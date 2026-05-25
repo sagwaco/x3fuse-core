@@ -1,0 +1,44 @@
+[package]
+name = "x3f-sys"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories = ["multimedia::images", "external-ffi-bindings"]
+description = "Low-level layer for the x3f Foveon raw converter: bindgen FFI plus the small remaining C/C++ (OpenCV denoise). Consume x3f-core instead."
+links = "x3f"
+
+[lib]
+crate-type = ["rlib"]
+
+# docs.rs has no network access, so the OpenCV denoise prebuilt can't be
+# fetched there; build.rs falls back to the no-op stub when DOCS_RS is set.
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+# libc::snprintf is used by src/print_meta.rs to match C `%g` float formatting
+# byte-for-byte (Rust's f64 Display uses Grisu/Ryu shortest-round-trip, which
+# differs from C's 6-significant-digit %g default and would invalidate the
+# tier-2 MD5 hashes pinned in tests/tier2_md5.rs).
+libc = "0.2"
+# M7a: rayon row-parallelism for the convert_data + apply_highlight_clip_dng
+# hot loops in src/process.rs. The per-pixel work is row-independent — see
+# the analysis at the head of process.rs.
+rayon = "1.10"
+
+[build-dependencies]
+bindgen = "0.71"
+cc = { version = "1.2", features = ["parallel"] }
+
+# Bindgen output is full of style "issues"; lint workspace doesn't apply here.
+[lints.rust]
+non_upper_case_globals = "allow"
+non_camel_case_types = "allow"
+non_snake_case = "allow"
+dead_code = "allow"
+
+[lints.clippy]
+all = "allow"

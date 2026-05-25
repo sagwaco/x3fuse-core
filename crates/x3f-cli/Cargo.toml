@@ -1,0 +1,29 @@
+[package]
+name = "x3f-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories = ["command-line-utilities", "multimedia::images"]
+description = "Command-line tool for converting Sigma Foveon X3F raw images."
+
+[[bin]]
+name = "x3f_extract"
+path = "src/main.rs"
+
+[dependencies]
+x3f-core.workspace = true
+# M7b: rayon par_iter over args.files for batch-mode parallelism. Each
+# top-level worker runs one file end-to-end (decode → process → write)
+# so the per-image thread-local DNG_HIGHLIGHT_SCALE in x3f-sys stays
+# consistent.
+rayon = "1.10"
+
+[dev-dependencies]
+md-5 = "0.10"
+tiff = "0.10"
+
+[lints]
+workspace = true

@@ -1,0 +1,210 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtiff-dev libjpeg-turbo8-dev zlib1g-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  build:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, macos-13]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtiff-dev libjpeg-turbo8-dev zlib1g-dev pkg-config
+      - name: Install system deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libtiff jpeg-turbo
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build
+        run: cargo build --workspace --all-targets
+      # Tier-1 unit tests run unconditionally. Tier-2/3 integration tests
+      # auto-skip when the X3F corpus isn't on disk (it's not redistributable
+      # and not committed), so this passes in CI without extra setup. To run
+      # the full suite locally, point X3F_TEST_FILES at a corpus directory.
+      - name: cargo test
+        run: cargo test --workspace
+      - name: smoke test (x3f_extract --help)
+        run: cargo run --release --bin x3f_extract -- -help || true
+
+  # Windows full build is gated on M3, when libtiff/libjpeg/zlib are
+  # replaced by Rust crates and the pkg-config dependency disappears.
+  # Until then, run the formatting check on Windows so portability bugs
+  # in the Rust source are caught early.
+  windows-fmt:
+    name: fmt (windows-latest, no build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+  # M8b: cross-compile x3f-ffi-c for iOS device + simulator and build the
+  # xcframework. Validates that the cbindgen header, opencv-mobile prebuilt
+  # download, and IPHONEOS_DEPLOYMENT_TARGET pinning all hang together
+  # under a non-host toolchain. Runs on macos-14 because iOS cross-builds
+  # need an Apple host with Xcode.
+  ios-xcframework:
+    name: iOS xcframework (macos-14)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+      - name: build xcframework
+        run: ./crates/x3f-ffi-c/scripts/build-xcframework.sh
+      - name: verify xcframework structure
+        run: |
+          set -euxo pipefail
+          test -d target/X3F.xcframework
+          test -f target/X3F.xcframework/Info.plist
+          test -f target/X3F.xcframework/ios-arm64/libx3f.a
+          test -f target/X3F.xcframework/ios-arm64/Headers/x3f.h
+          test -f target/X3F.xcframework/ios-arm64-simulator/libx3f.a
+          test -f target/X3F.xcframework/ios-arm64-simulator/Headers/x3f.h
+      - uses: actions/upload-artifact@v4
+        with:
+          name: X3F.xcframework
+          path: target/X3F.xcframework
+          retention-days: 7
+
+  # M8d / M8d-α: WASM cross-builds. We test both wasm32-wasip1 (server-
+  # side WASM with wasi-libc) and wasm32-unknown-unknown (browser-style
+  # WASM, no libc, no filesystem). The wasm32-unknown-unknown build
+  # depends on the M8d-α `sysabi` shim that replaces libc with a Rust
+  # allocator + no-op file-I/O stubs.
+  wasm32:
+    name: wasm32 build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wasm32-wasip1, wasm32-unknown-unknown]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: build x3f-ffi-c (staticlib + cdylib)
+        run: cargo build --release -p x3f-ffi-c --target ${{ matrix.target }}
+      - name: verify .wasm + .a + header are produced
+        run: |
+          set -euxo pipefail
+          T=target/${{ matrix.target }}/release
+          test -f $T/libx3f.a
+          test -f $T/x3f.wasm
+          test -f $T/include/x3f.h
+          # Spot-check the wasm exports the C ABI symbols.
+          for sym in x3f_reader_open x3f_reader_open_from_bytes x3f_reader_close \
+                     x3f_reader_dump_meta x3f_reader_dump_jpeg_thumbnail \
+                     x3f_reader_header_version x3f_last_error; do
+            grep -q "$sym" $T/x3f.wasm \
+              || { echo "missing export: $sym" >&2; exit 1; }
+          done
+      - name: install wasm-tools
+        run: cargo install --locked wasm-tools --version "^1.248"
+      - name: assert wasm has zero unresolved env imports
+        run: |
+          set -euxo pipefail
+          T=target/${{ matrix.target }}/release
+          # M8d-α-2 invariant: wasm32-* cdylibs are fully self-contained
+          # (no `(import "env" …)` entries) — i.e. consumers never have
+          # to provide host-function shims for `x3f_printf` / `x3f_denoise`
+          # / etc. They get satisfied by Rust shims in `wasm_c_shims.rs`.
+          if wasm-tools print $T/x3f.wasm | grep -E '^\s*\(import "env"' >&2; then
+            echo "wasm cdylib has unresolved env imports!" >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x3f-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/libx3f.a
+            target/${{ matrix.target }}/release/x3f.wasm
+            target/${{ matrix.target }}/release/include/x3f.h
+          retention-days: 7
+
+  # M8d-α-2: end-to-end wasm runtime smoke. Cross-compiles the
+  # `wasi_from_bytes` example to wasm32-wasip1, runs it under
+  # wasmtime, and asserts the parsed X3F header version matches what
+  # `Reader::open` returns natively. Validates the buffer-based
+  # `Reader::from_bytes` path through the same code that runs in a
+  # browser-WASM context (sans wasi syscalls).
+  wasm32-runtime-smoke:
+    name: wasm32 runtime smoke (wasmtime)
+    runs-on: ubuntu-latest
+    needs: wasm32
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+      - name: install wasmtime
+        run: |
+          curl -sSfL https://wasmtime.dev/install.sh | bash
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+      - name: run wasm runtime smoke (skips silently if no corpus)
+        run: cargo test --release -p x3f-core --test wasm_runtime_smoke -- --nocapture
+
+  # M9a: build the contributor mdbook so docs drift surfaces as a CI
+  # failure rather than as a stale on-disk render. We pin a known-good
+  # mdbook version to avoid silent breakage from upstream config-key
+  # renames (e.g. `multilingual` → removed). No `mdbook test` — we
+  # have no Rust doctests in the book, and unfenced ``` blocks
+  # (e.g. workspace trees) would otherwise be parsed as Rust.
+  mdbook:
+    name: mdbook build (docs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install mdbook
+        run: cargo install --locked mdbook --version "^0.5"
+      - name: mdbook build
+        run: mdbook build docs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x3f-book
+          path: docs/book
+          retention-days: 7

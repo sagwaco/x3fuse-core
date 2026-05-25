@@ -1,0 +1,30 @@
+[package]
+name = "x3f-ffi-c"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+# `x3f` is the linker name: produces `libx3f.dylib` / `libx3f.so` / `x3f.dll`
+# (cdylib) and `libx3f.a` / `x3f.lib` (staticlib). The staticlib feeds the
+# iOS xcframework / Android jniLibs builds in M8b/M8c; the cdylib is the
+# preferred option for desktop dynamic-linking consumers.
+name = "x3f"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+x3f-core.workspace = true
+libc = "0.2"
+
+[build-dependencies]
+# Pinned at 0.27 (Oct 2024). Update with care: cbindgen sometimes regresses
+# on `#[repr(C)] struct Foo { _private: [u8; 0] }` opaque-handle output.
+cbindgen = "0.27"
+
+# x3f-sys (transitive through x3f-core) opts out of clippy::all to keep
+# bindgen-generated code from drowning the workspace, so any new lints
+# we want to enforce on this crate must go here. We just inherit the
+# workspace defaults.
+[lints]
+workspace = true
