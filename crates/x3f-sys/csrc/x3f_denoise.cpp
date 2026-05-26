@@ -55,7 +55,8 @@ static void denoise_nlm(Mat& img, float h)
   out.copyTo(img);
 }
 
-void x3f_denoise_active(x3f_area16_t *area, x3f_denoise_type_t type, int stage)
+void x3f_denoise_active(x3f_area16_t *area, x3f_denoise_type_t type, int stage,
+                        float scale)
 {
   // Entry point invoked by the Rust `x3f_expand_quattro` upsampler in
   // crates/x3f-sys/src/quattro.rs. Sees the area already in YUV layout —
@@ -63,18 +64,20 @@ void x3f_denoise_active(x3f_area16_t *area, x3f_denoise_type_t type, int stage)
   assert(area->channels == 3);
   assert(type < sizeof(denoise_types)/sizeof(denoise_desc_t));
   const denoise_desc_t *d = &denoise_types[type];
+  // `scale` (0..1) attenuates the per-sensor sigma; 1.0 == legacy strength.
+  float sigma = d->h * scale;
 
   Mat act(area->rows, area->columns, CV_16UC3,
           area->data, sizeof(uint16_t)*area->row_stride);
 
   if (stage == 0) {
     // Half-res pre-upsample pass: full denoise_nlm pipeline.
-    denoise_nlm(act, d->h);
+    denoise_nlm(act, sigma);
   } else {
     // Full-res post-upsample pass: just fastNlMeansDenoising with the
     // legacy per-channel weights {0, h, h*2}.
     Mat out;
-    float h[3] = {0.0f, d->h, d->h * 2.0f};
+    float h[3] = {0.0f, sigma, sigma * 2.0f};
     x3f_printf(DEBUG, "BEGIN Quattro full-resolution denoising\n");
     fastNlMeansDenoising(act, out, std::vector<float>(h, h+3),
                          3, 11, NORM_L1);
@@ -83,7 +86,7 @@ void x3f_denoise_active(x3f_area16_t *area, x3f_denoise_type_t type, int stage)
   }
 }
 
-void x3f_denoise(x3f_area16_t *image, x3f_denoise_type_t type)
+void x3f_denoise(x3f_area16_t *image, x3f_denoise_type_t type, float scale)
 {
   assert(image->channels == 3);
   assert(type < sizeof(denoise_types)/sizeof(denoise_desc_t));
@@ -93,7 +96,8 @@ void x3f_denoise(x3f_area16_t *image, x3f_denoise_type_t type)
 
   Mat img(image->rows, image->columns, CV_16UC3,
 	 image->data, sizeof(uint16_t)*image->row_stride);
-  denoise_nlm(img, d->h);
+  // `scale` (0..1) attenuates the per-sensor sigma; 1.0 == legacy strength.
+  denoise_nlm(img, d->h * scale);
 
   d->YUV_to_BMT(image);
 }
@@ -103,12 +107,15 @@ void x3f_denoise(x3f_area16_t *image, x3f_denoise_type_t type)
 // NOTE: image, active and qtop will be destructively modified in place.
 void x3f_expand_quattro(x3f_area16_t *image, x3f_area16_t *active,
 			x3f_area16_t *qtop,
-			x3f_area16_t *expanded, x3f_area16_t *active_exp)
+			x3f_area16_t *expanded, x3f_area16_t *active_exp,
+			float scale)
 {
   assert(image->channels == 3);
   assert(qtop->channels == 1);
   assert(X3F_DENOISE_F23 < sizeof(denoise_types)/sizeof(denoise_desc_t));
   const denoise_desc_t *d = &denoise_types[X3F_DENOISE_F23];
+  // `scale` (0..1) attenuates the per-sensor sigma; 1.0 == legacy strength.
+  float sigma = d->h * scale;
 
   d->BMT_to_YUV(image);
 
@@ -125,7 +132,7 @@ void x3f_expand_quattro(x3f_area16_t *image, x3f_area16_t *active,
     assert(active->channels == 3);
     Mat act(active->rows, active->columns, CV_16UC3,
 	    active->data, sizeof(uint16_t)*active->row_stride);
-    denoise_nlm(act, d->h);
+    denoise_nlm(act, sigma);
   }
 
   resize(img, exp, exp.size(), 0.0, 0.0, INTER_CUBIC);
@@ -138,7 +145,7 @@ void x3f_expand_quattro(x3f_area16_t *image, x3f_area16_t *active,
     Mat act_exp(active_exp->rows, active_exp->columns, CV_16UC3,
 		active_exp->data, sizeof(uint16_t)*active_exp->row_stride);
     Mat out;
-    float h[3] = {0.0, d->h, d->h*2};
+    float h[3] = {0.0, sigma, sigma*2};
 
     x3f_printf(DEBUG, "BEGIN Quattro full-resolution denoising\n");
     fastNlMeansDenoising(act_exp, out, std::vector<float>(h, h+3),

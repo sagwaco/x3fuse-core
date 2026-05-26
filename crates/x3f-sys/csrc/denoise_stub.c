@@ -19,17 +19,20 @@
 
 #include "x3f_denoise.h"
 
-void x3f_denoise(x3f_area16_t *image, x3f_denoise_type_t type)
+void x3f_denoise(x3f_area16_t *image, x3f_denoise_type_t type, float scale)
 {
   (void)image;
   (void)type;
+  (void)scale;
 }
 
-void x3f_denoise_active(x3f_area16_t *area, x3f_denoise_type_t type, int stage)
+void x3f_denoise_active(x3f_area16_t *area, x3f_denoise_type_t type, int stage,
+                        float scale)
 {
   (void)area;
   (void)type;
   (void)stage;
+  (void)scale;
 }
 
 void x3f_set_use_opencl(int flag)

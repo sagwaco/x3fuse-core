@@ -22,12 +22,17 @@ typedef enum {
   X3F_DENOISE_F23=2,
 } x3f_denoise_type_t;
 
-extern void x3f_denoise(x3f_area16_t *image, x3f_denoise_type_t type);
+/* `scale` multiplies the per-sensor NLM sigma `denoise_types[type].h`.
+ * 1.0 reproduces the legacy full-strength denoise; 0.0 is a no-op. The
+ * Rust callers map the 0..=10 intensity knob to scale = intensity/10. */
+extern void x3f_denoise(x3f_area16_t *image, x3f_denoise_type_t type,
+			float scale);
 extern void x3f_expand_quattro(x3f_area16_t *image,
 			       x3f_area16_t *active,
 			       x3f_area16_t *qtop,
 			       x3f_area16_t *expanded,
-			       x3f_area16_t *active_exp);
+			       x3f_area16_t *active_exp,
+			       float scale);
 
 /* x3f_denoise_active: NLM passes the Rust `x3f_expand_quattro` upsampler
  * calls into for Quattro files. The legacy C++ `x3f_expand_quattro` ran
@@ -47,7 +52,8 @@ extern void x3f_expand_quattro(x3f_area16_t *image,
  * pass X3F_DENOISE_F23. */
 extern void x3f_denoise_active(x3f_area16_t *area,
 			       x3f_denoise_type_t type,
-			       int stage);
+			       int stage,
+			       float scale);
 
 extern void x3f_set_use_opencl(int flag);
 

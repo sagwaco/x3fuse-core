@@ -2135,8 +2135,17 @@ fn cineon_scale_from_env() -> f64 {
 // arranges crop rectangles, allocates the expanded RGB buffer, and
 // hands off to the Rust `x3f_expand_quattro` (M5a).
 
+/// Map the 0..=10 denoise-intensity knob to the NLM sigma scale (0.0..=1.0)
+/// the C denoise kernels multiply onto each sensor's base `h`. 10 → 1.0
+/// reproduces the legacy full-strength denoise byte-for-byte; 0 → 0.0 is a
+/// no-op (callers gate it out before reaching the kernel anyway).
+#[inline]
+fn denoise_scale(intensity: libc::c_int) -> f32 {
+    (intensity.clamp(0, 10) as f32) / 10.0
+}
+
 #[no_mangle]
-pub unsafe extern "C" fn run_denoising(x3f: *mut x3f_t) -> libc::c_int {
+pub unsafe extern "C" fn run_denoising(x3f: *mut x3f_t, intensity: libc::c_int) -> libc::c_int {
     let mut original_image: x3f_area16_t = unsafe { std::mem::zeroed() };
     let mut image: x3f_area16_t = unsafe { std::mem::zeroed() };
 
@@ -2171,14 +2180,14 @@ pub unsafe extern "C" fn run_denoising(x3f: *mut x3f_t) -> libc::c_int {
         }
     }
 
-    unsafe { x3f_denoise(&mut image, t) };
+    unsafe { x3f_denoise(&mut image, t, denoise_scale(intensity)) };
     1
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn expand_quattro(
     x3f: *mut x3f_t,
-    denoise: libc::c_int,
+    intensity: libc::c_int,
     expanded: *mut x3f_area16_t,
 ) -> libc::c_int {
     let mut image: x3f_area16_t = unsafe { std::mem::zeroed() };
@@ -2194,7 +2203,7 @@ pub unsafe extern "C" fn expand_quattro(
         return 0;
     }
 
-    if denoise != 0
+    if intensity != 0
         && unsafe {
             x3f_crop_area_camf(
                 x3f,
@@ -2232,7 +2241,7 @@ pub unsafe extern "C" fn expand_quattro(
     exp.buf = unsafe { libc::malloc(bytes) };
     exp.data = exp.buf as *mut u16;
 
-    if denoise != 0
+    if intensity != 0
         && unsafe {
             x3f_crop_area_camf(
                 x3f,
@@ -2252,12 +2261,12 @@ pub unsafe extern "C" fn expand_quattro(
         }
     }
 
-    let active_ptr = if denoise != 0 {
+    let active_ptr = if intensity != 0 {
         &mut active as *mut _
     } else {
         ptr::null_mut()
     };
-    let active_exp_ptr = if denoise != 0 {
+    let active_exp_ptr = if intensity != 0 {
         &mut active_exp as *mut _
     } else {
         ptr::null_mut()
@@ -2265,7 +2274,9 @@ pub unsafe extern "C" fn expand_quattro(
     unsafe {
         // x3f_expand_quattro is exported by quattro.rs as #[no_mangle].
         // Re-declare with x3f_area16_t (bindgen) signature; layout
-        // matches quattro.rs's #[repr(C)] Area16 struct exactly.
+        // matches quattro.rs's #[repr(C)] Area16 struct exactly. The
+        // trailing `scale` carries the 0..1 NLM-sigma attenuation the
+        // two Quattro NLM passes apply (see denoise_scale).
         extern "C" {
             fn x3f_expand_quattro(
                 image: *mut x3f_area16_t,
@@ -2273,6 +2284,7 @@ pub unsafe extern "C" fn expand_quattro(
                 qtop: *mut x3f_area16_t,
                 expanded: *mut x3f_area16_t,
                 active_exp: *mut x3f_area16_t,
+                scale: f32,
             );
         }
         x3f_expand_quattro(
@@ -2281,6 +2293,7 @@ pub unsafe extern "C" fn expand_quattro(
             &mut qtop_crop,
             expanded,
             active_exp_ptr,
+            denoise_scale(intensity),
         );
     }
     1
@@ -2778,7 +2791,7 @@ pub unsafe extern "C" fn x3f_get_image(
     encoding: x3f_color_encoding_t,
     crop: libc::c_int,
     fix_bad: libc::c_int,
-    denoise: libc::c_int,
+    denoise: libc::c_int, // 0..=10 denoise intensity (0 = off); see denoise_scale
     apply_sgain: libc::c_int,
     mut wb: *mut libc::c_char,
 ) -> libc::c_int {
@@ -2853,7 +2866,7 @@ pub unsafe extern "C" fn x3f_get_image(
         }
         original_image = expanded;
         is_quattro = true;
-    } else if denoise != 0 && unsafe { run_denoising(x3f) } == 0 {
+    } else if denoise != 0 && unsafe { run_denoising(x3f, denoise) } == 0 {
         return 0;
     }
 
@@ -3089,7 +3102,8 @@ static _A_CONVERT_DATA: unsafe extern "C" fn(
     *mut libc::c_char,
 ) -> libc::c_int = convert_data;
 #[used]
-static _A_RUN_DENOISING: unsafe extern "C" fn(*mut x3f_t) -> libc::c_int = run_denoising;
+static _A_RUN_DENOISING: unsafe extern "C" fn(*mut x3f_t, libc::c_int) -> libc::c_int =
+    run_denoising;
 #[used]
 static _A_EXPAND_QUATTRO: unsafe extern "C" fn(
     *mut x3f_t,

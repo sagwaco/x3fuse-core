@@ -102,11 +102,16 @@ pub struct ProcessOptions {
     pub wb: Option<String>,
     /// ZIP-compress DNG/TIFF output.
     pub compress: bool,
-    /// Run the OpenCV NLM denoise pass before color conversion. Backed by
-    /// opencv-mobile's `fastNlMeansDenoising` on every target except
-    /// `wasm32-unknown-unknown` (where the build falls back to a no-op stub
-    /// because the WASM ecosystem here cannot link C++ stdlib).
-    pub denoise: bool,
+    /// Strength of the OpenCV NLM denoise pass run before color conversion,
+    /// on a 0..=10 scale: `0` disables denoise entirely (equivalent to the
+    /// legacy `-no-denoise`), `10` is full strength (the legacy default,
+    /// byte-identical to the pre-knob output), and intermediate values
+    /// linearly attenuate each sensor's NLM sigma (`scale = intensity / 10`).
+    /// Values above 10 are clamped. Backed by opencv-mobile's
+    /// `fastNlMeansDenoising` on every target except `wasm32-unknown-unknown`
+    /// (where the build falls back to a no-op stub because the WASM ecosystem
+    /// here cannot link C++ stdlib).
+    pub denoise_intensity: u8,
     /// Directory of pre-rendered DNG `OpcodeList3` blobs (Sigma's per-
     /// model / per-aperture flat-fielding gain maps). When set, the DNG
     /// writer looks up the blob matching the camera's model and aperture
@@ -163,7 +168,7 @@ impl Default for ProcessOptions {
             apply_sgain: None,
             wb: None,
             compress: false,
-            denoise: true,
+            denoise_intensity: 10,
             opcodes_dir: None,
             dng_highlight_recovery: false,
             cineon: false,
@@ -535,7 +540,7 @@ impl Reader {
                 opts.color_encoding.to_raw(),
                 opts.crop as i32,
                 opts.fix_bad as i32,
-                opts.denoise as i32,
+                opts.denoise_intensity.min(10) as i32,
                 sgain,
                 cwb_ptr(&cwb),
                 log_exposure as i32,
