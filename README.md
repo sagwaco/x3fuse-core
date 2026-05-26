@@ -15,7 +15,7 @@ cargo build --release
 
 This produces `target/release/x3f_extract`.
 
-**Denoise (optional, on by default).** The non-local-means denoise pass links against a prebuilt [opencv-mobile](https://github.com/nihui/opencv-mobile) static library, fetched automatically at build time for supported targets (macOS, iOS, Linux, Windows, Android). If no prebuilt is available or the download fails, the build falls back to a no-op denoise stub — the binary still builds and runs; pass `-no-denoise` to skip the pass explicitly.
+**Denoise (optional, on by default).** The non-local-means denoise pass links against a prebuilt [opencv-mobile](https://github.com/nihui/opencv-mobile) static library, fetched automatically at build time for supported targets (macOS, iOS, Linux, Windows, Android). If no prebuilt is available or the download fails, the build falls back to a no-op denoise stub — the binary still builds and runs; pass `-no-denoise` (or `-denoise 0`) to skip the pass explicitly. Denoise strength is adjustable on a `0`–`10` scale with `-denoise <0-10>` (see [Modifiers](#modifiers)).
 
 ## Usage
 
@@ -47,7 +47,8 @@ Multiple input files are processed in parallel. The legacy single-dash flag synt
 | `-v` / `-q`               | verbose / quiet (errors only)                                                      |
 | `-color <SPACE>`          | RGB color space: `none`, `sRGB`, `AdobeRGB`, `ProPhotoRGB` (does not affect DNG)   |
 | `-compress`               | Deflate/ZIP compression for DNG and TIFF                                           |
-| `-no-denoise`             | disable the OpenCV NLM denoise pass                                                |
+| `-denoise <0-10>`         | OpenCV NLM denoise intensity: `0` = off, `10` = full strength (**default**); intermediate values linearly scale the NLM sigma |
+| `-no-denoise`             | disable the OpenCV NLM denoise pass (alias for `-denoise 0`)                        |
 | `-no-crop`                | do not crop to the active image area                                               |
 | `-no-sgain` / `-sgain`    | disable / force spatial-gain (lens color) compensation                             |
 | `-no-fix-bad`             | do not fix bad pixels                                                              |
@@ -73,6 +74,9 @@ x3f_extract -tiff -color sRGB input.X3F
 
 # Deflate-compressed TIFF into an output directory
 x3f_extract -tiff -compress -o out/ input.X3F
+
+# DNG with a lighter denoise pass (half the default strength)
+x3f_extract -dng -denoise 5 input.X3F
 
 # Metadata dump
 x3f_extract -meta input.X3F

@@ -149,6 +149,16 @@ in
 [`crates/x3f-sys/csrc/denoise_stub.c`](../../crates/x3f-sys/csrc/denoise_stub.c)
 provides the same no-op resolution.
 
+Denoise strength is a `0`–`10` intensity (`-denoise <0-10>`, default `10`;
+`-no-denoise` is the alias for `0`). The CLI value rides through the
+pipeline's `denoise` arg and `x3f-core`'s `ProcessOptions::denoise_intensity`;
+[`run_denoising`](../../crates/x3f-sys/src/process.rs) /
+[`expand_quattro`](../../crates/x3f-sys/src/process.rs) map it to a
+`scale = intensity / 10` that the C kernels (`x3f_denoise`,
+`x3f_denoise_active`) multiply onto each sensor's base NLM sigma. `10` →
+`scale = 1.0` reproduces the legacy full-strength denoise byte-for-byte (so
+the tier-2 parity baselines are unaffected); `0` gates the pass out entirely.
+
 Everything else under [`src/`](../../src/) is the legacy archive —
 header files are still consumed by bindgen for typedefs, but the `.c`
 function bodies have all been deleted or migrated.
