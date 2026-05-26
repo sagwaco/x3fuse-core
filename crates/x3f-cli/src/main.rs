@@ -48,7 +48,9 @@ struct Args {
     extract_unconverted_raw: bool,
     crop: bool,
     fix_bad: bool,
-    denoise: bool,
+    /// Denoise strength, 0..=10. 0 disables denoise (legacy `-no-denoise`),
+    /// 10 is full strength (legacy default).
+    denoise_intensity: u8,
     apply_sgain: Option<bool>,
     file_type: FileType,
     color_encoding: ColorEncoding,
@@ -78,7 +80,7 @@ impl Default for Args {
             extract_unconverted_raw: false,
             crop: true,
             fix_bad: true,
-            denoise: true,
+            denoise_intensity: 10,
             apply_sgain: None,
             file_type: FileType::Dng,
             color_encoding: ColorEncoding::Srgb,
@@ -125,7 +127,10 @@ fn usage(progname: &str) -> ! {
          \x20  -unprocessed    Dump RAW without any preprocessing\n\
          \x20  -qtop           Dump Quattro top layer without preprocessing\n\
          \x20  -no-crop        Do not crop to active area\n\
-         \x20  -no-denoise     Disable OpenCV NLM denoise (default: enabled)\n\
+         \x20  -no-denoise     Disable OpenCV NLM denoise (same as -denoise 0)\n\
+         \x20  -denoise <0-10> OpenCV NLM denoise intensity. 0 = off,\n\
+         \x20                  10 = full strength (default). Intermediate\n\
+         \x20                  values linearly scale the NLM sigma.\n\
          \x20  -no-sgain       Do not apply spatial gain (color compensation)\n\
          \x20  -no-fix-bad     Do not fix bad pixels\n\
          \x20  -sgain          Apply spatial gain (default except for Quattro)\n\
@@ -277,7 +282,15 @@ fn parse_args(argv: &[String]) -> Args {
             }
             "-no-crop" => args.crop = false,
             "-no-fix-bad" => args.fix_bad = false,
-            "-no-denoise" => args.denoise = false,
+            "-no-denoise" => args.denoise_intensity = 0,
+            "-denoise" => {
+                i += 1;
+                let v = argv.get(i).unwrap_or_else(|| usage(progname));
+                match v.parse::<u8>() {
+                    Ok(n) if n <= 10 => args.denoise_intensity = n,
+                    _ => usage(progname),
+                }
+            }
             "-no-sgain" => args.apply_sgain = Some(false),
             "-sgain" => args.apply_sgain = Some(true),
             "-wb" => {
@@ -434,7 +447,7 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
         color_encoding: args.color_encoding,
         crop: args.crop,
         fix_bad: args.fix_bad,
-        denoise: args.denoise,
+        denoise_intensity: args.denoise_intensity,
         apply_sgain: args.apply_sgain,
         wb: args.wb.clone(),
         compress: args.compress,
@@ -539,7 +552,8 @@ mod tests {
         let a = parse(&["in.X3F"]);
         assert_eq!(a.file_type, FileType::Dng);
         assert_eq!(a.color_encoding, ColorEncoding::Srgb);
-        assert!(a.crop && a.fix_bad && a.denoise);
+        assert!(a.crop && a.fix_bad);
+        assert_eq!(a.denoise_intensity, 10);
         assert!(!a.compress);
         assert_eq!(a.files, vec![PathBuf::from("in.X3F")]);
     }
@@ -637,13 +651,23 @@ mod tests {
             "-v",
             "in.X3F",
         ]);
-        assert!(!a.crop && !a.fix_bad && !a.denoise);
+        assert!(!a.crop && !a.fix_bad);
+        assert_eq!(a.denoise_intensity, 0);
         assert_eq!(a.apply_sgain, Some(false));
         assert!(a.compress);
         assert_eq!(a.wb.as_deref(), Some("Daylight"));
         assert_eq!(a.legacy_offset, Some(1024));
         assert_eq!(a.matrix_max, Some(200));
         assert_eq!(a.verbosity, Some(Verbosity::Debug));
+    }
+
+    #[test]
+    fn denoise_intensity_parses_explicit_value() {
+        assert_eq!(parse(&["-denoise", "5", "in.X3F"]).denoise_intensity, 5);
+        assert_eq!(parse(&["-denoise", "0", "in.X3F"]).denoise_intensity, 0);
+        assert_eq!(parse(&["-denoise", "10", "in.X3F"]).denoise_intensity, 10);
+        // `-no-denoise` is the alias for the off end of the scale.
+        assert_eq!(parse(&["-no-denoise", "in.X3F"]).denoise_intensity, 0);
     }
 
     #[test]

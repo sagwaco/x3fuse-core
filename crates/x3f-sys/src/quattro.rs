@@ -256,7 +256,7 @@ const STAGE_PRE_UPSAMPLE: i32 = 0;
 const STAGE_POST_UPSAMPLE: i32 = 1;
 
 extern "C" {
-    fn x3f_denoise_active(area: *mut Area16, denoise_type: u32, stage: i32);
+    fn x3f_denoise_active(area: *mut Area16, denoise_type: u32, stage: i32, scale: f32);
 }
 
 /// Native Rust replacement for the OpenCV-backed `x3f_expand_quattro`. The
@@ -272,7 +272,9 @@ extern "C" {
 /// `image` and `expanded` are mutated in place. `active` (when non-null)
 /// must be a sub-area view into `image`'s data; `active_exp` must be a
 /// sub-area view into `expanded`'s data — those invariants come from the
-/// C call site in `x3f-sys::process::expand_quattro`.
+/// C call site in `x3f-sys::process::expand_quattro`. `scale` (0..1)
+/// attenuates the NLM sigma of both Quattro denoise passes (1.0 = legacy
+/// full strength); `expand_quattro` derives it from the 0..=10 intensity.
 #[no_mangle]
 pub(crate) unsafe extern "C" fn x3f_expand_quattro(
     image: *mut Area16,
@@ -280,6 +282,7 @@ pub(crate) unsafe extern "C" fn x3f_expand_quattro(
     qtop: *mut Area16,
     expanded: *mut Area16,
     active_exp: *mut Area16,
+    scale: f32,
 ) {
     assert!(!image.is_null() && !qtop.is_null() && !expanded.is_null());
 
@@ -305,7 +308,7 @@ pub(crate) unsafe extern "C" fn x3f_expand_quattro(
     // `active` is null (caller passed null because denoise was disabled)
     // or when the binary was built without opencv-mobile (WASM).
     if !active.is_null() {
-        unsafe { x3f_denoise_active(active, X3F_DENOISE_F23, STAGE_PRE_UPSAMPLE) };
+        unsafe { x3f_denoise_active(active, X3F_DENOISE_F23, STAGE_PRE_UPSAMPLE, scale) };
     }
 
     // Step 2: bicubic 2x upsample, per channel, image -> expanded.
@@ -364,7 +367,7 @@ pub(crate) unsafe extern "C" fn x3f_expand_quattro(
     // Runs while `expanded` is still in YUV layout, before the final
     // YUV->BMT transform below.
     if !active_exp.is_null() {
-        unsafe { x3f_denoise_active(active_exp, X3F_DENOISE_F23, STAGE_POST_UPSAMPLE) };
+        unsafe { x3f_denoise_active(active_exp, X3F_DENOISE_F23, STAGE_POST_UPSAMPLE, scale) };
     }
 
     // Step 4: YUV -> BMT in place on expanded.
@@ -382,6 +385,7 @@ static _ANCHOR_X3F_EXPAND_QUATTRO: unsafe extern "C" fn(
     *mut Area16,
     *mut Area16,
     *mut Area16,
+    f32,
 ) = x3f_expand_quattro;
 
 #[cfg(test)]

@@ -59,16 +59,22 @@ pub unsafe extern "C" fn x3f_printf(_level: c_int, _fmt: *const c_char, _arg: c_
 #[no_mangle]
 pub unsafe extern "C" fn x3f_set_use_opencl(_flag: c_int) {}
 
-/// `x3f_denoise(image, type)` — no-op stub.
+/// `x3f_denoise(image, type, scale)` — no-op stub.
 ///
 /// # Safety
 /// `_image` may be NULL; we don't dereference it.
 #[no_mangle]
-pub unsafe extern "C" fn x3f_denoise(_image: *mut c_void, _type: c_int) {}
+pub unsafe extern "C" fn x3f_denoise(_image: *mut c_void, _type: c_int, _scale: f32) {}
 
-/// `x3f_denoise_active(area, type, stage)` — no-op stub.
+/// `x3f_denoise_active(area, type, stage, scale)` — no-op stub.
 ///
 /// # Safety
 /// `_area` may be NULL; we don't dereference it.
 #[no_mangle]
-pub unsafe extern "C" fn x3f_denoise_active(_area: *mut c_void, _type: c_int, _stage: c_int) {}
+pub unsafe extern "C" fn x3f_denoise_active(
+    _area: *mut c_void,
+    _type: c_int,
+    _stage: c_int,
+    _scale: f32,
+) {
+}

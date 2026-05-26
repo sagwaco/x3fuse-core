@@ -133,7 +133,7 @@ impl Reader {
                 opts.color_encoding.to_raw(),
                 opts.crop as i32,
                 opts.fix_bad as i32,
-                opts.denoise as i32,
+                opts.denoise_intensity.min(10) as i32,
                 sgain,
                 cwb_ptr(&cwb),
             )

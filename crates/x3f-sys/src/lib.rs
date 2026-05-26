@@ -45,9 +45,9 @@ mod _wasm_c_shim_anchors {
     #[used]
     static A1: unsafe extern "C" fn(c_int, *const c_char, c_int) = super::wasm_c_shims::x3f_printf;
     #[used]
-    static A2: unsafe extern "C" fn(*mut c_void, c_int) = super::wasm_c_shims::x3f_denoise;
+    static A2: unsafe extern "C" fn(*mut c_void, c_int, f32) = super::wasm_c_shims::x3f_denoise;
     #[used]
-    static A3: unsafe extern "C" fn(*mut c_void, c_int, c_int) =
+    static A3: unsafe extern "C" fn(*mut c_void, c_int, c_int, f32) =
         super::wasm_c_shims::x3f_denoise_active;
     #[used]
     static A4: unsafe extern "C" fn(c_int) = super::wasm_c_shims::x3f_set_use_opencl;
