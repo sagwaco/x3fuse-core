@@ -27,12 +27,11 @@ typedef enum {
  * Rust callers map the 0..=10 intensity knob to scale = intensity/10. */
 extern void x3f_denoise(x3f_area16_t *image, x3f_denoise_type_t type,
 			float scale);
-extern void x3f_expand_quattro(x3f_area16_t *image,
-			       x3f_area16_t *active,
-			       x3f_area16_t *qtop,
-			       x3f_area16_t *expanded,
-			       x3f_area16_t *active_exp,
-			       float scale);
+/* x3f_expand_quattro is owned by Rust (src/quattro.rs, #[no_mangle]); the
+ * legacy C++ body was removed so the two definitions no longer collide at
+ * link time (GNU ld / lld reject the duplicate; only macOS's ld64 tolerated
+ * it). The Rust upsampler calls back into x3f_denoise_active below for the
+ * NLM passes. */
 
 /* x3f_denoise_active: NLM passes the Rust `x3f_expand_quattro` upsampler
  * calls into for Quattro files. The legacy C++ `x3f_expand_quattro` ran

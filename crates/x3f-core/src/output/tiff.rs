@@ -116,7 +116,7 @@ where
 fn to_io(e: tiff::TiffError) -> io::Error {
     match e {
         tiff::TiffError::IoError(e) => e,
-        other => io::Error::new(io::ErrorKind::Other, other),
+        other => io::Error::other(other),
     }
 }
 
@@ -179,7 +179,7 @@ mod tests {
         let decoded = round_trip(&img, false);
         assert_eq!(decoded.len(), 2 * 5 * 3);
         // pixel(2,1) channel 2 → row_stride*2 + 1*3 + 2 in the source layout
-        let expected_g = ((2u32 * 7 + 1 * 13) as u16).wrapping_add(100);
+        let expected_g = ((2u32 * 7 + 13) as u16).wrapping_add(100);
         assert_eq!(decoded[(2 * 2 + 1) * 3 + 1], expected_g);
     }
 
