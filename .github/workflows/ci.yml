@@ -2,6 +2,9 @@ name: CI
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,7 +37,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14, macos-13]
+        include:
+          - os: ubuntu-latest
+            asset: x3f_extract-linux-x86_64
+          - os: macos-14
+            asset: x3f_extract-macos-arm64
+          - os: macos-13
+            asset: x3f_extract-macos-x86_64
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps (Linux)
@@ -57,6 +66,16 @@ jobs:
         run: cargo test --workspace
       - name: smoke test (x3f_extract --help)
         run: cargo run --release --bin x3f_extract -- -help || true
+      - name: stage release binary
+        run: |
+          mkdir -p dist
+          cp target/release/x3f_extract "dist/${{ matrix.asset }}"
+      - name: upload CLI binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          retention-days: 7
 
   # Windows full build is gated on M3, when libtiff/libjpeg/zlib are
   # replaced by Rust crates and the pkg-config dependency disappears.
@@ -206,3 +225,48 @@ jobs:
           name: x3f-book
           path: docs/book
           retention-days: 7
+
+  # Publish a GitHub release on `v*` tag pushes, attaching every built
+  # binary produced above: the per-platform x3f_extract CLI executables,
+  # the iOS X3F.xcframework, and the wasm32 libs/headers. Runs only for
+  # tag pushes (not plain workflow_dispatch) and waits on the jobs that
+  # produce the artifacts it collects.
+  release:
+    name: publish release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint, build, ios-xcframework, wasm32]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: package release assets
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          # CLI executables — each artifact holds a single renamed binary.
+          for f in artifacts/x3f_extract-*/x3f_extract-*; do
+            install -m 0755 "$f" "dist/$(basename "$f")"
+          done
+          # iOS xcframework — re-wrap so the zip's top level is X3F.xcframework/.
+          mkdir -p stage/X3F.xcframework
+          cp -R artifacts/X3F.xcframework/. stage/X3F.xcframework/
+          ( cd stage && zip -qr - X3F.xcframework ) > dist/X3F.xcframework.zip
+          # wasm bundles — one zip per target (libx3f.a + x3f.wasm + x3f.h).
+          for t in wasm32-wasip1 wasm32-unknown-unknown; do
+            ( cd "artifacts/x3f-$t" && zip -qr - . ) > "dist/x3f-$t.zip"
+          done
+          ls -la dist
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*
