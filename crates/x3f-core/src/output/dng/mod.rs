@@ -329,7 +329,7 @@ fn populate_raw_ifd(
                 .levels
                 .black
                 .iter()
-                .map(|&b| (((b as f64) * denom as f64).round().max(0.0) as u32, denom))
+                .map(|&b| ((b * denom as f64).round().max(0.0) as u32, denom))
                 .collect(),
         ),
     );

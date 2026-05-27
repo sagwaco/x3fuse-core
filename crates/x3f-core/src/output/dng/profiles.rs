@@ -806,7 +806,7 @@ mod tests {
         let blob = build_mmcr_profile("Vivid", [0.0_f32; 9], [0.0_f32; 9], None, None);
         let ifd_off = u32::from_be_bytes([blob[4], blob[5], blob[6], blob[7]]) as usize;
         let ifd_end = ifd_off + 2 + 5 * 12 + 4;
-        let cm_p = ifd_off + 2 + 1 * 12; // entry 1 = ColorMatrix1
+        let cm_p = ifd_off + 2 + 12; // entry 1 = ColorMatrix1
         let cm_value = u32::from_be_bytes([
             blob[cm_p + 8],
             blob[cm_p + 9],

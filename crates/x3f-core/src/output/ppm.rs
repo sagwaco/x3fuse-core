@@ -45,7 +45,7 @@ pub fn write(image: &Image, out: impl AsRef<Path>, binary: bool) -> io::Result<(
                 w.write_all(&g.to_be_bytes())?;
                 w.write_all(&b.to_be_bytes())?;
             } else {
-                write!(w, "{r} {g} {b} \n")?;
+                writeln!(w, "{r} {g} {b} ")?;
             }
         }
     }

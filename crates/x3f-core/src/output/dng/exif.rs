@@ -61,8 +61,10 @@ pub(crate) struct CaptureMetadata {
 
 impl CaptureMetadata {
     pub(crate) fn from_reader(reader: &Reader) -> Self {
-        let mut m = Self::default();
-        m.orientation = reader.prop_orientation();
+        let mut m = Self {
+            orientation: reader.prop_orientation(),
+            ..Self::default()
+        };
 
         // ---- Merrill: PROP table ---------------------------------------
         if let Some(s) = reader.dng_prop("CAMMANUF") {
@@ -548,7 +550,7 @@ fn find_app1_tiff(jpeg: &[u8]) -> Option<&[u8]> {
 /// count, and the 4-byte raw value-or-offset slot exactly as it appears
 /// in the entry — the caller decides whether to dereference it.
 fn walk_ifd(tiff: &[u8], off: usize, endian: Endian, mut f: impl FnMut(u16, u16, u32, [u8; 4])) {
-    let Some(n) = endian.read_u16(&tiff.get(off..).unwrap_or(&[])[..]) else {
+    let Some(n) = endian.read_u16(tiff.get(off..).unwrap_or(&[])) else {
         return;
     };
     for i in 0..n as usize {
