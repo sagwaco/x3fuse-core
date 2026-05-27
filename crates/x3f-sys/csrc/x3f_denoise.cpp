@@ -102,61 +102,12 @@ void x3f_denoise(x3f_area16_t *image, x3f_denoise_type_t type, float scale)
   d->YUV_to_BMT(image);
 }
 
-// NOTE: active has to be a subaera of image, i.e. they have to share
-//       the same data area.
-// NOTE: image, active and qtop will be destructively modified in place.
-void x3f_expand_quattro(x3f_area16_t *image, x3f_area16_t *active,
-			x3f_area16_t *qtop,
-			x3f_area16_t *expanded, x3f_area16_t *active_exp,
-			float scale)
-{
-  assert(image->channels == 3);
-  assert(qtop->channels == 1);
-  assert(X3F_DENOISE_F23 < sizeof(denoise_types)/sizeof(denoise_desc_t));
-  const denoise_desc_t *d = &denoise_types[X3F_DENOISE_F23];
-  // `scale` (0..1) attenuates the per-sensor sigma; 1.0 == legacy strength.
-  float sigma = d->h * scale;
-
-  d->BMT_to_YUV(image);
-
-  Mat img(image->rows, image->columns, CV_16UC3,
-	  image->data, sizeof(uint16_t)*image->row_stride);
-  Mat qt(qtop->rows, qtop->columns, CV_16U,
-	 qtop->data, sizeof(uint16_t)*qtop->row_stride);
-  Mat exp(expanded->rows, expanded->columns, CV_16UC3,
-	  expanded->data, sizeof(uint16_t)*expanded->row_stride);
-
-  assert(qt.size() == exp.size());
-
-  if (active) {
-    assert(active->channels == 3);
-    Mat act(active->rows, active->columns, CV_16UC3,
-	    active->data, sizeof(uint16_t)*active->row_stride);
-    denoise_nlm(act, sigma);
-  }
-
-  resize(img, exp, exp.size(), 0.0, 0.0, INTER_CUBIC);
-  qt *= 4;
-  int from_to[] = { 0,0 };
-  mixChannels(&qt, 1, &exp, 1, from_to, 1);
-
-  if (active_exp) {
-    assert(active_exp->channels == 3);
-    Mat act_exp(active_exp->rows, active_exp->columns, CV_16UC3,
-		active_exp->data, sizeof(uint16_t)*active_exp->row_stride);
-    Mat out;
-    float h[3] = {0.0, sigma, sigma*2};
-
-    x3f_printf(DEBUG, "BEGIN Quattro full-resolution denoising\n");
-    fastNlMeansDenoising(act_exp, out, std::vector<float>(h, h+3),
-			 3, 11, NORM_L1);
-    x3f_printf(DEBUG, "END Quattro full-resolution denoising\n");
-
-    out.copyTo(act_exp);
-  }
-
-  d->YUV_to_BMT(expanded);
-}
+// x3f_expand_quattro is now implemented in Rust (src/quattro.rs) and
+// exported as the canonical `#[no_mangle]` symbol; it orchestrates the
+// resize + BMT/YUV transforms there and calls back into x3f_denoise_active
+// above for the NLM passes. The legacy C++ body that used to live here was
+// removed: keeping it produced a duplicate `x3f_expand_quattro` definition
+// that GNU ld / lld reject at link time (only macOS's ld64 tolerated it).
 
 void x3f_set_use_opencl(int flag)
 {
