@@ -85,7 +85,7 @@ fn fetch_opencv_mobile(out_dir: &Path, asset: &str) -> Option<PathBuf> {
     let extract_dir = out_dir.join(format!("opencv-mobile-{}-{}", OPENCV_MOBILE_VERSION, asset));
     let stamp = extract_dir.join(".extracted");
     if stamp.exists() {
-        return Some(resolve_opencv_root(&extract_dir));
+        return Some(extract_dir);
     }
 
     let zip_path = out_dir.join(&zip_name);
@@ -125,45 +125,39 @@ fn fetch_opencv_mobile(out_dir: &Path, asset: &str) -> Option<PathBuf> {
         return None;
     }
     std::fs::write(&stamp, b"ok").ok()?;
-    Some(resolve_opencv_root(&extract_dir))
+    Some(extract_dir)
 }
 
-/// Find the actual package root inside the unpacked directory.
+/// Recursively search `base` (bounded by `max_depth`) for the directory that
+/// directly contains `marker` — a relative path such as `opencv2/core.hpp`
+/// (the include root we hand to `-I`) or a filename such as
+/// `libopencv_core.a` (the link-search dir).
 ///
-/// opencv-mobile's Apple zips drop `opencv2.framework` straight at the
-/// archive root, but the Linux / Windows / Android zips wrap everything in a
-/// top-level `opencv-mobile-<ver>-<asset>/` folder (and cross-compile assets
-/// add a further arch-triple level), so the real `include/` + `lib/` live one
-/// or two directories down. Probe a few levels so either layout resolves to
-/// the directory that actually contains the OpenCV headers / framework.
-fn resolve_opencv_root(extract_dir: &Path) -> PathBuf {
-    fn is_root(d: &Path) -> bool {
-        d.join("opencv2.framework").exists() || d.join("include").join("opencv2").exists()
-    }
-    let mut queue = vec![extract_dir.to_path_buf()];
-    for _ in 0..4 {
-        let mut next = Vec::new();
-        for dir in &queue {
-            if is_root(dir) {
-                return dir.clone();
-            }
-            if let Ok(entries) = std::fs::read_dir(dir) {
+/// opencv-mobile's prebuilt zips differ across assets: the headers may sit at
+/// `include/opencv2/` or, following OpenCV's CMake-install convention, at
+/// `include/opencv4/opencv2/`; the static archives live under `lib/`; and the
+/// whole tree may be wrapped in a top-level `opencv-mobile-<ver>-<asset>/`
+/// folder (cross-compile assets add a further arch-triple level). Probing for
+/// the real markers rather than assuming fixed subpaths keeps every layout
+/// (including the Apple `opencv2.framework`) working.
+fn find_under(base: &Path, marker: &Path, max_depth: usize) -> Option<PathBuf> {
+    let mut stack = vec![(base.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if dir.join(marker).exists() {
+            return Some(dir);
+        }
+        if depth < max_depth {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
                 for e in entries.flatten() {
                     let p = e.path();
                     if p.is_dir() {
-                        next.push(p);
+                        stack.push((p, depth + 1));
                     }
                 }
             }
         }
-        if next.is_empty() {
-            break;
-        }
-        queue = next;
     }
-    // Fall back to the extract dir; the include / link directives below then
-    // surface a clear "opencv2/core.hpp: No such file" rather than guessing.
-    extract_dir.to_path_buf()
+    None
 }
 
 /// Configure cc::Build and emit cargo:rustc-link-* directives so the
@@ -176,19 +170,23 @@ fn configure_opencv(build: &mut cc::Build, target: &str, root: &Path) {
         // framework's `Headers/` directory. The framework's binary is a
         // static `ar` archive (universal arm64+x86_64 on macos), so the
         // linker pulls only used object files.
-        build.flag("-F").flag(root.to_str().unwrap());
-        println!("cargo:rustc-link-search=framework={}", root.display());
+        let fw_dir = find_under(root, Path::new("opencv2.framework"), 4)
+            .unwrap_or_else(|| root.to_path_buf());
+        build.flag("-F").flag(fw_dir.to_str().unwrap());
+        println!("cargo:rustc-link-search=framework={}", fw_dir.display());
         println!("cargo:rustc-link-lib=framework=opencv2");
         // OpenCV's image I/O uses Accelerate's vDSP/vImage on Apple.
         println!("cargo:rustc-link-lib=framework=Accelerate");
     } else {
-        // Conventional layout: <root>/include/opencv2/*.hpp and
-        // <root>/lib/libopencv_*.a (typically with cmake metadata).
-        build.include(root.join("include"));
-        println!(
-            "cargo:rustc-link-search=native={}",
-            root.join("lib").display()
-        );
+        // Conventional layout, but the exact subpaths vary by asset (see
+        // find_under). Locate the dir that actually holds <opencv2/core.hpp>
+        // and the one holding the static archives instead of guessing.
+        let include = find_under(root, &Path::new("opencv2").join("core.hpp"), 6)
+            .unwrap_or_else(|| root.join("include"));
+        build.include(&include);
+        let lib_dir =
+            find_under(root, Path::new("libopencv_core.a"), 6).unwrap_or_else(|| root.join("lib"));
+        println!("cargo:rustc-link-search=native={}", lib_dir.display());
         // opencv-mobile's modules. Order matters for static linking on some
         // platforms (photo depends on imgproc which depends on core).
         for lib in ["opencv_photo", "opencv_imgproc", "opencv_core"] {
