@@ -85,7 +85,7 @@ fn fetch_opencv_mobile(out_dir: &Path, asset: &str) -> Option<PathBuf> {
     let extract_dir = out_dir.join(format!("opencv-mobile-{}-{}", OPENCV_MOBILE_VERSION, asset));
     let stamp = extract_dir.join(".extracted");
     if stamp.exists() {
-        return Some(extract_dir);
+        return Some(resolve_opencv_root(&extract_dir));
     }
 
     let zip_path = out_dir.join(&zip_name);
@@ -125,7 +125,45 @@ fn fetch_opencv_mobile(out_dir: &Path, asset: &str) -> Option<PathBuf> {
         return None;
     }
     std::fs::write(&stamp, b"ok").ok()?;
-    Some(extract_dir)
+    Some(resolve_opencv_root(&extract_dir))
+}
+
+/// Find the actual package root inside the unpacked directory.
+///
+/// opencv-mobile's Apple zips drop `opencv2.framework` straight at the
+/// archive root, but the Linux / Windows / Android zips wrap everything in a
+/// top-level `opencv-mobile-<ver>-<asset>/` folder (and cross-compile assets
+/// add a further arch-triple level), so the real `include/` + `lib/` live one
+/// or two directories down. Probe a few levels so either layout resolves to
+/// the directory that actually contains the OpenCV headers / framework.
+fn resolve_opencv_root(extract_dir: &Path) -> PathBuf {
+    fn is_root(d: &Path) -> bool {
+        d.join("opencv2.framework").exists() || d.join("include").join("opencv2").exists()
+    }
+    let mut queue = vec![extract_dir.to_path_buf()];
+    for _ in 0..4 {
+        let mut next = Vec::new();
+        for dir in &queue {
+            if is_root(dir) {
+                return dir.clone();
+            }
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        next.push(p);
+                    }
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        queue = next;
+    }
+    // Fall back to the extract dir; the include / link directives below then
+    // surface a clear "opencv2/core.hpp: No such file" rather than guessing.
+    extract_dir.to_path_buf()
 }
 
 /// Configure cc::Build and emit cargo:rustc-link-* directives so the
