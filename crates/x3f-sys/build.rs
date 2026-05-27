@@ -192,6 +192,16 @@ fn configure_opencv(build: &mut cc::Build, target: &str, root: &Path) {
         for lib in ["opencv_photo", "opencv_imgproc", "opencv_core"] {
             println!("cargo:rustc-link-lib=static={}", lib);
         }
+        // The Linux prebuilt parallelizes `cv::parallel_for_` with OpenMP, so
+        // libopencv_core.a's parallel.cpp.o references GOMP_*/omp_* symbols.
+        // Link the GNU OpenMP runtime (shipped with gcc) so they resolve;
+        // emitted after the opencv archives so the static-archive references
+        // are still open when the linker reaches it. (Android ships libomp
+        // via the NDK and Windows MSVC pulls vcomp in via #pragma — neither
+        // is built in CI, so scope this to glibc/musl Linux.)
+        if target.contains("linux") {
+            println!("cargo:rustc-link-lib=dylib=gomp");
+        }
     }
 }
 
