@@ -127,8 +127,8 @@ fn usage(progname: &str) -> ! {
          \x20  -unprocessed    Dump RAW without any preprocessing\n\
          \x20  -qtop           Dump Quattro top layer without preprocessing\n\
          \x20  -no-crop        Do not crop to active area\n\
-         \x20  -no-denoise     Disable OpenCV NLM denoise (same as -denoise 0)\n\
-         \x20  -denoise <0-10> OpenCV NLM denoise intensity. 0 = off,\n\
+         \x20  -no-denoise     Disable NLM denoise (same as -denoise 0)\n\
+         \x20  -denoise <0-10> NLM denoise intensity. 0 = off,\n\
          \x20                  10 = full strength (default). Intermediate\n\
          \x20                  values linearly scale the NLM sigma.\n\
          \x20  -no-sgain       Do not apply spatial gain (color compensation)\n\

@@ -165,11 +165,14 @@ ships a pure-Rust `sysabi` shim
 that replaces `libc` on this target: the allocator routes through
 `std::alloc`, `memcpy` / `memset` lower to wasm `memory.copy` /
 `memory.fill`, file-I/O is satisfied by an internal `MemFile` cursor
-backing `fmemopen`. `x3f_printf`, `x3f_denoise`, and friends are
-no-op'd by Rust shims in
-[`crates/x3f-sys/src/wasm_c_shims.rs`](../../crates/x3f-sys/src/wasm_c_shims.rs)
-so the wasm cdylib has **zero** unresolved `(import "env" ...)`
-entries — fully self-contained, ready for
+backing `fmemopen`. The variadic `x3f_printf` is no-op'd by a Rust shim in
+[`crates/x3f-sys/src/wasm_c_shims.rs`](../../crates/x3f-sys/src/wasm_c_shims.rs),
+and `x3f_denoise` / `x3f_denoise_active` / `x3f_set_use_opencl` resolve to the
+portable pure-Rust Non-Local Means in
+[`crates/x3f-sys/src/denoise.rs`](../../crates/x3f-sys/src/denoise.rs) — so
+denoise actually runs in the browser (opencv-mobile ships no wasm prebuilt)
+rather than no-op'ing. Together this leaves the wasm cdylib with **zero**
+unresolved `(import "env" ...)` entries — fully self-contained, ready for
 `WebAssembly.instantiateStreaming` with no host-function shims.
 
 ```sh

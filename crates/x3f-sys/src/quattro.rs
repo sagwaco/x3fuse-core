@@ -20,7 +20,8 @@
 //!
 //! Symbol export: `x3f_expand_quattro` is `#[no_mangle] extern "C"`. The
 //! legacy C call site in `src/x3f_process.c` resolves to this Rust function
-//! at link time, after `denoise_stub.c` was edited to drop its stub.
+//! at link time; no C stub competes for the symbol (the old
+//! `csrc/denoise_stub.c` that once held one has been deleted).
 
 use std::slice;
 
@@ -29,14 +30,18 @@ use std::slice;
 /// module is `pub mod quattro;` inside `x3f-sys` and including the bindgen
 /// types here triggers a circular-include problem (the bindings live in
 /// `OUT_DIR` and `include!` is at the crate root).
+///
+/// Fields are `pub(crate)` so the sibling `denoise` module (the portable
+/// pure-Rust NLM) can read and write the same area layout without
+/// re-declaring the struct.
 #[repr(C)]
 pub(crate) struct Area16 {
-    data: *mut u16,
-    buf: *mut std::os::raw::c_void,
-    rows: u32,
-    columns: u32,
-    channels: u32,
-    row_stride: u32,
+    pub(crate) data: *mut u16,
+    pub(crate) buf: *mut std::os::raw::c_void,
+    pub(crate) rows: u32,
+    pub(crate) columns: u32,
+    pub(crate) channels: u32,
+    pub(crate) row_stride: u32,
 }
 
 /// To match `denoise_utils.cpp`'s `O_UV` constant: a bias added to the U/V
@@ -241,13 +246,13 @@ unsafe fn yuv_to_bmt_yis4t(area: *mut Area16) {
     }
 }
 
-// `x3f_denoise_active` is implemented in C++ (src/x3f_denoise.cpp) when
-// opencv-mobile is linked; on wasm32-unknown-unknown the matching no-op
-// stub in csrc/denoise_stub.c resolves the symbol. Either way the call
-// is safe to make unconditionally.
+// `x3f_denoise_active` is implemented in C++ (csrc/x3f_denoise.cpp) when
+// opencv-mobile is linked; otherwise the portable Rust NLM in src/denoise.rs
+// owns the symbol (so it actually denoises on wasm / offline builds instead
+// of no-op'ing). Either way the call is safe to make unconditionally.
 //
 // The `denoise_type` arg is the C `x3f_denoise_type_t` enum from
-// src/x3f_denoise.h; we hardcode 2 = X3F_DENOISE_F23 below since this
+// csrc/x3f_denoise.h; we hardcode 2 = X3F_DENOISE_F23 below since this
 // is the only variant the Quattro path uses (the F23 row of
 // `denoise_types[]` selects sigma h=300 and the Yis4T BMT/YUV transforms,
 // which the Rust code already does in place above).
@@ -257,6 +262,22 @@ const STAGE_POST_UPSAMPLE: i32 = 1;
 
 extern "C" {
     fn x3f_denoise_active(area: *mut Area16, denoise_type: u32, stage: i32, scale: f32);
+}
+
+/// Run an active-area Quattro NLM pass. Uses the portable Rust NLM directly
+/// when `X3F_PORTABLE_DENOISE` is set (A/B testing on an OpenCV build);
+/// otherwise calls `x3f_denoise_active` — opencv-mobile where linked, else the
+/// same Rust NLM via its `#[no_mangle]` symbol.
+///
+/// # Safety
+/// `area` must point to a valid YUV-layout 3-channel `x3f_area16_t`.
+#[inline]
+unsafe fn denoise_active(area: *mut Area16, stage: i32, scale: f32) {
+    if crate::denoise::use_portable() {
+        unsafe { crate::denoise::denoise_active_area(area, X3F_DENOISE_F23, stage, scale) };
+    } else {
+        unsafe { x3f_denoise_active(area, X3F_DENOISE_F23, stage, scale) };
+    }
 }
 
 /// Native Rust replacement for the OpenCV-backed `x3f_expand_quattro`. The
@@ -308,7 +329,7 @@ pub(crate) unsafe extern "C" fn x3f_expand_quattro(
     // `active` is null (caller passed null because denoise was disabled)
     // or when the binary was built without opencv-mobile (WASM).
     if !active.is_null() {
-        unsafe { x3f_denoise_active(active, X3F_DENOISE_F23, STAGE_PRE_UPSAMPLE, scale) };
+        unsafe { denoise_active(active, STAGE_PRE_UPSAMPLE, scale) };
     }
 
     // Step 2: bicubic 2x upsample, per channel, image -> expanded.
@@ -367,7 +388,7 @@ pub(crate) unsafe extern "C" fn x3f_expand_quattro(
     // Runs while `expanded` is still in YUV layout, before the final
     // YUV->BMT transform below.
     if !active_exp.is_null() {
-        unsafe { x3f_denoise_active(active_exp, X3F_DENOISE_F23, STAGE_POST_UPSAMPLE, scale) };
+        unsafe { denoise_active(active_exp, STAGE_POST_UPSAMPLE, scale) };
     }
 
     // Step 4: YUV -> BMT in place on expanded.

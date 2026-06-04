@@ -2,10 +2,14 @@
 //!
 //! The decode + processing pipeline is native Rust in this crate's modules;
 //! the only C/C++ left (an optional OpenCV denoise pass plus log/version
-//! shims) lives in `csrc/`. This crate exposes the C ABI verbatim — function
-//! names, struct layouts, and ownership semantics match the C headers — so it
-//! is **unsafe** to use directly. Almost all callers should consume the
-//! `x3f-core` crate instead, which wraps these bindings in safe RAII types.
+//! shims) lives in `csrc/`. Denoise also has a portable, pure-Rust
+//! Non-Local Means implementation in [`denoise`] that owns the
+//! `x3f_denoise` / `x3f_denoise_active` symbols on every target without an
+//! opencv-mobile prebuilt (wasm, offline, …). This crate exposes the C ABI
+//! verbatim — function names, struct layouts, and ownership semantics match
+//! the C headers — so it is **unsafe** to use directly. Almost all callers
+//! should consume the `x3f-core` crate instead, which wraps these bindings in
+//! safe RAII types.
 //!
 //! `#[repr(C)]` struct/enum layouts are generated at build time by `bindgen`
 //! from `wrapper.h` (see `csrc/`).
@@ -26,39 +30,57 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 // touching their bodies.
 pub mod sysabi;
 
-// `#[no_mangle]` Rust shims for C symbols still referenced from the
-// bindgen-generated bindings on wasm32 (`x3f_printf`, `x3f_denoise`,
-// `x3f_denoise_active`, `x3f_set_use_opencl`). On non-wasm targets
-// these come from compiled C; on wasm32 the C path is unavailable
-// (no wasm-libc) so we provide the symbols directly. See module
-// header for why a 3-arg `x3f_printf` satisfies all variadic call
-// sites at the wasm import boundary.
+// `#[no_mangle]` Rust shim for the variadic `x3f_printf` symbol still
+// referenced from the bindgen-generated bindings on wasm32. On non-wasm
+// targets it comes from compiled C (`csrc/x3f_printf.c`); on wasm32 the C
+// path is unavailable (no wasm-libc) so we provide the symbol directly. See
+// the module header for why a 3-arg `x3f_printf` satisfies all variadic call
+// sites at the wasm import boundary. (`x3f_denoise` / `x3f_denoise_active` /
+// `x3f_set_use_opencl` used to live here too; they now come from the portable
+// Rust denoise in `denoise.rs` — see below.)
 #[cfg(target_arch = "wasm32")]
 mod wasm_c_shims;
-// `#[used]` anchors so cross-crate dead-code elimination doesn't strip
-// the symbols before the bindgen-generated extern decls find them at
-// link time. See the per-static comments in `wasm_c_shims.rs`.
+// `#[used]` anchor so cross-crate dead-code elimination doesn't strip
+// `x3f_printf` before the bindgen-generated extern decl finds it at link time.
 #[cfg(target_arch = "wasm32")]
 mod _wasm_c_shim_anchors {
-    use core::ffi::{c_char, c_int, c_void};
+    use core::ffi::{c_char, c_int};
 
     #[used]
     static A1: unsafe extern "C" fn(c_int, *const c_char, c_int) = super::wasm_c_shims::x3f_printf;
+}
+
+// Portable, pure-Rust Non-Local Means denoise. Always compiled (so host CI
+// type-checks and unit-tests it), but its `#[no_mangle]` C-ABI entry points
+// (`x3f_denoise`, `x3f_denoise_active`, `x3f_set_use_opencl`) are only emitted
+// when opencv-mobile was NOT linked (`cfg(not(x3f_opencv))`, set by build.rs):
+// wasm, offline / docs.rs, and any triple without a prebuilt. On an OpenCV
+// build the C++ in `csrc/` owns those symbols and these are gated out; set
+// `X3F_PORTABLE_DENOISE=1` to route the Rust path anyway (A/B testing).
+mod denoise;
+// `#[used]` anchors so the rlib keeps the Rust denoise symbols for the
+// bindgen-generated extern decls the rest of the crate calls through (same
+// rationale as the wasm `x3f_printf` anchor above).
+#[cfg(not(x3f_opencv))]
+mod _denoise_anchors {
+    use core::ffi::{c_int, c_void};
+
     #[used]
-    static A2: unsafe extern "C" fn(*mut c_void, c_int, f32) = super::wasm_c_shims::x3f_denoise;
+    static D1: unsafe extern "C" fn(*mut c_void, c_int, f32) = super::denoise::x3f_denoise;
     #[used]
-    static A3: unsafe extern "C" fn(*mut c_void, c_int, c_int, f32) =
-        super::wasm_c_shims::x3f_denoise_active;
+    static D2: unsafe extern "C" fn(*mut c_void, c_int, c_int, f32) =
+        super::denoise::x3f_denoise_active;
     #[used]
-    static A4: unsafe extern "C" fn(c_int) = super::wasm_c_shims::x3f_set_use_opencl;
+    static D3: unsafe extern "C" fn(c_int) = super::denoise::x3f_set_use_opencl;
 }
 
 // Native Rust replacement for `x3f_expand_quattro`. The legacy C symbol of
 // the same name in `src/x3f_process.c` resolves to this `#[no_mangle] extern
-// "C"` definition at link time. The corresponding stub was removed from
-// `csrc/denoise_stub.c`; if it returns, you'll see a duplicate-symbol link
-// error. The `#[used]` static below anchors the symbol so cross-crate dead-
-// code elimination cannot strip it before the C call site sees it.
+// "C"` definition at link time. No competing C stub defines it (the old
+// `csrc/denoise_stub.c` was deleted once denoise moved to `src/denoise.rs`);
+// a second definition would be a duplicate-symbol link error. The `#[used]`
+// static below anchors the symbol so cross-crate dead-code elimination cannot
+// strip it before the C call site sees it.
 mod quattro;
 
 // M5b: native Rust TRUE entropy decoder. Opt-in via the `X3F_RUST_DECODE`

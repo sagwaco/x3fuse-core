@@ -102,15 +102,16 @@ pub struct ProcessOptions {
     pub wb: Option<String>,
     /// ZIP-compress DNG/TIFF output.
     pub compress: bool,
-    /// Strength of the OpenCV NLM denoise pass run before color conversion,
-    /// on a 0..=10 scale: `0` disables denoise entirely (equivalent to the
-    /// legacy `-no-denoise`), `10` is full strength (the legacy default,
-    /// byte-identical to the pre-knob output), and intermediate values
-    /// linearly attenuate each sensor's NLM sigma (`scale = intensity / 10`).
-    /// Values above 10 are clamped. Backed by opencv-mobile's
-    /// `fastNlMeansDenoising` on every target except `wasm32-unknown-unknown`
-    /// (where the build falls back to a no-op stub because the WASM ecosystem
-    /// here cannot link C++ stdlib).
+    /// Strength of the NLM denoise pass run before color conversion, on a
+    /// 0..=10 scale: `0` disables denoise entirely (equivalent to the legacy
+    /// `-no-denoise`), `10` is full strength (the legacy default, byte-identical
+    /// to the pre-knob output), and intermediate values linearly attenuate each
+    /// sensor's NLM sigma (`scale = intensity / 10`). Values above 10 are
+    /// clamped. Backed by opencv-mobile's `fastNlMeansDenoising` where a
+    /// prebuilt is linked, and by the portable pure-Rust NLM
+    /// (`x3f-sys/src/denoise.rs`) everywhere else — `wasm32`, offline / docs.rs
+    /// builds, and any triple without an opencv-mobile prebuilt — so denoise
+    /// works on every target instead of no-op'ing.
     pub denoise_intensity: u8,
     /// Directory of pre-rendered DNG `OpcodeList3` blobs (Sigma's per-
     /// model / per-aperture flat-fielding gain maps). When set, the DNG

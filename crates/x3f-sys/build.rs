@@ -9,14 +9,17 @@
 //  - csrc/x3f_printf.c, csrc/x3f_version.c — the log callback + version shim.
 //  - The OpenCV-backed denoise .cpp files (x3f_denoise.cpp +
 //    x3f_denoise_utils.cpp) on targets where we can fetch a prebuilt
-//    opencv-mobile static framework (Apple, Linux, Windows, Android).
-//    On wasm32 cc-rs is skipped entirely (Apple's bundled clang has no
-//    wasm-libc sysroot); the four C symbols still referenced by the
-//    bindgen output (x3f_printf, x3f_denoise, x3f_denoise_active,
-//    x3f_set_use_opencl) are satisfied by Rust shims in
-//    `src/wasm_c_shims.rs`. For non-wasm targets with no opencv-mobile
-//    prebuilt (or offline / docs.rs builds), `csrc/denoise_stub.c`
-//    provides the same no-op fallback.
+//    opencv-mobile static framework (Apple, Linux, Windows, Android). When
+//    they're compiled we emit `cargo:rustc-cfg=x3f_opencv` so the Rust side
+//    keeps the C++ denoise as the default. On wasm32 cc-rs is skipped
+//    entirely (Apple's bundled clang has no wasm-libc sysroot); the variadic
+//    `x3f_printf` symbol referenced by the bindgen output is satisfied by the
+//    Rust shim in `src/wasm_c_shims.rs`.
+//  - Denoise (x3f_denoise / x3f_denoise_active / x3f_set_use_opencl) on every
+//    target WITHOUT an opencv-mobile prebuilt (wasm32, offline / docs.rs
+//    builds, unsupported triples) comes from the portable, pure-Rust
+//    Non-Local Means in `src/denoise.rs` (gated `cfg(not(x3f_opencv))`) —
+//    no C/C++ is compiled for it. This is what makes denoise work on wasm.
 //  - bindgen against wrapper.h emits a single bindings.rs for the C
 //    struct/enum layouts the Rust port mirrors via #[repr(C)].
 //
@@ -37,7 +40,7 @@ const OPENCV_MOBILE_VERSION: &str = "4.13.0";
 
 /// Map a Rust target triple to an opencv-mobile release asset suffix.
 /// Returns `None` for targets we don't have a prebuilt for, in which case
-/// we fall back to the no-op denoise stub.
+/// the portable Rust NLM in `src/denoise.rs` provides the denoise symbols.
 fn opencv_mobile_asset_for(target: &str) -> Option<&'static str> {
     if target.starts_with("wasm32") {
         // wasm32-unknown-unknown can't link C++ stdlib; the prebuilt WASM
@@ -72,12 +75,12 @@ fn opencv_mobile_asset_for(target: &str) -> Option<&'static str> {
 ///
 /// Returns `None` when the prebuilt can't be obtained (no network, `curl` /
 /// `unzip` missing, or the build is running on docs.rs). The caller then
-/// falls back to the no-op denoise stub, so an offline / sandboxed build
-/// still succeeds — it just ships without the OpenCV NLM denoise.
+/// uses the portable Rust NLM in `src/denoise.rs`, so an offline / sandboxed
+/// build still succeeds — and still denoises, just not via opencv-mobile.
 fn fetch_opencv_mobile(out_dir: &Path, asset: &str) -> Option<PathBuf> {
-    // docs.rs builds have no network access; go straight to the stub.
+    // docs.rs builds have no network access; use the portable Rust NLM.
     if env::var_os("DOCS_RS").is_some() {
-        println!("cargo:warning=DOCS_RS set; building without OpenCV denoise (no-op stub)");
+        println!("cargo:warning=DOCS_RS set; building with the portable Rust NLM denoise");
         return None;
     }
 
@@ -103,7 +106,7 @@ fn fetch_opencv_mobile(out_dir: &Path, asset: &str) -> Option<PathBuf> {
         if !matches!(status, Ok(ref s) if s.success()) {
             println!(
                 "cargo:warning=could not fetch opencv-mobile ({url}): {status:?}; \
-                 building without OpenCV denoise (no-op stub)"
+                 building with the portable Rust NLM denoise"
             );
             return None;
         }
@@ -119,7 +122,7 @@ fn fetch_opencv_mobile(out_dir: &Path, asset: &str) -> Option<PathBuf> {
     if !matches!(status, Ok(ref s) if s.success()) {
         println!(
             "cargo:warning=could not extract {}: {status:?}; \
-             building without OpenCV denoise (no-op stub)",
+             building with the portable Rust NLM denoise",
             zip_path.display()
         );
         return None;
@@ -232,10 +235,11 @@ fn clang_target_for(rust_target: &str) -> Option<String> {
 /// skip cc-rs entirely on wasm32 — Apple's bundled clang has no
 /// wasi-libc / wasm-libc sysroot, and the workspace's only remaining
 /// C/C++ files (`x3f_printf.c`, `x3f_denoise.cpp`, …) all `#include
-/// <stdio.h>` / `<inttypes.h>`. The four C symbols still referenced
-/// from the Rust port (`x3f_printf`, `x3f_denoise`, `x3f_denoise_active`,
-/// `x3f_set_use_opencl`) are provided by `#[no_mangle]` Rust shims in
-/// `src/wasm_c_shims.rs`.
+/// <stdio.h>` / `<inttypes.h>`. The variadic `x3f_printf` symbol is
+/// provided by a `#[no_mangle]` Rust shim in `src/wasm_c_shims.rs`; the
+/// denoise symbols (`x3f_denoise`, `x3f_denoise_active`,
+/// `x3f_set_use_opencl`) by the portable Rust NLM in `src/denoise.rs`
+/// (wasm is never `x3f_opencv`, so that module owns them).
 ///
 /// We still run bindgen so `x3f_t` / `x3f_directory_entry_t` /
 /// `x3f_image_data_t` and friends keep their type definitions; the
@@ -344,16 +348,25 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=wrapper.h");
-    println!("cargo:rerun-if-changed=csrc/denoise_stub.c");
     println!("cargo:rerun-if-changed={}", c_src.display());
+
+    // `x3f_opencv` is set further down when (and only when) the opencv-mobile
+    // C++ denoise is actually compiled in. Register it so the cfg is known to
+    // rustc (otherwise the `#[cfg(x3f_opencv)]` gates in `src/denoise.rs` /
+    // `src/lib.rs` trip the `unexpected_cfgs` lint under `-D warnings`). When
+    // it's unset, the portable Rust NLM in `src/denoise.rs` owns the
+    // x3f_denoise / x3f_denoise_active / x3f_set_use_opencl symbols instead.
+    println!("cargo:rustc-check-cfg=cfg(x3f_opencv)");
 
     let version = env::var("CARGO_PKG_VERSION").unwrap();
 
     // wasm32-unknown-unknown / wasm32-wasip* targets either lack a libc
     // sysroot (Apple's bundled clang doesn't ship wasi-libc / wasm-libc) or
     // lack libc altogether (the unknown-unknown ABI). Compile no C/C++ on
-    // wasm targets and let the matching Rust shims in `src/wasm_shim.rs`
-    // satisfy x3f_printf / x3f_version / x3f_denoise / x3f_set_use_opencl.
+    // wasm targets; the variadic `x3f_printf` shim in `src/wasm_c_shims.rs`
+    // and the portable Rust NLM in `src/denoise.rs` (which owns x3f_denoise /
+    // x3f_denoise_active / x3f_set_use_opencl when opencv-mobile isn't linked)
+    // satisfy the remaining symbols.
     if is_wasm {
         compile_wasm_only(&manifest_dir, &c_src, &out_dir, &host);
         return;
@@ -401,8 +414,10 @@ fn main() {
     }
 
     // Denoise: fetch opencv-mobile and compile the denoise .cpp files for
-    // supported targets; otherwise fall back to the no-op stub so the
-    // x3f_denoise / x3f_set_use_opencl symbols still resolve.
+    // supported targets. When no prebuilt is available (unsupported target,
+    // offline, or docs.rs) we compile nothing here and the portable Rust NLM
+    // in `src/denoise.rs` (gated `cfg(not(x3f_opencv))`) provides the
+    // x3f_denoise / x3f_denoise_active / x3f_set_use_opencl symbols instead.
     let denoise_cpp_sources = ["x3f_denoise.cpp", "x3f_denoise_utils.cpp"];
     let opencv_root =
         opencv_mobile_asset_for(&target).and_then(|asset| fetch_opencv_mobile(&out_dir, asset));
@@ -423,12 +438,14 @@ fn main() {
             cpp_build.file(c_src.join(src));
         }
         cpp_build.compile("x3f_denoise");
-    } else {
-        // No prebuilt available (unsupported target, offline, or docs.rs):
-        // link the no-op denoise stub so x3f_denoise / x3f_set_use_opencl
-        // still resolve.
-        build.file(manifest_dir.join("csrc/denoise_stub.c"));
+        // Tell rustc the C++ denoise is linked, so `src/denoise.rs` gates out
+        // its competing `#[no_mangle]` x3f_denoise* definitions and the C++
+        // symbols stay the default. (This keeps the byte output unchanged on
+        // every platform that has an opencv-mobile prebuilt.)
+        println!("cargo:rustc-cfg=x3f_opencv");
     }
+    // else: no opencv-mobile — the Rust NLM in `src/denoise.rs` owns the
+    // denoise symbols (`cfg(not(x3f_opencv))`). Nothing to compile here.
 
     build.compile("x3f");
 

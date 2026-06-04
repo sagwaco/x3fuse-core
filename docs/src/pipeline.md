@@ -139,23 +139,32 @@ Plus the OpenCV NLM denoise path
 [`x3f_denoise_utils.cpp`](../../src/x3f_denoise_utils.cpp)) which links a
 pinned prebuilt
 [`opencv-mobile`](https://github.com/nihui/opencv-mobile) when the
-target has a matching asset (Apple, Linux, Windows, Android). On
-`wasm32-*` cc-rs is skipped entirely; `x3f_denoise` /
-`x3f_denoise_active` / `x3f_set_use_opencl` are satisfied by
-`#[no_mangle]` Rust no-op shims in
+target has a matching asset (Apple, Linux, Windows, Android); `build.rs`
+then emits `cargo:rustc-cfg=x3f_opencv` so the C++ stays the default.
+
+On every target *without* an opencv-mobile prebuilt — `wasm32-*` (cc-rs is
+skipped entirely there), offline / docs.rs builds, and any unsupported
+triple — `x3f_denoise` / `x3f_denoise_active` / `x3f_set_use_opencl` are
+provided by the portable, pure-Rust Non-Local Means in
+[`crates/x3f-sys/src/denoise.rs`](../../crates/x3f-sys/src/denoise.rs)
+(gated `cfg(not(x3f_opencv))`). It mirrors the OpenCV algorithm — fixed-point
+weight LUT, `BORDER_REFLECT_101` windows, per-channel `h`, L1 patch distance,
+V-channel median, and the low-frequency refinement — so denoise actually runs
+on wasm instead of no-op'ing (it is *not* byte-identical to OpenCV, but no
+parity baseline pins it: every tier-2/tier-3 test uses `-no-denoise`). The
+variadic `x3f_printf` shim still lives in
 [`crates/x3f-sys/src/wasm_c_shims.rs`](../../crates/x3f-sys/src/wasm_c_shims.rs).
-For any non-wasm target without an opencv-mobile prebuilt, the C stub
-in
-[`crates/x3f-sys/csrc/denoise_stub.c`](../../crates/x3f-sys/csrc/denoise_stub.c)
-provides the same no-op resolution.
+Set `X3F_PORTABLE_DENOISE=1` to route the Rust path even on an OpenCV build
+(A/B comparison).
 
 Denoise strength is a `0`–`10` intensity (`-denoise <0-10>`, default `10`;
 `-no-denoise` is the alias for `0`). The CLI value rides through the
 pipeline's `denoise` arg and `x3f-core`'s `ProcessOptions::denoise_intensity`;
 [`run_denoising`](../../crates/x3f-sys/src/process.rs) /
 [`expand_quattro`](../../crates/x3f-sys/src/process.rs) map it to a
-`scale = intensity / 10` that the C kernels (`x3f_denoise`,
-`x3f_denoise_active`) multiply onto each sensor's base NLM sigma. `10` →
+`scale = intensity / 10` that the denoise kernels (`x3f_denoise`,
+`x3f_denoise_active` — OpenCV or the portable Rust NLM) multiply onto each
+sensor's base NLM sigma. `10` →
 `scale = 1.0` reproduces the legacy full-strength denoise byte-for-byte (so
 the tier-2 parity baselines are unaffected); `0` gates the pass out entirely.
 

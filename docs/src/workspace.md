@@ -18,8 +18,8 @@ Dependency direction:
 
 ```
 x3f-cli  ──▶  x3f-core  ──▶  x3f-sys  ──FFI──▶  csrc/x3f_printf.c, csrc/x3f_version.c
-                  ▲                              (+ optional opencv-mobile denoise)
-                  │
+                  ▲                              (+ optional opencv-mobile denoise,
+                  │                               else portable src/denoise.rs NLM)
               x3f-ffi-c  (cbindgen → libx3f.{a,dylib,so,wasm})
 ```
 
@@ -47,9 +47,13 @@ Optionally, when `opencv_mobile_asset_for(target)` returns `Some`,
 prebuilt and re-adds the two denoise files
 ([`x3f_denoise.cpp`](../../crates/x3f-sys/csrc/x3f_denoise.cpp),
 [`x3f_denoise_utils.cpp`](../../crates/x3f-sys/csrc/x3f_denoise_utils.cpp)) to a
-separate `cc::Build` with `cpp(true) + std("c++14")`. On
-`wasm32-unknown-unknown` (or offline / docs.rs builds) the build falls
-back to [`csrc/denoise_stub.c`](../../crates/x3f-sys/csrc/denoise_stub.c).
+separate `cc::Build` with `cpp(true) + std("c++14")`, emitting
+`cargo:rustc-cfg=x3f_opencv`. On `wasm32-unknown-unknown` (or offline /
+docs.rs builds, or any unsupported triple) no denoise C/C++ is compiled;
+instead the portable pure-Rust Non-Local Means in
+[`src/denoise.rs`](../../crates/x3f-sys/src/denoise.rs) (gated
+`cfg(not(x3f_opencv))`) owns the `x3f_denoise` / `x3f_denoise_active` /
+`x3f_set_use_opencl` symbols, so denoise still runs.
 
 The Rust modules under
 [`crates/x3f-sys/src/`](../../crates/x3f-sys/src/) are a thin native
@@ -68,9 +72,10 @@ mirror of what used to be in `src/`:
 | `print_meta.rs` | `x3f_print_meta.c` (tier-2-MD5-pinned text dump) | M4b |
 | `process.rs` | `x3f_process.c` master pipeline (preprocess, convert, expand, denoise) | M6e1–10 |
 | `quattro.rs` | Quattro 2×2 expansion (replaces M0 `exit(2)` stub) | M5a |
+| `denoise.rs` | portable Rust NLM (replaces OpenCV `x3f_denoise.cpp` where unlinked) | — |
 | `spatial_gain.rs` | `x3f_spatial_gain.c` | M6d |
 | `sysabi.rs` | wasm32-unknown-unknown libc shim (allocator + no-op file I/O) | M8d-α |
-| `wasm_c_shims.rs` | Rust no-op stubs for `x3f_printf` / `x3f_denoise` on wasm32 | M8d-α-2 |
+| `wasm_c_shims.rs` | Rust no-op shim for the variadic `x3f_printf` on wasm32 | M8d-α-2 |
 | `histogram_wasm_stub.rs`, `print_meta_wasm_stub.rs` | wasm32 fallbacks (no variadics) | M8d-α |
 
 Most of the ported modules export `#[no_mangle] extern "C"` symbols so

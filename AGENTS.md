@@ -4,7 +4,7 @@ This file provides guidance to Agents like Claude Code (claude.ai/code) when wor
 
 ## Project: x3fuse-core
 
-`x3fuse-core` converts Sigma Foveon X3F raw files to DNG / TIFF / PPM / JPEG / metadata. It began as a ~10K-LOC C/C++ codebase and has been **fully ported to a Rust Cargo workspace**; the only non-Rust code left is an optional OpenCV-backed denoise pass (in [crates/x3f-sys/csrc/](crates/x3f-sys/csrc/)). Read [ARCHITECTURE.md](ARCHITECTURE.md) (pipeline + workspace) before non-trivial work; [docs/PORT-PLAN.md](docs/PORT-PLAN.md) is retained as a historical record of the port.
+`x3fuse-core` converts Sigma Foveon X3F raw files to DNG / TIFF / PPM / JPEG / metadata. It began as a ~10K-LOC C/C++ codebase and has been **fully ported to a Rust Cargo workspace**; the only non-Rust code left is an optional OpenCV-backed denoise pass (in [crates/x3f-sys/csrc/](crates/x3f-sys/csrc/)) — which now has a portable pure-Rust Non-Local Means fallback ([crates/x3f-sys/src/denoise.rs](crates/x3f-sys/src/denoise.rs)) that takes over on every target without an opencv-mobile prebuilt (wasm, offline/docs.rs, unsupported triples), so denoise works everywhere. Read [ARCHITECTURE.md](ARCHITECTURE.md) (pipeline + workspace) before non-trivial work; [docs/PORT-PLAN.md](docs/PORT-PLAN.md) is retained as a historical record of the port.
 
 ### Build, test, lint
 
@@ -24,6 +24,7 @@ cargo clippy --workspace --all-targets -- -D warnings   # CI gate
 
 ```
 x3f-cli  ──depends-on──▶  x3f-core  ──depends-on──▶  x3f-sys  ──FFI──▶  csrc/ (OpenCV denoise + shims)
+                                                              └── src/denoise.rs (portable Rust NLM fallback)
 ```
 
 `x3f-sys` is the low-level layer where the `cc-rs` build of the remaining C/C++ lives ([crates/x3f-sys/build.rs](crates/x3f-sys/build.rs), sources in [crates/x3f-sys/csrc/](crates/x3f-sys/csrc/)). `x3f-core` is the safe Rust API outside consumers depend on. `x3f-cli` is the binary.

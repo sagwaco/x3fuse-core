@@ -3,7 +3,7 @@
 A command-line converter for Sigma Foveon **X3F** raw files. It decodes X3F images and writes **DNG**, **TIFF**, **PPM**, embedded **JPEG** thumbnails, **metadata** dumps, and **histogram** CSVs. It supports the Merrill, classic (SD9/SD14-era), and Quattro sensor
 generations.
 
-The converter is written in Rust as a Cargo workspace. The only non-Rust component is an optional OpenCV-backed denoise pass (see [Build](#build)); everything else (container parsing, entropy decode, the processing pipeline, and all output writers) is native Rust.
+The converter is written in Rust as a Cargo workspace. The only non-Rust component is an optional OpenCV-backed denoise pass (see [Build](#build)) — and even that has a portable pure-Rust fallback, so denoise works on every target (including `wasm32`); everything else (container parsing, entropy decode, the processing pipeline, and all output writers) is native Rust.
 
 Built to power [X3Fuse](https://github.com/sagwaco/x3fuse), which provides a GUI for converting X3F files to DNG, TIFF, and JPEG.
 
@@ -49,8 +49,8 @@ Multiple input files are processed in parallel. The legacy single-dash flag synt
 | `-v` / `-q`               | verbose / quiet (errors only)                                                      |
 | `-color <SPACE>`          | RGB color space: `none`, `sRGB`, `AdobeRGB`, `ProPhotoRGB` (does not affect DNG)   |
 | `-compress`               | Deflate/ZIP compression for DNG and TIFF                                           |
-| `-denoise <0-10>`         | OpenCV NLM denoise intensity: `0` = off, `10` = full strength (**default**); intermediate values linearly scale the NLM sigma |
-| `-no-denoise`             | disable the OpenCV NLM denoise pass (alias for `-denoise 0`)                        |
+| `-denoise <0-10>`         | NLM denoise intensity: `0` = off, `10` = full strength (**default**); intermediate values linearly scale the NLM sigma |
+| `-no-denoise`             | disable the NLM denoise pass (alias for `-denoise 0`)                               |
 | `-no-crop`                | do not crop to the active image area                                               |
 | `-no-sgain` / `-sgain`    | disable / force spatial-gain (lens color) compensation                             |
 | `-no-fix-bad`             | do not fix bad pixels                                                              |
@@ -106,7 +106,9 @@ x3f-cli  ──▶  x3f-core  ──▶  x3f-sys  ──FFI──▶  C/C++ (den
 - [crates/x3f-cli](crates/x3f-cli) — the `x3f_extract` binary.
 - [crates/x3f-core](crates/x3f-core) — safe Rust API for reading and converting X3F images.
 - [crates/x3f-sys](crates/x3f-sys) — low-level layer; bindgen FFI and the small remaining
-  C/C++ ([crates/x3f-sys/csrc/](crates/x3f-sys/csrc)) for the OpenCV denoise pass.
+  C/C++ ([crates/x3f-sys/csrc/](crates/x3f-sys/csrc)) for the OpenCV denoise pass, plus a
+  portable pure-Rust NLM denoise ([src/denoise.rs](crates/x3f-sys/src/denoise.rs)) used where
+  OpenCV isn't linked (wasm, offline builds).
 - [crates/x3f-ffi-c](crates/x3f-ffi-c) — C ABI wrapper for iOS / Android / WASM consumers.
 - [opcodes/](opcodes) — pre-rendered DNG `OpcodeList3` flat-fielding blobs for Merrill bodies.
 - [docs/](docs) — the [mdbook](https://rust-lang.github.io/mdBook/) (pipeline, format
