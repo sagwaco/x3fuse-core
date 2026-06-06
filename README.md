@@ -5,6 +5,8 @@ generations.
 
 The converter is written in Rust as a Cargo workspace. The only non-Rust component is an optional OpenCV-backed denoise pass (see [Build](#build)); everything else (container parsing, entropy decode, the processing pipeline, and all output writers) is native Rust.
 
+Built to power [X3Fuse](https://github.com/sagwaco/x3fuse), which provides a GUI for converting X3F files to DNG, TIFF, and JPEG.
+
 ## Build
 
 The only prerequisite is a Rust toolchain ([rustup](https://rustup.rs)):
