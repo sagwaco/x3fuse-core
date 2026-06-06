@@ -75,6 +75,17 @@ expected MD5s. When a hash _should_ change (you're shipping an
 intentional algorithm tweak), call it out in the commit message and
 update the test expectation as part of the same change.
 
+**The denoise output is _not_ part of the byte-parity gate.** Every
+tier-2/tier-3 test runs with `-no-denoise`, so the MD5 baselines above
+don't constrain the denoise kernels at all. The portable pure-Rust NLM in
+[`crates/x3f-sys/src/denoise.rs`](../../crates/x3f-sys/src/denoise.rs)
+(used wherever opencv-mobile isn't linked — wasm, offline builds, …) is a
+faithful but deliberately _not_ byte-identical reimplementation of
+opencv-mobile's `fastNlMeansDenoising` (floating-point `exp`, INTER_AREA /
+INTER_CUBIC rounding differ). On real images it tracks OpenCV to ~99.98%
+of bytes. If you need to A/B the two on a platform that has both, set
+`X3F_PORTABLE_DENOISE=1` to force the Rust path on an OpenCV build.
+
 ### Legacy CLI flag syntax is preserved
 
 Single-dash flags (`-dng`, `-tiff`, `-color sRGB`, `-no-denoise`, …)
