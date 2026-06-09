@@ -86,11 +86,32 @@ The `convert_data` function is the hot loop. In order:
 
 The DNG path replaces stages 7–9 with `apply_highlight_clip_dng`
 (M6e9): per-pixel CLUT/RepairPix/`L*p`/matrix-pathology gate
-(sg-amplified preview) → bake-sg-into-raw → global-max scale +
-uniform divide-down so all channels fit within `WhiteLevel`. The
-divide-down factor is published as `BaselineExposure = log2(scale)`
-in the DNG, so Lightroom restores brightness on import without
-clamping recovered chroma.
+(sg-amplified preview) → bake-sg-into-raw → baked soft highlight
+shoulder. With `-dng-highlight-recovery` the CLUT step uses the
+generalized BMT apply (`chroma_lut_apply_pixel_bmt`): three
+scene-derived tables reconstruct whichever single channel clipped
+(T from B,M; B from M,T; M from B,T) so recovered highlights keep
+scene chroma, and only multi-channel clips fall back to the neutral
+`L*p` snap. Recovered values overshoot the sensor white point, so a
+global-max scan drives a per-pixel soft shoulder (`L' = knee +
+(1-knee)·(1-(1-t/s)^s)`, knee 0.85 via `X3F_DNG_SHOULDER_KNEE`,
+slope-1/C1 at the knee, chroma-preserving uniform per-pixel scale)
+that compresses `[knee, global_max]` into `[knee, WhiteLevel]`. The
+knee is published as `LinearResponseLimit`. An earlier design
+divided the whole raster down and compensated via a
+`BaselineExposure = log2(scale)` nudge instead — that rendered
+correctly only in readers that honour BE (it is an optional hint in
+the DNG spec), so it was replaced by the baked shoulder.
+
+The writer then equalizes the three channels into one shared
+encoding range (`output::dng::equalize_levels`): the per-channel
+saturation points (e.g. Merrill `[16383, 7695, 4829]`) are baked
+into the raster and the tags become a uniform `BlackLevel = 0` /
+`WhiteLevel = 65535`. Adobe and LibRaw normalize per-channel
+WhiteLevel correctly, but Apple's RAW engine and Capture One do not
+(single-level normalization destroys the channel ratios — the
+historical magenta/green casts in those apps), and baking the
+normalization is loss-free since each channel gains range.
 
 The hot loop is parallelised by row via `rayon::par_chunks_mut`
 (M7a/c) and decode is parallelised by plane (M7d). Single-image

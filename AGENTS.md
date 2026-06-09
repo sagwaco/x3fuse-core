@@ -36,7 +36,7 @@ x3f-cli  ──depends-on──▶  x3f-core  ──depends-on──▶  x3f-sys
 - **Highlight-recovery is the actively-iterated hot loop.** The chroma LUT, RepairPix, and matrix-pathology gate live in [crates/x3f-sys/src/highlight.rs](crates/x3f-sys/src/highlight.rs) and [process.rs](crates/x3f-sys/src/process.rs). Don't refactor while changing behavior; pair-review changes there.
 - **Byte-identical parity is the gate.** Tier-2 MD5s on three baselines (SD1M `dcaa9929…`, older raw `_SDI8040` `41a80ce6…`, Quattro `_SDI8284` `c2f70f35…`) must match unless a change is an _intentional_ algorithm change.
 - **Legacy CLI flag syntax is preserved.** Single-dash flags (`-dng`, `-tiff`, `-color sRGB`, `-no-denoise`, …) are kept verbatim so existing scripts and the test corpus continue to work. A modern subcommand interface is deferred.
-- **`X3F_*` env vars are preserved.** Tunables like `X3F_NO_CHROMA_LUT`, `X3F_REPAIR_PIX`, `X3F_EV`, `X3F_GATE_THR`, `X3F_GATE_WIDTH`, `X3F_CHROMA_LUT_TRACE` keep working.
+- **`X3F_*` env vars are preserved.** Tunables like `X3F_NO_CHROMA_LUT`, `X3F_REPAIR_PIX`, `X3F_EV`, `X3F_GATE_THR`, `X3F_GATE_WIDTH`, `X3F_CHROMA_LUT_TRACE`, `X3F_DNG_SHOULDER_KNEE` keep working.
 - **FFI ABI for the denoise boundary stays stable.** The one struct that still crosses into C++ (`x3f_area16_t`) is mirrored with `#[repr(C)]`; bindgen generates the rest of the layouts from the headers in `csrc/`. Heap allocations made on one side and freed on the other use `libc::malloc`/`free`.
 
 ### Test corpus

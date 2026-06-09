@@ -86,7 +86,7 @@ x3f_extract -meta input.X3F
 
 ## Foveon highlight recovery (DNG)
 
-Pass `-dng-highlight-recovery` to enable the Foveon highlight-recovery pipeline. Highlight recovery is not compatible with some RAW engines, and is only tested in Adobe Camera Raw (Lightroom) and RawTherapee.
+Pass `-dng-highlight-recovery` to enable the Foveon highlight-recovery pipeline: clipped channels are reconstructed per-channel from a scene-derived chroma LUT (with a neutral fallback for fully blown pixels), and the recovered overshoot is folded back under `WhiteLevel` by a soft highlight shoulder baked into the raster (knee tunable via `X3F_DNG_SHOULDER_KNEE`, default `0.85`; published as `LinearResponseLimit`). The output is self-contained — no reliance on `BaselineExposure` or other optional-to-honour DNG hints — so recovered DNGs render consistently in Adobe Camera Raw / Lightroom, LibRaw / RawTherapee, Capture One, and Apple's RAW engine.
 
 ## RAW Compression
 
@@ -94,8 +94,7 @@ Pass `-compress` to enable RAW zip compression from TIFF and DNG outputs. Note t
 
 ## RAW Compatibility
 
-Because Foveon sensors do not have a traditional demosaicing step, output DNGs are written as **Linear DNGs** (`PhotometricInterpretation = LinearRaw`) — spec-compliant, but a less common path that many RAW engines (notably Apple RAW) handle poorly, since their decoders are tuned for mosaiced sensors and may misapply the embedded color matrices, levels, or
-highlight logic. For best results, prefer Adobe Camera Raw / Lightroom or RawTherapee. For use with other RAW engines, consider exporting as 16-bit TIFF with a flat `-cineon` gamma curve.
+Because Foveon sensors do not have a traditional demosaicing step, output DNGs are written as **Linear DNGs** (`PhotometricInterpretation = LinearRaw`) — spec-compliant, but a less common path some RAW engines exercise poorly. The writer therefore avoids every LinearRaw feature known to be mishandled outside Adobe: the per-channel saturation points are baked into the raster so the tags are a uniform `BlackLevel = 0` / `WhiteLevel = 65535` (Apple RAW and Capture One mis-normalize per-channel `WhiteLevel` on 3-sample LinearRaw), and highlight recovery never depends on `BaselineExposure` being honoured. Output is tested against Adobe Camera Raw / Lightroom, LibRaw / RawTherapee, and Apple's RAW engine.
 
 ## Workspace layout
 

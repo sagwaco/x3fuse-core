@@ -212,8 +212,9 @@ pub use spatial_gain::{
 // points remain C until later phases.
 mod process;
 pub use process::{
-    x3f_get_bmt_to_xyz, x3f_get_dng_highlight_scale, x3f_get_gain, x3f_get_image, x3f_get_preview,
-    x3f_get_raw_to_xyz, x3f_set_cineon, x3f_set_dng_highlight_recovery,
+    x3f_get_bmt_to_xyz, x3f_get_dng_highlight_scale, x3f_get_dng_shoulder_knee, x3f_get_gain,
+    x3f_get_image, x3f_get_preview, x3f_get_raw_to_xyz, x3f_set_cineon,
+    x3f_set_dng_highlight_recovery,
 };
 
 // M6e4: highlight-recovery family (highlight_params, chroma LUT, sat
@@ -223,8 +224,9 @@ pub use process::{
 // these on the stack and passing them by pointer.
 mod highlight;
 pub use highlight::{
-    build_sat_map, chroma_lut_apply_pixel, chroma_lut_apply_stats_print, chroma_lut_apply_stats_t,
-    chroma_lut_build_from_image, chroma_lut_init_defaults, chroma_lut_t, compute_chroma_prior,
-    get_highlight_params, highlight_params_t, reconstruct_highlights, repair_pix_apply_pixel,
-    repair_pix_init_defaults, repair_pix_t,
+    build_sat_map, chroma_lut_apply_pixel, chroma_lut_apply_pixel_bmt,
+    chroma_lut_apply_stats_print, chroma_lut_apply_stats_t, chroma_lut_build_from_image,
+    chroma_lut_init_defaults, chroma_lut_t, compute_chroma_prior, get_highlight_params,
+    highlight_params_t, reconstruct_highlights, repair_pix_apply_pixel, repair_pix_init_defaults,
+    repair_pix_t,
 };

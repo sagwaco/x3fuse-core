@@ -2342,16 +2342,16 @@ thread_local! {
     static DNG_HIGHLIGHT_SCALE: std::cell::Cell<f64> = const { std::cell::Cell::new(1.0) };
     /// Controls the DNG-path highlight-recovery pipeline. When `false`
     /// (default), `apply_highlight_clip_dng` skips the chroma LUT, L*p
-    /// reconstruction, repair_pix, and matrix-pathology gate, ships the
-    /// raster within sensor-native `WhiteLevel` via a per-pixel uniform
-    /// cap, and publishes `DNG_HIGHLIGHT_SCALE = 1.0` so the writer
-    /// emits BaselineExposure ≈ 0. Renderers that don't honour the
-    /// log2(scale) BE nudge (Capture One, Apple RAW Engine) get a
-    /// self-consistent DNG that matches the pre-Rust C writer's output.
-    /// When `true`, the original recovery + global_max scale-down + BE
-    /// compensation runs — Adobe Camera Raw, Lightroom, and
-    /// RawTherapee/LibRaw honour the BE nudge and benefit from the
-    /// recovered chroma, but other renderers cast green/blue.
+    /// reconstruction, repair_pix, and matrix-pathology gate, and ships
+    /// the raster within sensor-native `WhiteLevel` via a per-pixel
+    /// uniform cap (matches the pre-Rust C writer's output). When
+    /// `true`, the recovery pipeline runs (generalized per-channel
+    /// chroma-LUT reconstruction + L*p fallback + matrix-pathology
+    /// gate) and the recovered overshoot is folded back under
+    /// WhiteLevel by a baked soft highlight shoulder (see Pass 3 in
+    /// `apply_highlight_clip_dng`) — no BaselineExposure compensation,
+    /// so the result renders identically in every DNG reader (ACR,
+    /// LibRaw, Capture One, Apple RAW Engine).
     static DNG_HIGHLIGHT_RECOVERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
     /// Per-conversion Cineon-log TIFF toggle. Set by callers immediately
@@ -2375,6 +2375,44 @@ thread_local! {
 #[no_mangle]
 pub unsafe extern "C" fn x3f_get_dng_highlight_scale() -> f64 {
     DNG_HIGHLIGHT_SCALE.with(|c| c.get())
+}
+
+/// The luminance (as a fraction of WhiteLevel) where the DNG recovery
+/// path's baked highlight shoulder starts — below it the raster is
+/// strictly linear. Tunable via `X3F_DNG_SHOULDER_KNEE`, clamped to
+/// [0.5, 0.99]. Stateless: reads the env on every call so the writer
+/// (x3f-core) and the shoulder pass here can't disagree.
+fn dng_shoulder_knee() -> f64 {
+    let mut knee = 0.85_f64;
+    if let Some(v) = env_atof("X3F_DNG_SHOULDER_KNEE") {
+        knee = v;
+    }
+    knee.clamp(0.5, 0.99)
+}
+
+/// FFI accessor for [`dng_shoulder_knee`] — the DNG writer publishes it
+/// as `LinearResponseLimit` when highlight recovery ran, telling DNG
+/// readers the top of the encoding range is no longer scene-linear.
+#[no_mangle]
+pub unsafe extern "C" fn x3f_get_dng_shoulder_knee() -> f64 {
+    dng_shoulder_knee()
+}
+
+/// The baked highlight shoulder: maps a luminance `lum` in
+/// `(knee, global_max]` into `(knee, 1.0]` with the power soft clip
+/// `g(t) = 1 - (1 - t/s)^s` on the normalized overshoot
+/// `t = (lum - knee)/(1 - knee)`, where
+/// `s = (global_max - knee)/(1 - knee)` is the normalized overshoot
+/// ceiling. Properties (see the unit tests): identity when
+/// `global_max == 1` (`s == 1` ⇒ `g(t) = t`), slope 1 at the knee
+/// (`g'(0) = 1`, so the curve is C1 against the linear segment below),
+/// monotone, and `g(s) = 1` (the brightest recovered pixel lands
+/// exactly on WhiteLevel).
+#[inline]
+fn shoulder_compress(lum: f64, knee: f64, shoulder_s: f64) -> f64 {
+    let t = (lum - knee) / (1.0 - knee);
+    let compressed = 1.0 - (1.0 - (t / shoulder_s).min(1.0)).powf(shoulder_s);
+    knee + (1.0 - knee) * compressed
 }
 
 /// Toggle the DNG-path highlight-recovery pipeline. See
@@ -2467,8 +2505,13 @@ unsafe fn dng_clip_row(
         // Recovery is per-pixel gated on `ctx.recovery` so the cost
         // of dispatching is paid once per row when off, and the
         // matrix-pathology preview block below matches the same gate.
+        // M8 — the DNG path uses the generalized BMT apply (T repair
+        // first, then the B-/M-clipped identities) so single-clipped-
+        // channel pixels keep scene chroma instead of neutral-snapping.
+        // The TIFF/PPM path (convert_row) keeps the original T-only
+        // `chroma_lut_apply_pixel` — its output is MD5-pinned.
         let clut_applied = if ctx.recovery && ctx.use_clut {
-            unsafe { chroma_lut_apply_pixel(sat_ratio.as_mut_ptr(), ctx.clut, stats) }
+            unsafe { chroma_lut_apply_pixel_bmt(sat_ratio.as_mut_ptr(), ctx.clut, stats) }
         } else {
             0
         };
@@ -2709,15 +2752,31 @@ pub unsafe extern "C" fn apply_highlight_clip_dng(
     // Pass 2 + Pass 3 only run when recovery is ON. With recovery OFF,
     // Pass 1 already capped each pixel at sat_ratio ≤ 1 via the
     // per-pixel uniform cap, so the raster is strictly within
-    // sensor-native WhiteLevel and we publish DNG_HIGHLIGHT_SCALE = 1
-    // (the writer omits the BaselineExposure log2 nudge).
+    // sensor-native WhiteLevel.
     //
-    // With recovery ON, recovered pixels overshoot WhiteLevel; Pass 2
-    // scans for the global max sat_ratio so Pass 3 can divide-down
-    // uniformly, and the writer adds `log2(global_max)` to
-    // BaselineExposure so Lightroom / ACR / RawTherapee restore the
-    // brightness on import — the recovered highlight detail unfolds
-    // back to its captured luminance via the renderer's tone curve.
+    // With recovery ON, recovered pixels overshoot WhiteLevel. An
+    // earlier design divided the whole raster down by the global max
+    // and published `log2(global_max)` as a BaselineExposure nudge for
+    // the renderer to undo — but BaselineExposure is an *optional* hint
+    // in the DNG spec (readers "should" vary their zero point, not
+    // "must"), and renderers that ignore it (Capture One among them)
+    // rendered the file several stops dark. Instead, Pass 3 now bakes a
+    // soft highlight shoulder into the raster itself: pixel luminance
+    // (max-channel sat_ratio) below the knee is untouched; the
+    // [knee, global_max] range is compressed into [knee, 1.0] with the
+    // C1-continuous soft clip
+    //
+    //   L' = knee + (1-knee) * (1 - (1 - t/s)^s),
+    //   t  = (L - knee)/(1 - knee),  s = (global_max - knee)/(1 - knee)
+    //
+    // (slope 1 at the knee; identity when global_max == 1). All three
+    // channels scale by L'/L, so per-pixel chromaticity — including the
+    // recovered chroma — survives the renderer's white balance and
+    // matrix exactly. The result is self-consistent for *every* DNG
+    // reader: nothing exceeds WhiteLevel and no optional tag needs to
+    // be honoured. This mirrors what Sigma Photo Pro itself does —
+    // recovered highlights are tone-mapped into display range, not
+    // shipped as scene-linear overrange.
     let mut global_max = 1.0_f64;
     if recovery {
         global_max = {
@@ -2745,18 +2804,31 @@ pub unsafe extern "C" fn apply_highlight_clip_dng(
         };
         if global_max > 1.0 {
             use rayon::prelude::*;
-            let inv = 1.0 / global_max;
+            let knee = dng_shoulder_knee();
+            let shoulder_s = (global_max - knee) / (1.0 - knee);
             let black = il.black;
             let white = il.white;
             let cols = img.columns as usize;
             data.par_chunks_mut(row_stride).for_each(|row_data| {
                 for col in 0..cols {
                     let off = col * channels;
+                    let mut sr = [0.0_f64; 3];
+                    let mut lum = 0.0_f64;
                     for color in 0..3 {
                         let v = row_data[off + color] as f64;
                         let range = white[color] as f64 - black[color];
-                        let sr = (v - black[color]) / range * inv;
-                        let out = (sr * range + black[color]).round() as i32;
+                        sr[color] = (v - black[color]) / range;
+                        if sr[color] > lum {
+                            lum = sr[color];
+                        }
+                    }
+                    if lum <= knee {
+                        continue;
+                    }
+                    let scale = shoulder_compress(lum, knee, shoulder_s) / lum;
+                    for color in 0..3 {
+                        let range = white[color] as f64 - black[color];
+                        let out = (sr[color] * scale * range + black[color]).round() as i32;
                         row_data[off + color] = if out < 0 {
                             0
                         } else if out > 65535 {
@@ -2787,12 +2859,13 @@ pub unsafe extern "C" fn apply_highlight_clip_dng(
     // x3f-core::image::Reader::get_image which snapshots the cell
     // immediately after this returns.
     //
-    // With recovery ON, this is `global_max` so the writer adds
-    // log2(global_max) to BaselineExposure (Lightroom/ACR/RawTherapee
-    // pull recovered highlights back via the BE nudge). With recovery
-    // OFF the raster is already within WhiteLevel, so we publish 1.0
-    // and the writer emits BE = log2(captureISO/sensorISO) only.
-    DNG_HIGHLIGHT_SCALE.with(|c| c.set(if recovery { global_max } else { 1.0 }));
+    // Since the shoulder bake (Pass 3) the raster always fits within
+    // sensor-native WhiteLevel, so this is always 1.0 — the writer
+    // emits BE = log2(captureISO/sensorISO) only, with no renderer-
+    // dependent compensation. The cell + plumbing are kept so the
+    // writer-side contract (`Image::dng_highlight_scale`) is unchanged.
+    let _ = global_max;
+    DNG_HIGHLIGHT_SCALE.with(|c| c.set(1.0));
 }
 
 // ----------------------------------------------------------------------
@@ -3163,3 +3236,58 @@ static _A_X3F_GET_PREVIEW: unsafe extern "C" fn(
     u32,
     *mut x3f_area8_t,
 ) -> libc::c_int = x3f_get_preview;
+
+#[cfg(test)]
+mod tests {
+    use super::shoulder_compress;
+
+    fn s_for(global_max: f64, knee: f64) -> f64 {
+        (global_max - knee) / (1.0 - knee)
+    }
+
+    #[test]
+    fn shoulder_is_identity_when_no_overshoot() {
+        // global_max == 1.0 ⇒ s == 1 ⇒ g(t) = t.
+        let s = s_for(1.0, 0.85);
+        for lum in [0.86, 0.9, 0.95, 1.0] {
+            assert!((shoulder_compress(lum, 0.85, s) - lum).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn shoulder_maps_global_max_to_white() {
+        let knee = 0.85;
+        for global_max in [1.1, 1.75, 3.59] {
+            let s = s_for(global_max, knee);
+            let top = shoulder_compress(global_max, knee, s);
+            assert!((top - 1.0).abs() < 1e-12, "g(s) = {top}");
+        }
+    }
+
+    #[test]
+    fn shoulder_is_continuous_and_unit_slope_at_knee() {
+        let knee = 0.85;
+        let s = s_for(2.0, knee);
+        // g(knee) == knee (continuous against the linear segment).
+        assert!((shoulder_compress(knee, knee, s) - knee).abs() < 1e-12);
+        // Forward difference at the knee ≈ 1 (C1 join).
+        let eps = 1e-7;
+        let slope = (shoulder_compress(knee + eps, knee, s) - knee) / eps;
+        assert!((slope - 1.0).abs() < 1e-4, "slope at knee = {slope}");
+    }
+
+    #[test]
+    fn shoulder_is_monotone() {
+        let knee = 0.85;
+        let s = s_for(3.0, knee);
+        let mut prev = knee;
+        let mut lum = knee;
+        while lum < 3.0 {
+            lum += 0.01;
+            let v = shoulder_compress(lum, knee, s);
+            assert!(v >= prev - 1e-12, "non-monotone at lum={lum}");
+            assert!(v <= 1.0 + 1e-12);
+            prev = v;
+        }
+    }
+}
