@@ -14,10 +14,9 @@ x3f-sys.workspace = true
 thiserror.workspace = true
 libc = "0.2"
 tiff = "0.10"
-flate2 = "1"
-# M7d: rayon par_iter over DNG strips. Each strip's horizontal-predictor
-# + zlib pass is independent (no cross-strip state) and zlib dominates
-# DNG output wall-time on uncompressed inputs.
+# M7d: rayon par_iter over DNG strips. Each strip's encode pass is
+# independent (no cross-strip state) and compression dominates DNG
+# output wall-time on uncompressed inputs.
 rayon = "1.10"
 
 [lints]

@@ -1,40 +1,27 @@
-//! Portable, dependency-free Non-Local Means denoise — a pure-Rust
-//! reimplementation of the OpenCV-backed `x3f_denoise` / `x3f_denoise_active`
-//! pipeline (`csrc/x3f_denoise.cpp` + `csrc/x3f_denoise_utils.cpp`).
+//! Portable, dependency-free Non-Local Means denoise — the sole denoise
+//! implementation, called directly by the pipeline (`run_denoising` in
+//! `process.rs` and the two Quattro passes in `quattro.rs`).
 //!
-//! ## Why this exists
+//! ## History
 //!
-//! The legacy denoise pass links against opencv-mobile's `cv::photo`
-//! (`fastNlMeansDenoising`, `medianBlur`, `resize`). opencv-mobile ships
-//! prebuilt static archives for Apple / Linux / Windows / Android, but **not**
-//! for `wasm32` (and offline / docs.rs builds can't fetch it at all). On those
-//! targets the denoise symbols used to resolve to no-op stubs
-//! (`csrc/denoise_stub.c`, `src/wasm_c_shims.rs`), so denoise silently did
-//! nothing. This module fills that gap with an equivalent algorithm written
-//! entirely in Rust, so denoise works everywhere the rest of the pipeline does.
-//!
-//! ## What runs where
-//!
-//! * On targets that linked opencv-mobile (`cfg(x3f_opencv)`, emitted by
-//!   `build.rs`) the C++ path stays the default so its byte output is
-//!   unchanged. This module is still compiled (so host CI type-checks and
-//!   unit-tests it), but its `#[no_mangle]` C-ABI entry points are gated out;
-//!   the C++ definitions own those symbols. Set `X3F_PORTABLE_DENOISE=1` to
-//!   route the Rust path even on an OpenCV build (handy for A/B comparison).
-//! * On every other target (`cfg(not(x3f_opencv))` — wasm, offline, docs.rs,
-//!   any triple without a prebuilt) the `#[no_mangle]` wrappers below *are*
-//!   the `x3f_denoise` / `x3f_denoise_active` / `x3f_set_use_opencl` symbols.
+//! The denoise pass originally linked against opencv-mobile's `cv::photo`
+//! (`fastNlMeansDenoising`, `medianBlur`, `resize`), which shipped prebuilt
+//! static archives for Apple / Linux / Windows / Android but not for `wasm32`
+//! (and offline / docs.rs builds couldn't fetch it). This module was written as
+//! a pure-Rust equivalent so denoise worked everywhere; it has since replaced
+//! OpenCV entirely on every target. The C++ sources and the opencv-mobile fetch
+//! in `build.rs` are gone.
 //!
 //! ## Fidelity
 //!
-//! The algorithm mirrors OpenCV closely — the same fixed-point weight LUT,
-//! `BORDER_REFLECT_101` template/search windows, per-channel `h`, L1 patch
-//! distance, V-channel 3×3 median, and the low-frequency
-//! down/denoise/subtract/up/subtract refinement. It is **not** byte-identical
-//! to OpenCV (floating-point `exp`, INTER_AREA / INTER_CUBIC fixed-point and
-//! rounding differ), and no parity baseline pins it: every tier-2/tier-3 test
-//! runs with `-no-denoise`. The goal is a visually equivalent denoise, not a
-//! bit-exact clone.
+//! The algorithm mirrors the original OpenCV pipeline closely — the same
+//! fixed-point weight LUT, `BORDER_REFLECT_101` template/search windows,
+//! per-channel `h`, L1 patch distance, V-channel 3×3 median, and the
+//! low-frequency down/denoise/subtract/up/subtract refinement. It is **not**
+//! byte-identical to the old OpenCV output (floating-point `exp`, INTER_AREA /
+//! INTER_CUBIC fixed-point and rounding differ), and no parity baseline pins
+//! it: every tier-2/tier-3 test runs with `-no-denoise`. The goal is a visually
+//! equivalent denoise, not a bit-exact clone.
 
 use crate::quattro::Area16;
 
@@ -42,7 +29,14 @@ use crate::quattro::Area16;
 // Denoise type table (mirror of `denoise_types[]` in x3f_denoise_utils.h)
 // ----------------------------------------------------------------------
 
-/// The three BMT↔YUV transform families, selected by `x3f_denoise_type_t`.
+/// Sensor-type selector passed by callers (`denoise_area` / `denoise_active_area`),
+/// mapped to a `DType` via `DType::from_u32`. Values match the legacy
+/// `x3f_denoise_type_t` enum so existing call sites and behaviour are preserved.
+pub(crate) const DENOISE_STD: u32 = 0;
+pub(crate) const DENOISE_F20: u32 = 1;
+pub(crate) const DENOISE_F23: u32 = 2;
+
+/// The three BMT↔YUV transform families, selected by the sensor type.
 /// Each carries the per-sensor base NLM sigma `h` from `denoise_types[]`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DType {
@@ -873,18 +867,11 @@ unsafe fn yuv_to_bmt(area: *mut Area16, dt: DType) {
 }
 
 // ----------------------------------------------------------------------
-// Internal entry points (always compiled; called by the FFI wrappers below
-// and, when X3F_PORTABLE_DENOISE is set, directly from the Rust pipeline)
+// Entry points — called directly by the pipeline (`run_denoising` in
+// process.rs and the two Quattro passes in quattro.rs).
 // ----------------------------------------------------------------------
 
-/// Whether the pipeline should force the portable Rust denoise even on an
-/// OpenCV build. On `cfg(not(x3f_opencv))` the FFI symbols already are this
-/// code, so the flag only matters for A/B testing against opencv-mobile.
-pub(crate) fn use_portable() -> bool {
-    std::env::var_os("X3F_PORTABLE_DENOISE").is_some()
-}
-
-/// Rust equivalent of `x3f_denoise`: BMT→YUV, full `denoise_nlm`, YUV→BMT.
+/// BMT→YUV, full `denoise_nlm`, YUV→BMT (was the OpenCV `x3f_denoise`).
 ///
 /// # Safety
 /// `image` must be null or a valid 3-channel `x3f_area16_t`.
@@ -903,7 +890,8 @@ pub(crate) unsafe fn denoise_area(image: *mut Area16, dtype: u32, scale: f32) {
     unsafe { yuv_to_bmt(image, dt) };
 }
 
-/// Rust equivalent of `x3f_denoise_active`: the area is already YUV.
+/// Active-area Quattro pass: the area is already YUV (was the OpenCV
+/// `x3f_denoise_active`).
 /// `stage == 0` runs the full `denoise_nlm`; `stage != 0` runs only the
 /// full-resolution NLM with per-channel `{0, h, 2h}` (template 3, search 11).
 ///
@@ -927,51 +915,6 @@ pub(crate) unsafe fn denoise_active_area(area: *mut Area16, dtype: u32, stage: i
         unsafe { img3_to_area(&out, area) };
     }
 }
-
-// ----------------------------------------------------------------------
-// C-ABI entry points — these own the x3f_denoise / x3f_denoise_active /
-// x3f_set_use_opencl symbols on every target that did NOT link opencv-mobile.
-// On an OpenCV build the C++ definitions own them, so these are gated out.
-// (lib.rs adds `#[used]` anchors so the rlib keeps them for the bindgen
-// extern decls the rest of the crate calls through.)
-// ----------------------------------------------------------------------
-
-#[cfg(not(x3f_opencv))]
-use core::ffi::{c_int, c_void};
-
-/// `x3f_denoise(image, type, scale)`.
-///
-/// # Safety
-/// `image` is a `*mut x3f_area16_t` (layout-identical to `Area16`).
-#[cfg(not(x3f_opencv))]
-#[no_mangle]
-pub unsafe extern "C" fn x3f_denoise(image: *mut c_void, type_: c_int, scale: f32) {
-    unsafe { denoise_area(image as *mut Area16, type_ as u32, scale) }
-}
-
-/// `x3f_denoise_active(area, type, stage, scale)`.
-///
-/// # Safety
-/// `area` is a `*mut x3f_area16_t` (layout-identical to `Area16`).
-#[cfg(not(x3f_opencv))]
-#[no_mangle]
-pub unsafe extern "C" fn x3f_denoise_active(
-    area: *mut c_void,
-    type_: c_int,
-    stage: c_int,
-    scale: f32,
-) {
-    unsafe { denoise_active_area(area as *mut Area16, type_ as u32, stage, scale) }
-}
-
-/// `x3f_set_use_opencl(flag)` — no-op (opencv-mobile / this path have no
-/// OpenCL backend; the `-ocl` CLI flag is preserved but inert).
-///
-/// # Safety
-/// `_flag` is unused.
-#[cfg(not(x3f_opencv))]
-#[no_mangle]
-pub unsafe extern "C" fn x3f_set_use_opencl(_flag: c_int) {}
 
 // ----------------------------------------------------------------------
 // Tests (run on the host regardless of target gating)

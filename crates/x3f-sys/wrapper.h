@@ -12,4 +12,3 @@
 #include "x3f_image.h"
 #include "x3f_matrix.h"
 #include "x3f_spatial_gain.h"
-#include "x3f_denoise.h"

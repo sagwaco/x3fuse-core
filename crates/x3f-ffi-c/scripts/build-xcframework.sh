@@ -8,8 +8,7 @@
 # Requires:
 #   - macOS host (xcodebuild must be on PATH)
 #   - rustup targets `aarch64-apple-ios` and `aarch64-apple-ios-sim`
-#   - Xcode with iOS SDK (we use the SDK opencv-mobile's prebuilt was
-#     compiled against, currently iOS 13.0+).
+#   - Xcode with iOS SDK
 #
 # Usage:
 #   scripts/build-xcframework.sh [--release|--debug]   # default: --release
@@ -37,9 +36,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 TARGET_DIR="${CARGO_TARGET_DIR:-$WORKSPACE_ROOT/target}"
 
-# Build each target. The opencv-mobile prebuilt requires iOS 13.0+; the
-# x3f-sys build.rs pins IPHONEOS_DEPLOYMENT_TARGET on iOS targets so we
-# do not need to set it here.
+# Build each target. The crate is pure Rust plus two tiny C shims, so the
+# rustc default iOS deployment target is fine; nothing needs pinning here.
 TARGETS=(aarch64-apple-ios aarch64-apple-ios-sim)
 if [[ "${X3F_XCFRAMEWORK_SIM_ONLY:-}" == "1" ]]; then
     TARGETS=(aarch64-apple-ios-sim)

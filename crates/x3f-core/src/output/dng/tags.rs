@@ -25,7 +25,6 @@ pub const STRIP_BYTE_COUNTS: u16 = 279;
 pub const PLANAR_CONFIGURATION: u16 = 284;
 pub const SOFTWARE: u16 = 305;
 pub const DATETIME: u16 = 306;
-pub const PREDICTOR: u16 = 317;
 pub const SUB_IFDS: u16 = 330;
 
 // --- EXIF sub-IFD pointer (TIFF private tag) ---------------------------
@@ -102,7 +101,10 @@ pub const PHOTOMETRIC_LINEAR_RAW: u16 = 34892;
 // --- Compression values ------------------------------------------------
 
 pub const COMPRESSION_NONE: u16 = 1;
-pub const COMPRESSION_ADOBE_DEFLATE: u16 = 8;
+/// "New-style" JPEG (TIFF 6.0 §22); in DNG this means lossless JPEG
+/// (ITU-T T.81 process 14) — the only compression the spec allows for
+/// 16-bit integer raw data.
+pub const COMPRESSION_LOSSLESS_JPEG: u16 = 7;
 
 // --- Orientation values ------------------------------------------------
 

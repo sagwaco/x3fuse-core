@@ -3,7 +3,7 @@
 A command-line converter for Sigma Foveon **X3F** raw files. It decodes X3F images and writes **DNG**, **TIFF**, **PPM**, embedded **JPEG** thumbnails, **metadata** dumps, and **histogram** CSVs. It supports the Merrill, classic (SD9/SD14-era), and Quattro sensor
 generations.
 
-The converter is written in Rust as a Cargo workspace. The only non-Rust component is an optional OpenCV-backed denoise pass (see [Build](#build)) — and even that has a portable pure-Rust fallback, so denoise works on every target (including `wasm32`); everything else (container parsing, entropy decode, the processing pipeline, and all output writers) is native Rust.
+The converter is written in Rust as a Cargo workspace. The only non-Rust component is two tiny C log/version shims; everything else — container parsing, entropy decode, the processing pipeline, the Non-Local Means denoise pass, and all output writers — is native Rust, so it builds on every target (including `wasm32`) with no external dependencies.
 
 Built to power [X3Fuse](https://github.com/sagwaco/x3fuse), which provides a GUI for converting X3F files to DNG, TIFF, and JPEG.
 
@@ -17,7 +17,7 @@ cargo build --release
 
 This produces `target/release/x3f_extract`.
 
-**Denoise (optional, on by default).** The non-local-means denoise pass links against a prebuilt [opencv-mobile](https://github.com/nihui/opencv-mobile) static library, fetched automatically at build time for supported targets (macOS, iOS, Linux, Windows, Android). If no prebuilt is available or the download fails, the build falls back to a no-op denoise stub — the binary still builds and runs; pass `-no-denoise` (or `-denoise 0`) to skip the pass explicitly. Denoise strength is adjustable on a `0`–`10` scale with `-denoise <0-10>` (see [Modifiers](#modifiers)).
+**Denoise (on by default).** The non-local-means denoise pass is a pure-Rust implementation ([crates/x3f-sys/src/denoise.rs](crates/x3f-sys/src/denoise.rs)) that runs on every target with no external dependency or build-time download. Pass `-no-denoise` (or `-denoise 0`) to skip the pass; denoise strength is adjustable on a `0`–`10` scale with `-denoise <0-10>` (see [Modifiers](#modifiers)).
 
 ## Usage
 
@@ -48,7 +48,7 @@ Multiple input files are processed in parallel. The legacy single-dash flag synt
 | `-o <DIR>`                | write output to `<DIR>`                                                            |
 | `-v` / `-q`               | verbose / quiet (errors only)                                                      |
 | `-color <SPACE>`          | RGB color space: `none`, `sRGB`, `AdobeRGB`, `ProPhotoRGB` (does not affect DNG)   |
-| `-compress`               | Deflate/ZIP compression for DNG and TIFF                                           |
+| `-compress`               | lossless compression (DNG: lossless JPEG, TIFF: Deflate/ZIP)                       |
 | `-denoise <0-10>`         | NLM denoise intensity: `0` = off, `10` = full strength (**default**); intermediate values linearly scale the NLM sigma |
 | `-no-denoise`             | disable the NLM denoise pass (alias for `-denoise 0`)                               |
 | `-no-crop`                | do not crop to the active image area                                               |
@@ -90,7 +90,7 @@ Pass `-dng-highlight-recovery` to enable the Foveon highlight-recovery pipeline:
 
 ## RAW Compression
 
-Pass `-compress` to enable RAW zip compression from TIFF and DNG outputs. Note that DNG compression is not compatible with all RAW engines, and is only tested in Adobe Camera Raw (Lightroom).
+Pass `-compress` to compress TIFF and DNG outputs losslessly. TIFF uses Deflate/ZIP. DNG uses **lossless JPEG** (`Compression = 7`, ITU-T T.81 process 14) — the only compression the DNG spec allows for 16-bit integer raw data, and the one every RAW engine decodes. (An earlier version used Adobe Deflate for the DNG raw plane; the spec reserves Deflate for floating-point/32-bit data, and Apple's RAW engine rejects such files outright — compressed DNGs had no Finder/Quick Look previews on macOS. The lossless-JPEG raw plane is written as a single full-height strip, the layout the dcraw-lineage decoders require.) Compressed DNGs decode bit-identically to uncompressed ones and are verified against Adobe Camera Raw / Lightroom, LibRaw, and Apple's RAW engine.
 
 ## RAW Compatibility
 
@@ -99,15 +99,14 @@ Because Foveon sensors do not have a traditional demosaicing step, output DNGs a
 ## Workspace layout
 
 ```
-x3f-cli  ──▶  x3f-core  ──▶  x3f-sys  ──FFI──▶  C/C++ (denoise + log/version shims)
+x3f-cli  ──▶  x3f-core  ──▶  x3f-sys  ──FFI──▶  C (log/version shims)
 ```
 
 - [crates/x3f-cli](crates/x3f-cli) — the `x3f_extract` binary.
 - [crates/x3f-core](crates/x3f-core) — safe Rust API for reading and converting X3F images.
-- [crates/x3f-sys](crates/x3f-sys) — low-level layer; bindgen FFI and the small remaining
-  C/C++ ([crates/x3f-sys/csrc/](crates/x3f-sys/csrc)) for the OpenCV denoise pass, plus a
-  portable pure-Rust NLM denoise ([src/denoise.rs](crates/x3f-sys/src/denoise.rs)) used where
-  OpenCV isn't linked (wasm, offline builds).
+- [crates/x3f-sys](crates/x3f-sys) — low-level layer; bindgen FFI and the two tiny remaining
+  C shims ([crates/x3f-sys/csrc/](crates/x3f-sys/csrc)), plus the pure-Rust Non-Local Means
+  denoise ([src/denoise.rs](crates/x3f-sys/src/denoise.rs)) used on every target.
 - [crates/x3f-ffi-c](crates/x3f-ffi-c) — C ABI wrapper for iOS / Android / WASM consumers.
 - [opcodes/](opcodes) — pre-rendered DNG `OpcodeList3` flat-fielding blobs for Merrill bodies.
 - [docs/](docs) — the [mdbook](https://rust-lang.github.io/mdBook/) (pipeline, format

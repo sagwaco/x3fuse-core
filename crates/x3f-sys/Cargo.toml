@@ -7,14 +7,12 @@ repository.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories = ["multimedia::images", "external-ffi-bindings"]
-description = "Low-level layer for the x3f Foveon raw converter: bindgen FFI plus the small remaining C/C++ (OpenCV denoise). Consume x3f-core instead."
+description = "Low-level layer for the x3f Foveon raw converter: bindgen FFI plus the tiny remaining C (log/version shims). Consume x3f-core instead."
 links = "x3f"
 
 [lib]
 crate-type = ["rlib"]
 
-# docs.rs has no network access, so the OpenCV denoise prebuilt can't be
-# fetched there; build.rs falls back to the no-op stub when DOCS_RS is set.
 [package.metadata.docs.rs]
 all-features = true
 

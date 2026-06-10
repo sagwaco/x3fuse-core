@@ -5,7 +5,7 @@
 //! ```text
 //! TIFF header (II + magic + IFD0-offset)
 //! Preview strip bytes               (8-bit RGB, downsampled to 300 px wide)
-//! Raw strip bytes                    (16-bit RGB, full resolution; optional zlib)
+//! Raw strip bytes                    (16-bit RGB, full resolution; optional lossless JPEG)
 //! ExtraCameraProfiles blob           (concatenated MMCR mini-TIFFs)
 //! IFD1 (raw) — external values + body
 //! IFD0 (preview) — external values + body
@@ -20,11 +20,16 @@
 //!   function exists but is unreferenced; the comment cites a "double-
 //!   application of sg" risk in readers that honour the opcode.
 //! - `LinearizationTable`. The image is already linear.
-//! - DNG raw compression formats (LJPEG-92, JXL). We support uncompressed
-//!   and Adobe Deflate, matching the legacy C.
+//! - Adobe Deflate raw compression. The legacy C used it for `-compress`,
+//!   but the DNG spec only allows Deflate for floating-point/32-bit data
+//!   and Apple's RAW engine rejects the whole file when the raw IFD is
+//!   deflated (no Finder/Quick Look previews on macOS). `-compress` now
+//!   emits lossless JPEG ([`ljpeg`]), the compression the spec sanctions
+//!   for 16-bit integer raws and the one all RAW engines decode.
 
 mod exif;
 mod hue_sat_map;
+mod ljpeg;
 mod metadata;
 mod opcodes;
 mod profiles;
@@ -54,8 +59,8 @@ const PREVIEW_MAX_WIDTH: u32 = 300;
 /// Write `reader`'s processed image to `path` as a DNG file.
 ///
 /// `opts` is honoured the same way the legacy CLI honoured its DNG flags:
-/// `compress` enables Adobe Deflate + horizontal predictor on the raw
-/// plane; `wb` overrides the file's recorded white balance; `apply_sgain`,
+/// `compress` enables lossless-JPEG encoding of the raw plane; `wb`
+/// overrides the file's recorded white balance; `apply_sgain`,
 /// `fix_bad`, `denoise` flow through to image processing.
 pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> Result<(), Error> {
     let path = path.as_ref();
@@ -118,8 +123,20 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
 
     let preview = reader.get_preview(&image, &opts, PREVIEW_MAX_WIDTH)?;
     let preview_bytes = strip::encode_preview_strip(&preview);
+    // Lossless JPEG must go out as ONE full-height strip: the dcraw-
+    // lineage decoders (LibRaw, and Apple's engine behaves the same)
+    // treat a multi-strip LJPEG raw IFD as "first strip, then stop", so
+    // a 32-row strip layout renders as a thin band over black. Real-
+    // world LJ92 DNGs are single-strip or tiled; single-strip is the
+    // minimal layout every reader handles. Uncompressed keeps the
+    // legacy 32-row strips (tier-2 parity surface).
+    let rows_per_strip = if opts.compress {
+        out_rows
+    } else {
+        ROWS_PER_STRIP
+    };
     let raw_strips =
-        strip::encode_strips(&image, ROWS_PER_STRIP, opts.compress, crop).map_err(|source| {
+        strip::encode_strips(&image, rows_per_strip, opts.compress, crop).map_err(|source| {
             Error::Io {
                 path: path.display().to_string(),
                 source,
@@ -202,6 +219,7 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
         &mut ifd1,
         &raw_strip_offsets,
         &raw_strip_byte_counts,
+        rows_per_strip,
         opts.compress,
         linear_limit,
     )?;
@@ -225,7 +243,6 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
         preview_strip_offset,
         preview_strip_bytes,
         &mut ifd0,
-        opts.compress,
         orientation,
     );
     exif::add_top_level_tags(&capture_meta, &mut ifd0);
@@ -298,7 +315,6 @@ fn populate_preview_ifd(
     strip_offset: u32,
     strip_bytes: u32,
     ifd: &mut DirectoryWriter,
-    compress: bool,
     orientation: u16,
 ) {
     ifd.add(
@@ -331,16 +347,16 @@ fn populate_preview_ifd(
         tags::PLANAR_CONFIGURATION,
         Value::Short(vec![tags::PLANAR_CONFIG_CONTIG]),
     );
-    let backward = if compress {
-        tags::DNG_VERSION_1_4_0_0
-    } else {
-        tags::DNG_VERSION_1_3_0_0
-    };
+    // Lossless JPEG has been part of DNG since 1.0, so compression never
+    // raises the backward version (the old Deflate path needed 1.4).
     ifd.add(
         tags::DNG_VERSION,
         Value::Byte(tags::DNG_VERSION_1_4_0_0.to_vec()),
     );
-    ifd.add(tags::DNG_BACKWARD_VERSION, Value::Byte(backward.to_vec()));
+    ifd.add(
+        tags::DNG_BACKWARD_VERSION,
+        Value::Byte(tags::DNG_VERSION_1_3_0_0.to_vec()),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -351,6 +367,7 @@ fn populate_raw_ifd(
     ifd: &mut DirectoryWriter,
     strip_offsets: &[u32],
     strip_byte_counts: &[u32],
+    rows_per_strip: u32,
     compress: bool,
     linear_limit: f64,
 ) -> Result<(), Error> {
@@ -363,8 +380,12 @@ fn populate_raw_ifd(
     ifd.add(tags::IMAGE_WIDTH, Value::Long(vec![out_cols]));
     ifd.add(tags::IMAGE_LENGTH, Value::Long(vec![out_rows]));
     ifd.add(tags::BITS_PER_SAMPLE, Value::Short(vec![16, 16, 16]));
+    // Lossless JPEG (7) is the only spec-allowed compression for 16-bit
+    // integer raw data. Deflate (8) is reserved for floating-point/32-bit
+    // data, and Apple's RAW engine enforces that — it refuses the entire
+    // file, killing macOS Finder/Quick Look previews of compressed DNGs.
     let comp = if compress {
-        tags::COMPRESSION_ADOBE_DEFLATE
+        tags::COMPRESSION_LOSSLESS_JPEG
     } else {
         tags::COMPRESSION_NONE
     };
@@ -375,7 +396,7 @@ fn populate_raw_ifd(
     );
     ifd.add(tags::STRIP_OFFSETS, Value::Long(strip_offsets.to_vec()));
     ifd.add(tags::SAMPLES_PER_PIXEL, Value::Short(vec![3]));
-    ifd.add(tags::ROWS_PER_STRIP, Value::Long(vec![ROWS_PER_STRIP]));
+    ifd.add(tags::ROWS_PER_STRIP, Value::Long(vec![rows_per_strip]));
     ifd.add(
         tags::STRIP_BYTE_COUNTS,
         Value::Long(strip_byte_counts.to_vec()),
@@ -384,10 +405,6 @@ fn populate_raw_ifd(
         tags::PLANAR_CONFIGURATION,
         Value::Short(vec![tags::PLANAR_CONFIG_CONTIG]),
     );
-    if compress {
-        ifd.add(tags::PREDICTOR, Value::Short(vec![2]));
-    }
-
     // Per-channel black/white levels.
     // BlackLevel must be SHORT, LONG, or (unsigned) RATIONAL per the DNG
     // 1.6 spec — Capture One rejects SRATIONAL here and renders the raw

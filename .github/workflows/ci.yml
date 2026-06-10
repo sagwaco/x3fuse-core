@@ -93,10 +93,10 @@ jobs:
         run: cargo fmt --all --check
 
   # M8b: cross-compile x3f-ffi-c for iOS device + simulator and build the
-  # xcframework. Validates that the cbindgen header, opencv-mobile prebuilt
-  # download, and IPHONEOS_DEPLOYMENT_TARGET pinning all hang together
-  # under a non-host toolchain. Runs on macos-14 because iOS cross-builds
-  # need an Apple host with Xcode.
+  # xcframework. Validates that the cbindgen header and the bindgen iOS
+  # cross-compile (clang --target + -isysroot) hang together under a
+  # non-host toolchain. Runs on macos-14 because iOS cross-builds need an
+  # Apple host with Xcode.
   ios-xcframework:
     name: iOS xcframework (macos-14)
     runs-on: macos-14

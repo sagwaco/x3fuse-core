@@ -135,7 +135,8 @@ fn usage(progname: &str) -> ! {
          \x20  -no-fix-bad     Do not fix bad pixels\n\
          \x20  -sgain          Apply spatial gain (default except for Quattro)\n\
          \x20  -wb <WB>        Select white balance preset\n\
-         \x20  -compress       Enable ZIP compression for DNG and TIFF output\n\
+         \x20  -compress       Enable lossless compression (DNG: lossless\n\
+         \x20                  JPEG, TIFF: ZIP/Deflate)\n\
          \x20  -opcodes-dir <DIR>  Directory of pre-rendered DNG OpcodeList3\n\
          \x20                  flat-fielding blobs. When set, the matching\n\
          \x20                  per-(model, aperture[, lens]) blob is embedded\n\
@@ -167,7 +168,7 @@ fn usage(progname: &str) -> ! {
          \x20                  with X3F_CINEON_SCALE (default 100; 12 ≈ Cineon\n\
          \x20                  film-print, 50 ≈ moderate log; larger is flatter\n\
          \x20                  still at the cost of shadow noise). Requires -tiff.\n\
-         \x20  -ocl            Ignored (opencv-mobile has no OpenCL backend)\n\
+         \x20  -ocl            Ignored (no OpenCL backend)\n\
          \n\
          STRANGE STUFF\n\
          \x20  -offset <OFF>   Offset for SD14 and older\n\
@@ -494,8 +495,8 @@ fn main() -> ExitCode {
     if let Some(n) = args.matrix_max {
         set_max_printed_matrix_elements(n);
     }
-    // -ocl is currently a no-op; we intentionally do not call into x3f-sys
-    // for it. The OpenCL paths returned with the OpenCV port in M9.
+    // -ocl is a no-op, preserved only so legacy scripts don't error. There is
+    // no OpenCL backend (the denoise pass is the pure-Rust NLM in x3f-sys).
     let _ = args.use_opencl;
 
     if let Some(dir) = args.outdir.as_deref() {

@@ -13,11 +13,10 @@ read once you actually want to change something.
 ## Status
 
 The original ~10K-LOC C/C++ codebase has been fully ported to a Cargo
-workspace; the only non-Rust code left is an optional OpenCV-backed
-denoise pass — and even that has a portable pure-Rust Non-Local Means
-fallback ([`crates/x3f-sys/src/denoise.rs`](../../crates/x3f-sys/src/denoise.rs))
-that takes over on every target without an opencv-mobile prebuilt (wasm,
-offline/docs.rs, unsupported triples), so denoise works everywhere. The
+workspace; the only non-Rust code left is two tiny C log/version shims.
+Denoise is a pure-Rust Non-Local Means pass
+([`crates/x3f-sys/src/denoise.rs`](../../crates/x3f-sys/src/denoise.rs))
+called directly by the pipeline on every target — OpenCV was removed. The
 [port plan](./port-plan.md) is retained as a historical record of how the
 port proceeded.
 
@@ -31,10 +30,9 @@ target/release/x3f_extract -dng input.X3F
 Only prerequisite is a Rust toolchain (rustup). Output formats (PPM,
 TIFF, DNG, JPEG thumbnail extract, metadata text dump, histogram CSV)
 are pure Rust as of M3 — no system `libtiff` / `libjpeg` / `zlib`
-needed. The denoise path links a pinned prebuilt `opencv-mobile`
-(auto-fetched by `build.rs`) where one exists, and otherwise falls back to
-the portable pure-Rust NLM — so there are still no mandatory system deps,
-and the rest of the pipeline is libc-only.
+needed. The denoise path is the pure-Rust NLM in `crates/x3f-sys/src/denoise.rs`
+(no external dependency, no build-time download), so there are no mandatory
+system deps and the rest of the pipeline is libc-only.
 
 The binary preserves the legacy single-dash flag syntax (`-tiff`,
 `-no-denoise`, `-color sRGB`, …) so existing scripts and the test

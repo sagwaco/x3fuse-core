@@ -106,13 +106,13 @@ defer { x3f_reader_close(h) }
 print(String(format: "0x%08x", x3f_reader_header_version(h)))
 ```
 
-Three build-system tweaks live in
+A build-system tweak lives in
 [`crates/x3f-sys/build.rs`](../../crates/x3f-sys/build.rs) to make
-this work; the gist is that `IPHONEOS_DEPLOYMENT_TARGET` is pinned to
-13.0 (opencv-mobile's iOS prebuilt requires it), the linker is given a
-matching `-platform_version`, and bindgen invokes clang with the
-correct `--target` + `-isysroot` for the simulator's
-`arm64-apple-ios-simulator` triple.
+this work: bindgen invokes clang with the correct `--target` +
+`-isysroot` for the simulator's `arm64-apple-ios-simulator` triple.
+(Earlier revisions also pinned `IPHONEOS_DEPLOYMENT_TARGET` to 13.0 for
+opencv-mobile's iOS prebuilt; with OpenCV removed the crate is pure Rust
+plus two tiny C shims, so the rustc default deployment target is fine.)
 
 Mac Catalyst (`aarch64-apple-ios-macabi`) is wired into the `build.rs`
 but not yet added to the script; adding it is a ~3-line change once
@@ -133,9 +133,9 @@ target/jniLibs/
 └── x86_64/libx3f.so
 ```
 
-drop-in for `<app>/src/main/jniLibs/`. The opencv-mobile prebuilts
-already have the matching Android slices, wired up in `build.rs`; the
-missing piece is just the NDK + cargo-ndk wrapper.
+drop-in for `<app>/src/main/jniLibs/`. The crate is pure Rust plus two
+tiny C shims (no external native dependency), so the only missing piece
+is the NDK + cargo-ndk wrapper.
 
 ## WASM
 
@@ -166,12 +166,11 @@ that replaces `libc` on this target: the allocator routes through
 `std::alloc`, `memcpy` / `memset` lower to wasm `memory.copy` /
 `memory.fill`, file-I/O is satisfied by an internal `MemFile` cursor
 backing `fmemopen`. The variadic `x3f_printf` is no-op'd by a Rust shim in
-[`crates/x3f-sys/src/wasm_c_shims.rs`](../../crates/x3f-sys/src/wasm_c_shims.rs),
-and `x3f_denoise` / `x3f_denoise_active` / `x3f_set_use_opencl` resolve to the
-portable pure-Rust Non-Local Means in
-[`crates/x3f-sys/src/denoise.rs`](../../crates/x3f-sys/src/denoise.rs) — so
-denoise actually runs in the browser (opencv-mobile ships no wasm prebuilt)
-rather than no-op'ing. Together this leaves the wasm cdylib with **zero**
+[`crates/x3f-sys/src/wasm_c_shims.rs`](../../crates/x3f-sys/src/wasm_c_shims.rs);
+denoise is the pure-Rust Non-Local Means in
+[`crates/x3f-sys/src/denoise.rs`](../../crates/x3f-sys/src/denoise.rs), called
+directly by the pipeline — so it runs in the browser just like on any other
+target. Together this leaves the wasm cdylib with **zero**
 unresolved `(import "env" ...)` entries — fully self-contained, ready for
 `WebAssembly.instantiateStreaming` with no host-function shims.
 

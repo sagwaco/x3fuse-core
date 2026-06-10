@@ -2130,17 +2130,14 @@ fn cineon_scale_from_env() -> f64 {
 // ----------------------------------------------------------------------
 //
 // Both are thin wrappers. `run_denoising` crops to ActiveImageArea
-// and dispatches to `x3f_denoise` — the opencv-mobile NLM where it's
-// linked, otherwise the portable Rust NLM in `src/denoise.rs`. With
-// `X3F_PORTABLE_DENOISE=1` set it calls the Rust path directly even on
-// an OpenCV build (A/B comparison). `expand_quattro` arranges crop
-// rectangles, allocates the expanded RGB buffer, and hands off to the
-// Rust `x3f_expand_quattro` (M5a).
+// and hands off to the pure-Rust NLM in `src/denoise.rs`.
+// `expand_quattro` arranges crop rectangles, allocates the expanded RGB
+// buffer, and hands off to the Rust `x3f_expand_quattro` (M5a).
 
 /// Map the 0..=10 denoise-intensity knob to the NLM sigma scale (0.0..=1.0)
-/// the C denoise kernels multiply onto each sensor's base `h`. 10 → 1.0
-/// reproduces the legacy full-strength denoise byte-for-byte; 0 → 0.0 is a
-/// no-op (callers gate it out before reaching the kernel anyway).
+/// the denoise kernels multiply onto each sensor's base `h`. 10 → 1.0 is
+/// full-strength denoise; 0 → 0.0 is a no-op (callers gate it out before
+/// reaching the kernel anyway).
 #[inline]
 fn denoise_scale(intensity: libc::c_int) -> f32 {
     (intensity.clamp(0, 10) as f32) / 10.0
@@ -2174,29 +2171,22 @@ pub unsafe extern "C" fn run_denoising(x3f: *mut x3f_t, intensity: libc::c_int) 
     }
 
     let mut sensorid: *mut libc::c_char = ptr::null_mut();
-    let mut t = x3f_denoise_type_t_X3F_DENOISE_STD;
+    let mut t = crate::denoise::DENOISE_STD;
     if unsafe { x3f_get_prop_entry(x3f, c"SENSORID".as_ptr() as *mut _, &mut sensorid) } != 0 {
         let s = unsafe { CStr::from_ptr(sensorid) }.to_bytes();
         if s == b"F20" {
-            t = x3f_denoise_type_t_X3F_DENOISE_F20;
+            t = crate::denoise::DENOISE_F20;
         }
     }
 
     let scale = denoise_scale(intensity);
-    if crate::denoise::use_portable() {
-        // Force the portable Rust NLM (A/B testing on an OpenCV build).
-        unsafe {
-            crate::denoise::denoise_area(
-                &mut image as *mut x3f_area16_t as *mut crate::quattro::Area16,
-                t,
-                scale,
-            )
-        };
-    } else {
-        // `x3f_denoise` is opencv-mobile's NLM where linked, else the same
-        // Rust NLM via its `#[no_mangle]` symbol (see src/denoise.rs).
-        unsafe { x3f_denoise(&mut image, t, scale) };
-    }
+    unsafe {
+        crate::denoise::denoise_area(
+            &mut image as *mut x3f_area16_t as *mut crate::quattro::Area16,
+            t,
+            scale,
+        )
+    };
     1
 }
 

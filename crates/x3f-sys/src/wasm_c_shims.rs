@@ -18,9 +18,9 @@
 //! verbose-mode debug printing is silently dropped on wasm32. A future Rust
 //! port of `x3f_printf` could route through `tracing` or a JS console hook.
 //!
-//! (`x3f_denoise` / `x3f_denoise_active` / `x3f_set_use_opencl` were also
-//! no-op shims here; they now resolve to the portable Rust NLM in
-//! `denoise.rs`, which actually denoises on wasm instead of passing through.)
+//! (Denoise used to be a no-op shim here too; it is now the pure-Rust NLM in
+//! `denoise.rs`, called directly by the pipeline on every target including
+//! wasm.)
 //!
 //! Note: bindgen's forward declaration for `x3f_printf` remains in
 //! `bindings.rs`. Rust accepts an `extern "C" {}` foreign-fn decl AND a
