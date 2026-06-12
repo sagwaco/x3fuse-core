@@ -246,45 +246,25 @@ unsafe fn yuv_to_bmt_yis4t(area: *mut Area16) {
     }
 }
 
-// `x3f_denoise_active` is implemented in C++ (csrc/x3f_denoise.cpp) when
-// opencv-mobile is linked; otherwise the portable Rust NLM in src/denoise.rs
-// owns the symbol (so it actually denoises on wasm / offline builds instead
-// of no-op'ing). Either way the call is safe to make unconditionally.
-//
-// The `denoise_type` arg is the C `x3f_denoise_type_t` enum from
-// csrc/x3f_denoise.h; we hardcode 2 = X3F_DENOISE_F23 below since this
-// is the only variant the Quattro path uses (the F23 row of
+// The Quattro path only ever uses the F23 sensor type (the F23 row of
 // `denoise_types[]` selects sigma h=300 and the Yis4T BMT/YUV transforms,
 // which the Rust code already does in place above).
-const X3F_DENOISE_F23: u32 = 2;
 const STAGE_PRE_UPSAMPLE: i32 = 0;
 const STAGE_POST_UPSAMPLE: i32 = 1;
 
-extern "C" {
-    fn x3f_denoise_active(area: *mut Area16, denoise_type: u32, stage: i32, scale: f32);
-}
-
-/// Run an active-area Quattro NLM pass. Uses the portable Rust NLM directly
-/// when `X3F_PORTABLE_DENOISE` is set (A/B testing on an OpenCV build);
-/// otherwise calls `x3f_denoise_active` — opencv-mobile where linked, else the
-/// same Rust NLM via its `#[no_mangle]` symbol.
+/// Run an active-area Quattro NLM pass via the pure-Rust NLM in `src/denoise.rs`.
 ///
 /// # Safety
 /// `area` must point to a valid YUV-layout 3-channel `x3f_area16_t`.
 #[inline]
 unsafe fn denoise_active(area: *mut Area16, stage: i32, scale: f32) {
-    if crate::denoise::use_portable() {
-        unsafe { crate::denoise::denoise_active_area(area, X3F_DENOISE_F23, stage, scale) };
-    } else {
-        unsafe { x3f_denoise_active(area, X3F_DENOISE_F23, stage, scale) };
-    }
+    unsafe { crate::denoise::denoise_active_area(area, crate::denoise::DENOISE_F23, stage, scale) };
 }
 
 /// Native Rust replacement for the OpenCV-backed `x3f_expand_quattro`. The
-/// resize + BMT/YUV transforms run here in Rust; the two NLM passes that
-/// the legacy C++ embedded inside the upsampler are now thin FFI hops
-/// into `x3f_denoise_active` so the entire algorithm orchestration stays
-/// in Rust while the OpenCV NLM kernel stays in opencv-mobile.
+/// resize + BMT/YUV transforms and the two embedded NLM passes all run here
+/// in Rust (the NLM passes call into `src/denoise.rs`), so the entire
+/// algorithm orchestration and kernels stay in Rust.
 ///
 /// # Safety
 ///
@@ -326,8 +306,7 @@ pub(crate) unsafe extern "C" fn x3f_expand_quattro(
 
     // Step 1.5: pre-upsample NLM denoise on the half-res active region
     // (mirrors the legacy C++ `denoise_nlm(act, d->h)` call). No-op when
-    // `active` is null (caller passed null because denoise was disabled)
-    // or when the binary was built without opencv-mobile (WASM).
+    // `active` is null (caller passed null because denoise was disabled).
     if !active.is_null() {
         unsafe { denoise_active(active, STAGE_PRE_UPSAMPLE, scale) };
     }

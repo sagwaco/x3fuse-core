@@ -54,6 +54,15 @@ pub struct Image {
     /// thread-local cell between when this image was rendered and when
     /// the DNG writer needs the value.
     pub dng_highlight_scale: f64,
+    /// Snapshot of `x3f_get_dng_shoulder_ceiling()`, captured with the
+    /// same immediately-after-`x3f_get_image` discipline as
+    /// `dng_highlight_scale`. This is the pre-shoulder global max
+    /// sat_ratio: `> 1.0` means highlight recovery overshot WhiteLevel
+    /// and Pass 3 baked the soft shoulder into the raster, so the DNG
+    /// writer publishes `LinearResponseLimit = knee`; `1.0` means the
+    /// raster is scene-linear up to white and the writer keeps
+    /// `LinearResponseLimit = 1.0` even with recovery enabled.
+    pub dng_shoulder_ceiling: f64,
 }
 
 /// 8-bit preview image (3-channel interleaved). Produced by
@@ -150,6 +159,7 @@ impl Reader {
         // pair is safely co-located inside `x3f_get_image`'s body
         // here.
         let dng_highlight_scale = unsafe { sys::x3f_get_dng_highlight_scale() };
+        let dng_shoulder_ceiling = unsafe { sys::x3f_get_dng_shoulder_ceiling() };
 
         let len = (area.rows as usize) * (area.row_stride as usize);
         // SAFETY: x3f_get_image returns a buffer the C accessor pattern reads
@@ -171,6 +181,7 @@ impl Reader {
                 white: ilevels.white,
             },
             dng_highlight_scale,
+            dng_shoulder_ceiling,
         })
     }
 

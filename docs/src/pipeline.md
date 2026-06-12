@@ -86,11 +86,32 @@ The `convert_data` function is the hot loop. In order:
 
 The DNG path replaces stages 7–9 with `apply_highlight_clip_dng`
 (M6e9): per-pixel CLUT/RepairPix/`L*p`/matrix-pathology gate
-(sg-amplified preview) → bake-sg-into-raw → global-max scale +
-uniform divide-down so all channels fit within `WhiteLevel`. The
-divide-down factor is published as `BaselineExposure = log2(scale)`
-in the DNG, so Lightroom restores brightness on import without
-clamping recovered chroma.
+(sg-amplified preview) → bake-sg-into-raw → baked soft highlight
+shoulder. With `-dng-highlight-recovery` the CLUT step uses the
+generalized BMT apply (`chroma_lut_apply_pixel_bmt`): three
+scene-derived tables reconstruct whichever single channel clipped
+(T from B,M; B from M,T; M from B,T) so recovered highlights keep
+scene chroma, and only multi-channel clips fall back to the neutral
+`L*p` snap. Recovered values overshoot the sensor white point, so a
+global-max scan drives a per-pixel soft shoulder (`L' = knee +
+(1-knee)·(1-(1-t/s)^s)`, knee 0.85 via `X3F_DNG_SHOULDER_KNEE`,
+slope-1/C1 at the knee, chroma-preserving uniform per-pixel scale)
+that compresses `[knee, global_max]` into `[knee, WhiteLevel]`. The
+knee is published as `LinearResponseLimit`. An earlier design
+divided the whole raster down and compensated via a
+`BaselineExposure = log2(scale)` nudge instead — that rendered
+correctly only in readers that honour BE (it is an optional hint in
+the DNG spec), so it was replaced by the baked shoulder.
+
+The writer then equalizes the three channels into one shared
+encoding range (`output::dng::equalize_levels`): the per-channel
+saturation points (e.g. Merrill `[16383, 7695, 4829]`) are baked
+into the raster and the tags become a uniform `BlackLevel = 0` /
+`WhiteLevel = 65535`. Adobe and LibRaw normalize per-channel
+WhiteLevel correctly, but Apple's RAW engine and Capture One do not
+(single-level normalization destroys the channel ratios — the
+historical magenta/green casts in those apps), and baking the
+normalization is loss-free since each channel gains range.
 
 The hot loop is parallelised by row via `rayon::par_chunks_mut`
 (M7a/c) and decode is parallelised by plane (M7d). Single-image
@@ -108,8 +129,17 @@ One of:
   (50964 ForwardMatrix1, 51110 DefaultBlackRender, …), all 11
   in-camera Sigma color modes as `ExtraCameraProfiles`, and embeds
   Sigma's flat-fielding `OpcodeList3` blobs (lens-correction GainMaps)
-  when `-opcodes-dir opcodes` is passed. Strips are zlib-compressed in
-  parallel (M7d).
+  when `-opcodes-dir opcodes` is passed. `-compress` encodes the raw
+  plane as lossless JPEG (`Compression = 7`, the pure-Rust LJ92
+  encoder in
+  [`crates/x3f-core/src/output/dng/ljpeg.rs`](../../crates/x3f-core/src/output/dng/ljpeg.rs)),
+  written as a single full-height strip. The legacy Adobe-Deflate
+  32-row-strip path was dropped: the DNG spec reserves Deflate for
+  floating-point/32-bit data and Apple's RAW engine rejects deflated
+  integer raws wholesale (no Finder/Quick Look previews), while the
+  dcraw-lineage decoders stop after the first strip of a multi-strip
+  lossless-JPEG plane — single-strip LJ92 is the layout everything
+  decodes.
 - **16-bit TIFF** —
   [`crates/x3f-core/src/output/tiff.rs`](../../crates/x3f-core/src/output/tiff.rs)
   via the `tiff` crate.
@@ -127,46 +157,38 @@ One of:
 
 ## What's still C
 
-Two C files remain in the cc-rs build:
+Only two tiny C files remain in the cc-rs build:
 
 | File | Role |
 |------|------|
-| [`src/x3f_printf.c`](../../src/x3f_printf.c) | logging shim (function-pointer hook calls into a Rust callback for mobile/WASM) |
-| [`src/x3f_version.c`](../../src/x3f_version.c) | version string |
+| [`csrc/x3f_printf.c`](../../crates/x3f-sys/csrc/x3f_printf.c) | logging shim (function-pointer hook calls into a Rust callback for mobile/WASM) |
+| [`csrc/x3f_version.c`](../../crates/x3f-sys/csrc/x3f_version.c) | version string |
 
-Plus the OpenCV NLM denoise path
-([`src/x3f_denoise.cpp`](../../src/x3f_denoise.cpp) +
-[`x3f_denoise_utils.cpp`](../../src/x3f_denoise_utils.cpp)) which links a
-pinned prebuilt
-[`opencv-mobile`](https://github.com/nihui/opencv-mobile) when the
-target has a matching asset (Apple, Linux, Windows, Android); `build.rs`
-then emits `cargo:rustc-cfg=x3f_opencv` so the C++ stays the default.
-
-On every target *without* an opencv-mobile prebuilt — `wasm32-*` (cc-rs is
-skipped entirely there), offline / docs.rs builds, and any unsupported
-triple — `x3f_denoise` / `x3f_denoise_active` / `x3f_set_use_opencl` are
-provided by the portable, pure-Rust Non-Local Means in
-[`crates/x3f-sys/src/denoise.rs`](../../crates/x3f-sys/src/denoise.rs)
-(gated `cfg(not(x3f_opencv))`). It mirrors the OpenCV algorithm — fixed-point
-weight LUT, `BORDER_REFLECT_101` windows, per-channel `h`, L1 patch distance,
-V-channel median, and the low-frequency refinement — so denoise actually runs
-on wasm instead of no-op'ing (it is *not* byte-identical to OpenCV, but no
-parity baseline pins it: every tier-2/tier-3 test uses `-no-denoise`). The
-variadic `x3f_printf` shim still lives in
+Everything else — including the NLM denoise pass — is native Rust. Denoise is
+the pure-Rust Non-Local Means in
+[`crates/x3f-sys/src/denoise.rs`](../../crates/x3f-sys/src/denoise.rs), called
+directly by [`run_denoising`](../../crates/x3f-sys/src/process.rs) and the
+Quattro upsampler on every target. It mirrors the algorithm of the original
+OpenCV pass — fixed-point weight LUT, `BORDER_REFLECT_101` windows, per-channel
+`h`, L1 patch distance, V-channel median, and the low-frequency refinement — but
+is *not* byte-identical to that old output, and no parity baseline pins it:
+every tier-2/tier-3 test uses `-no-denoise`. (OpenCV / opencv-mobile was removed
+entirely; there is no longer a C/C++ denoise path or a build-time download.) On
+`wasm32-*` cc-rs is skipped entirely and the variadic `x3f_printf` shim is
+satisfied by
 [`crates/x3f-sys/src/wasm_c_shims.rs`](../../crates/x3f-sys/src/wasm_c_shims.rs).
-Set `X3F_PORTABLE_DENOISE=1` to route the Rust path even on an OpenCV build
-(A/B comparison).
 
 Denoise strength is a `0`–`10` intensity (`-denoise <0-10>`, default `10`;
 `-no-denoise` is the alias for `0`). The CLI value rides through the
 pipeline's `denoise` arg and `x3f-core`'s `ProcessOptions::denoise_intensity`;
 [`run_denoising`](../../crates/x3f-sys/src/process.rs) /
 [`expand_quattro`](../../crates/x3f-sys/src/process.rs) map it to a
-`scale = intensity / 10` that the denoise kernels (`x3f_denoise`,
-`x3f_denoise_active` — OpenCV or the portable Rust NLM) multiply onto each
-sensor's base NLM sigma. `10` →
-`scale = 1.0` reproduces the legacy full-strength denoise byte-for-byte (so
-the tier-2 parity baselines are unaffected); `0` gates the pass out entirely.
+`scale = intensity / 10` that the Rust NLM kernels
+([`denoise_area`](../../crates/x3f-sys/src/denoise.rs) /
+[`denoise_active_area`](../../crates/x3f-sys/src/denoise.rs)) multiply onto each
+sensor's base NLM sigma. `10` → `scale = 1.0` is full-strength denoise; `0`
+gates the pass out entirely. (Denoise output is not part of the byte-parity
+gate — every tier-2/3 test runs with `-no-denoise`.)
 
 Everything else under [`src/`](../../src/) is the legacy archive —
 header files are still consumed by bindgen for typedefs, but the `.c`

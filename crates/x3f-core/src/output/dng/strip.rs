@@ -1,18 +1,18 @@
-//! Strip encoding for the raw image plane: uncompressed or Deflate +
-//! horizontal predictor.
+//! Strip encoding for the raw image plane: uncompressed or lossless JPEG
+//! (DNG `Compression = 7`).
 //!
-//! Matches the C path:
 //! - Uncompressed: one strip per `ROWS_PER_STRIP` rows; pixels written as
 //!   little-endian u16 in interleaved BGR-ish (whatever channel order the
 //!   processed buffer holds — the writer is colour-agnostic).
-//! - Compressed: same strip layout, with a per-strip horizontal predictor
-//!   applied per-channel, then zlib-encoded (`COMPRESSION_ADOBE_DEFLATE`).
+//! - Compressed: same strip layout, each strip a standalone lossless-JPEG
+//!   stream (see [`super::ljpeg`]). The legacy C writer used Adobe Deflate
+//!   here, but the DNG spec only allows Deflate for floating-point/32-bit
+//!   data and Apple's RAW engine enforces that — it refused the whole
+//!   file, so `-compress` DNGs had no Finder/Quick Look previews on macOS.
 
-use std::io::{self, Write};
+use std::io;
 
-use flate2::write::ZlibEncoder;
-use flate2::Compression;
-
+use super::ljpeg;
 use crate::Image;
 
 /// One encoded strip ready to be written to file.
@@ -27,13 +27,13 @@ pub(crate) struct EncodedStrip {
 pub(crate) type CropWindow = (u32, u32, u32, u32);
 
 /// Encode `image` into one or more strips of `rows_per_strip` rows.
-/// `compress=true` enables horizontal-predictor + zlib (`Deflate`).
+/// `compress=true` encodes each strip as lossless JPEG.
 /// `crop` selects a sub-rectangle to emit; `None` writes the full frame.
 ///
-/// M7d — strips are independent (no cross-strip state in the predictor
-/// or the deflate stream; each strip is a standalone zlib payload), so
-/// the per-strip work runs on rayon. Output order is preserved by
-/// `into_par_iter()` over an indexed range + `collect::<Result<Vec<_>>>`.
+/// M7d — strips are independent (each is a standalone byte stream with no
+/// cross-strip state), so the per-strip work runs on rayon. Output order
+/// is preserved by `into_par_iter()` over an indexed range +
+/// `collect::<Result<Vec<_>>>`.
 pub(crate) fn encode_strips(
     image: &Image,
     rows_per_strip: u32,
@@ -64,20 +64,13 @@ pub(crate) fn encode_strips(
                 packed.extend_from_slice(&image.data[off..off + samples_per_row]);
             }
 
-            if compress {
-                for row in packed.chunks_mut(samples_per_row) {
-                    apply_horizontal_predictor_u16(row, cpp);
-                }
-            }
-
-            let mut payload: Vec<u8> = Vec::with_capacity(packed.len() * 2);
-            for &v in &packed {
-                payload.extend_from_slice(&v.to_le_bytes());
-            }
-
             let bytes = if compress {
-                zlib_encode(&payload)?
+                ljpeg::encode(&packed, out_cols as usize, n_rows, cpp)
             } else {
+                let mut payload: Vec<u8> = Vec::with_capacity(packed.len() * 2);
+                for &v in &packed {
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
                 payload
             };
             Ok(EncodedStrip { bytes })
@@ -101,29 +94,10 @@ pub(crate) fn encode_preview_strip(preview: &crate::Preview) -> Vec<u8> {
     out
 }
 
-fn apply_horizontal_predictor_u16(row: &mut [u16], samples_per_pixel: usize) {
-    if row.len() <= samples_per_pixel {
-        return;
-    }
-    // Reverse iteration so we compute (current - previous) using the
-    // original previous-pixel value, not an already-differenced one.
-    for i in (samples_per_pixel..row.len()).rev() {
-        row[i] = row[i].wrapping_sub(row[i - samples_per_pixel]);
-    }
-}
-
-fn zlib_encode(data: &[u8]) -> io::Result<Vec<u8>> {
-    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-    enc.write_all(data)?;
-    enc.finish()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ImageLevels;
-    use flate2::read::ZlibDecoder;
-    use std::io::Read;
 
     fn fake_image(cols: u32, rows: u32, chans: u32) -> Image {
         let row_stride = cols * chans;
@@ -144,32 +118,8 @@ mod tests {
             row_stride,
             levels: ImageLevels::default(),
             dng_highlight_scale: 1.0,
+            dng_shoulder_ceiling: 1.0,
         }
-    }
-
-    #[test]
-    fn predictor_first_pixel_unchanged_rest_differenced() {
-        let mut row = [10u16, 20, 30, 11, 21, 32];
-        apply_horizontal_predictor_u16(&mut row, 3);
-        assert_eq!(row[0], 10);
-        assert_eq!(row[1], 20);
-        assert_eq!(row[2], 30);
-        // Per-channel diff: 11-10=1, 21-20=1, 32-30=2.
-        assert_eq!(row[3], 1);
-        assert_eq!(row[4], 1);
-        assert_eq!(row[5], 2);
-    }
-
-    #[test]
-    fn predictor_round_trips_via_cumulative_sum() {
-        let original = vec![10u16, 20, 30, 11, 21, 32, 100, 50, 60];
-        let mut row = original.clone();
-        apply_horizontal_predictor_u16(&mut row, 3);
-        // Restore by cumulative sum per channel.
-        for i in 3..row.len() {
-            row[i] = row[i].wrapping_add(row[i - 3]);
-        }
-        assert_eq!(row, original);
     }
 
     #[test]
@@ -198,31 +148,37 @@ mod tests {
     }
 
     #[test]
-    fn compressed_strips_round_trip_to_original_bytes() {
-        let img = fake_image(8, 32, 3);
+    fn compressed_strips_are_standalone_jpeg_streams() {
+        // 100 rows / 32 per strip → 4 independent SOI..EOI streams, each
+        // sized for its own row count (the last strip is short).
+        let img = fake_image(8, 100, 3);
         let strips = encode_strips(&img, 32, true, None).unwrap();
-        assert_eq!(strips.len(), 1);
-        let mut decoded = Vec::new();
-        ZlibDecoder::new(&strips[0].bytes[..])
-            .read_to_end(&mut decoded)
-            .unwrap();
-        // Decoded payload is predictor-encoded LE u16. Reverse the
-        // predictor per row, then convert back to u16 pixels and compare
-        // against the source.
-        let cpp = 3usize;
-        let cols = 8usize;
-        let row_bytes = cols * cpp * 2;
-        let mut undone = Vec::with_capacity(decoded.len() / 2);
-        for row_chunk in decoded.chunks(row_bytes) {
-            let mut row: Vec<u16> = row_chunk
-                .chunks(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect();
-            for i in cpp..row.len() {
-                row[i] = row[i].wrapping_add(row[i - cpp]);
-            }
-            undone.extend(row);
+        assert_eq!(strips.len(), 4);
+        for s in &strips {
+            assert_eq!(&s.bytes[..2], &[0xFF, 0xD8], "strip must start with SOI");
+            assert_eq!(
+                &s.bytes[s.bytes.len() - 2..],
+                &[0xFF, 0xD9],
+                "strip must end with EOI"
+            );
         }
-        assert_eq!(undone, img.data);
+    }
+
+    #[test]
+    fn compressed_crop_matches_uncompressed_crop_dimensions() {
+        // Cropped compressed strips carry the crop dimensions in SOF3:
+        // height 4 (rows), width 4 (cols) for the (2,1,4,4) window.
+        let img = fake_image(8, 8, 3);
+        let strips = encode_strips(&img, 32, true, Some((2, 1, 4, 4))).unwrap();
+        assert_eq!(strips.len(), 1);
+        let b = &strips[0].bytes;
+        let sof = b
+            .windows(2)
+            .position(|w| w == [0xFF, 0xC3])
+            .expect("SOF3 present");
+        // SOF3 layout: marker(2) len(2) precision(1) height(2) width(2).
+        let height = u16::from_be_bytes([b[sof + 5], b[sof + 6]]);
+        let width = u16::from_be_bytes([b[sof + 7], b[sof + 8]]);
+        assert_eq!((height, width), (4, 4));
     }
 }

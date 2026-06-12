@@ -1,31 +1,25 @@
 # x3fuse-core
 
-A command-line converter for Sigma Foveon **X3F** raw files. It decodes X3F images and writes **DNG**, **TIFF**, **PPM**, embedded **JPEG** thumbnails, **metadata** dumps, and **histogram** CSVs. It supports the Merrill, classic (SD9/SD14-era), and Quattro sensor
-generations.
+Command-line converter for Sigma Foveon **X3F** raw files. Decodes Merrill, classic (SD9/SD14-era), and Quattro sensors and writes **DNG**, **TIFF**, **PPM**, embedded **JPEG** thumbnails, **metadata** dumps, and **histogram** CSVs.
 
-The converter is written in Rust as a Cargo workspace. The only non-Rust component is an optional OpenCV-backed denoise pass (see [Build](#build)) — and even that has a portable pure-Rust fallback, so denoise works on every target (including `wasm32`); everything else (container parsing, entropy decode, the processing pipeline, and all output writers) is native Rust.
+Built to power [X3Fuse](https://github.com/sagwaco/x3fuse), which provides a GUI for converting X3F files to DNG, TIFF, and JPEG. The codebase is a pure-Rust Cargo workspace (only two tiny C log/version shims remain) so it builds on every target (including `wasm32`) with no external dependencies.
 
-Built to power [X3Fuse](https://github.com/sagwaco/x3fuse), which provides a GUI for converting X3F files to DNG, TIFF, and JPEG.
+## Quick start
 
-## Build
-
-The only prerequisite is a Rust toolchain ([rustup](https://rustup.rs)):
+Prerequisite: a Rust toolchain ([rustup](https://rustup.rs)).
 
 ```sh
 cargo build --release
+target/release/x3f_extract -dng photo.X3F
 ```
 
-This produces `target/release/x3f_extract`.
-
-**Denoise (optional, on by default).** The non-local-means denoise pass links against a prebuilt [opencv-mobile](https://github.com/nihui/opencv-mobile) static library, fetched automatically at build time for supported targets (macOS, iOS, Linux, Windows, Android). If no prebuilt is available or the download fails, the build falls back to a no-op denoise stub — the binary still builds and runs; pass `-no-denoise` (or `-denoise 0`) to skip the pass explicitly. Denoise strength is adjustable on a `0`–`10` scale with `-denoise <0-10>` (see [Modifiers](#modifiers)).
+This produces `target/release/x3f_extract`. Multiple input files are processed in parallel.
 
 ## Usage
 
 ```sh
 x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 ```
-
-Multiple input files are processed in parallel. The legacy single-dash flag syntax is used.
 
 ### Output format (choose one)
 
@@ -48,7 +42,7 @@ Multiple input files are processed in parallel. The legacy single-dash flag synt
 | `-o <DIR>`                | write output to `<DIR>`                                                            |
 | `-v` / `-q`               | verbose / quiet (errors only)                                                      |
 | `-color <SPACE>`          | RGB color space: `none`, `sRGB`, `AdobeRGB`, `ProPhotoRGB` (does not affect DNG)   |
-| `-compress`               | Deflate/ZIP compression for DNG and TIFF                                           |
+| `-compress`               | lossless compression (DNG: lossless JPEG, TIFF: Deflate/ZIP)                       |
 | `-denoise <0-10>`         | NLM denoise intensity: `0` = off, `10` = full strength (**default**); intermediate values linearly scale the NLM sigma |
 | `-no-denoise`             | disable the NLM denoise pass (alias for `-denoise 0`)                               |
 | `-no-crop`                | do not crop to the active image area                                               |
@@ -58,12 +52,12 @@ Multiple input files are processed in parallel. The legacy single-dash flag synt
 | `-unprocessed`            | dump RAW with no preprocessing                                                     |
 | `-qtop`                   | dump the Quattro top layer, unprocessed                                            |
 | `-opcodes-dir <DIR>`      | embed pre-rendered DNG `OpcodeList3` flat-fielding blobs (see [opcodes/](opcodes)) |
-| `-dng-highlight-recovery` | Foveon highlight recovery for DNG (see below)                                      |
+| `-dng-highlight-recovery` | Foveon highlight recovery for DNG (see [DNG output](#dng-output))                |
 | `-cineon`                 | 16-bit TIFF with a Cineon-style log tone curve baked in (requires `-tiff`)         |
 | `-offset <OFF>`           | RAW offset for SD14 and older (automatic if omitted)                               |
 | `-matrixmax <M>`          | max matrix elements in metadata dump (default 100)                                 |
 
-A few `X3F_*` environment variables tune specific stages, e.g. `X3F_CINEON_SCALE` (Cineon log-curve scale; default 100).
+A few `X3F_*` environment variables tune specific stages, e.g. `X3F_CINEON_SCALE` (Cineon log-curve scale; default 100) and `X3F_DNG_SHOULDER_KNEE` (highlight-recovery knee; default `0.85`).
 
 ### Examples
 
@@ -84,35 +78,31 @@ x3f_extract -dng -denoise 5 input.X3F
 x3f_extract -meta input.X3F
 ```
 
-## Foveon highlight recovery (DNG)
+## DNG output
 
-Pass `-dng-highlight-recovery` to enable the Foveon highlight-recovery pipeline. Highlight recovery is not compatible with some RAW engines, and is only tested in Adobe Camera Raw (Lightroom) and RawTherapee.
+Foveon sensors have no demosaicing step, so DNGs are written as **Linear DNGs** (`PhotometricInterpretation = LinearRaw`). To render consistently across RAW engines (Adobe Camera Raw / Lightroom, LibRaw / RawTherapee, Capture One, and Apple's RAW engine) the writer bakes per-channel saturation into the raster and tags a uniform `BlackLevel = 0` / `WhiteLevel = 65535`, and never relies on optional hints like `BaselineExposure`.
 
-## RAW Compression
+- **`-compress`**: lossless compression. TIFF uses Deflate/ZIP; DNG uses **lossless JPEG** (`Compression = 7`), the only 16-bit integer raw compression the spec allows and the one every engine decodes. Compressed output is bit-identical to uncompressed.
+- **`-dng-highlight-recovery`**: reconstructs clipped channels from a scene-derived chroma LUT and folds recovered highlights back under `WhiteLevel` via a soft shoulder baked into the raster (published as `LinearResponseLimit`).
 
-Pass `-compress` to enable RAW zip compression from TIFF and DNG outputs. Note that DNG compression is not compatible with all RAW engines, and is only tested in Adobe Camera Raw (Lightroom).
+See the [conversion pipeline](docs/src/pipeline.md) chapter for the full DNG writer design.
 
-## RAW Compatibility
-
-Because Foveon sensors do not have a traditional demosaicing step, output DNGs are written as **Linear DNGs** (`PhotometricInterpretation = LinearRaw`) — spec-compliant, but a less common path that many RAW engines (notably Apple RAW) handle poorly, since their decoders are tuned for mosaiced sensors and may misapply the embedded color matrices, levels, or
-highlight logic. For best results, prefer Adobe Camera Raw / Lightroom or RawTherapee. For use with other RAW engines, consider exporting as 16-bit TIFF with a flat `-cineon` gamma curve.
-
-## Workspace layout
+## Project layout
 
 ```
-x3f-cli  ──▶  x3f-core  ──▶  x3f-sys  ──FFI──▶  C/C++ (denoise + log/version shims)
+x3f-cli  ──▶  x3f-core  ──▶  x3f-sys  ──FFI──▶  C (log/version shims)
 ```
 
-- [crates/x3f-cli](crates/x3f-cli) — the `x3f_extract` binary.
-- [crates/x3f-core](crates/x3f-core) — safe Rust API for reading and converting X3F images.
-- [crates/x3f-sys](crates/x3f-sys) — low-level layer; bindgen FFI and the small remaining
-  C/C++ ([crates/x3f-sys/csrc/](crates/x3f-sys/csrc)) for the OpenCV denoise pass, plus a
-  portable pure-Rust NLM denoise ([src/denoise.rs](crates/x3f-sys/src/denoise.rs)) used where
-  OpenCV isn't linked (wasm, offline builds).
-- [crates/x3f-ffi-c](crates/x3f-ffi-c) — C ABI wrapper for iOS / Android / WASM consumers.
-- [opcodes/](opcodes) — pre-rendered DNG `OpcodeList3` flat-fielding blobs for Merrill bodies.
-- [docs/](docs) — the [mdbook](https://rust-lang.github.io/mdBook/) (pipeline, format
-  reference, FFI surface, performance, contributor guide).
+| Path | Role |
+| ---- | ---- |
+| [crates/x3f-cli](crates/x3f-cli) | `x3f_extract` binary |
+| [crates/x3f-core](crates/x3f-core) | safe Rust API for reading and converting X3F images |
+| [crates/x3f-sys](crates/x3f-sys) | low-level layer, bindgen FFI, pure-Rust NLM denoise |
+| [crates/x3f-ffi-c](crates/x3f-ffi-c) | C ABI for iOS / Android / WASM consumers |
+| [opcodes/](opcodes) | pre-rendered DNG `OpcodeList3` flat-fielding blobs (Merrill) |
+| [docs/](docs) | [mdbook](https://rust-lang.github.io/mdBook/) — pipeline, format reference, FFI, contributor guide |
+
+Browse the book locally with `mdbook serve docs --open` (install via `cargo install mdbook`).
 
 ## License
 

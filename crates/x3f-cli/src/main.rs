@@ -135,22 +135,24 @@ fn usage(progname: &str) -> ! {
          \x20  -no-fix-bad     Do not fix bad pixels\n\
          \x20  -sgain          Apply spatial gain (default except for Quattro)\n\
          \x20  -wb <WB>        Select white balance preset\n\
-         \x20  -compress       Enable ZIP compression for DNG and TIFF output\n\
+         \x20  -compress       Enable lossless compression (DNG: lossless\n\
+         \x20                  JPEG, TIFF: ZIP/Deflate)\n\
          \x20  -opcodes-dir <DIR>  Directory of pre-rendered DNG OpcodeList3\n\
          \x20                  flat-fielding blobs. When set, the matching\n\
          \x20                  per-(model, aperture[, lens]) blob is embedded\n\
          \x20                  into the DNG raw IFD's OpcodeList3 tag. Files\n\
          \x20                  follow the x3fuse layout: <MODEL>[_<LENS>]_FF_DNG_Opcodelist3_<APERTURE>.\n\
          \x20  -dng-highlight-recovery\n\
-         \x20                  Apply Foveon highlight recovery (chroma LUT,\n\
-         \x20                  L*p reconstruction, matrix-pathology gate) when\n\
-         \x20                  writing DNG. Recovered raster values are scaled\n\
-         \x20                  to fit u16 with a matching BaselineExposure\n\
-         \x20                  nudge so the renderer can pull recovered\n\
-         \x20                  highlights back via negative exposure.\n\
-         \x20                  Compatible only with Adobe Camera Raw / Lightroom\n\
-         \x20                  and RawTherapee/LibRaw — Capture One and Apple\n\
-         \x20                  RAW Engine cast green/blue when this is on.\n\
+         \x20                  Apply Foveon highlight recovery (per-channel\n\
+         \x20                  chroma-LUT reconstruction, L*p fallback,\n\
+         \x20                  matrix-pathology gate) when writing DNG.\n\
+         \x20                  Recovered overshoot is folded back under\n\
+         \x20                  WhiteLevel with a soft highlight shoulder baked\n\
+         \x20                  into the raster (knee tunable via\n\
+         \x20                  X3F_DNG_SHOULDER_KNEE, default 0.85), so the\n\
+         \x20                  result renders identically in every DNG reader\n\
+         \x20                  (Adobe Camera Raw, Lightroom, LibRaw/RawTherapee,\n\
+         \x20                  Capture One, Apple RAW Engine).\n\
          \x20                  Default: off (matches the pre-Rust C writer).\n\
          \x20  -cineon         Write a 16-bit TIFF with a Cineon-style log tone\n\
          \x20                  curve (lifted shadows, pulled highlights, flat\n\
@@ -166,7 +168,7 @@ fn usage(progname: &str) -> ! {
          \x20                  with X3F_CINEON_SCALE (default 100; 12 ≈ Cineon\n\
          \x20                  film-print, 50 ≈ moderate log; larger is flatter\n\
          \x20                  still at the cost of shadow noise). Requires -tiff.\n\
-         \x20  -ocl            Ignored (opencv-mobile has no OpenCL backend)\n\
+         \x20  -ocl            Ignored (no OpenCL backend)\n\
          \n\
          STRANGE STUFF\n\
          \x20  -offset <OFF>   Offset for SD14 and older\n\
@@ -493,8 +495,8 @@ fn main() -> ExitCode {
     if let Some(n) = args.matrix_max {
         set_max_printed_matrix_elements(n);
     }
-    // -ocl is currently a no-op; we intentionally do not call into x3f-sys
-    // for it. The OpenCL paths returned with the OpenCV port in M9.
+    // -ocl is a no-op, preserved only so legacy scripts don't error. There is
+    // no OpenCL backend (the denoise pass is the pure-Rust NLM in x3f-sys).
     let _ = args.use_opencl;
 
     if let Some(dir) = args.outdir.as_deref() {

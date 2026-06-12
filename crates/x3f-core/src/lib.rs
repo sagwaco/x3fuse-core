@@ -1,8 +1,7 @@
 //! Safe Rust API for reading and converting Sigma Foveon X3F raw images.
 //!
 //! The decoding and processing pipeline is native Rust over the low-level
-//! [`x3f_sys`] layer; the only non-Rust code is an optional OpenCV-backed
-//! denoise pass.
+//! [`x3f_sys`] layer; the only non-Rust code is two tiny C log/version shims.
 //!
 //! The headline type is [`Reader`], which owns the C `x3f_t` and the input
 //! `FILE*`. Open a file, optionally load extra sections (CAMF/property
@@ -104,14 +103,10 @@ pub struct ProcessOptions {
     pub compress: bool,
     /// Strength of the NLM denoise pass run before color conversion, on a
     /// 0..=10 scale: `0` disables denoise entirely (equivalent to the legacy
-    /// `-no-denoise`), `10` is full strength (the legacy default, byte-identical
-    /// to the pre-knob output), and intermediate values linearly attenuate each
-    /// sensor's NLM sigma (`scale = intensity / 10`). Values above 10 are
-    /// clamped. Backed by opencv-mobile's `fastNlMeansDenoising` where a
-    /// prebuilt is linked, and by the portable pure-Rust NLM
-    /// (`x3f-sys/src/denoise.rs`) everywhere else — `wasm32`, offline / docs.rs
-    /// builds, and any triple without an opencv-mobile prebuilt — so denoise
-    /// works on every target instead of no-op'ing.
+    /// `-no-denoise`), `10` is full strength (the legacy default), and
+    /// intermediate values linearly attenuate each sensor's NLM sigma
+    /// (`scale = intensity / 10`). Values above 10 are clamped. Backed by the
+    /// pure-Rust Non-Local Means in `x3f-sys/src/denoise.rs` on every target.
     pub denoise_intensity: u8,
     /// Directory of pre-rendered DNG `OpcodeList3` blobs (Sigma's per-
     /// model / per-aperture flat-fielding gain maps). When set, the DNG

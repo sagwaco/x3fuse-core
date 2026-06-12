@@ -195,6 +195,23 @@ pub struct chroma_lut_t {
     pub neutral_tm: f64,
     pub blend_threshold: f64,
     pub blend_divisor: f64,
+    // --- M8 DNG highlight-recovery extension: per-channel tables -----
+    // The original `lut` reconstructs a clipped T from unclipped B,M
+    // (bin = B/(B+M), value = T/M). These two extend the same scheme to
+    // the other clip identities so a single-clipped-channel pixel keeps
+    // its scene chroma instead of falling through to the neutral L*p
+    // snap in `reconstruct_highlights`:
+    //   lut_b: bin = M/(M+T), value = B/M  (B clipped; M,T donors)
+    //   lut_m: bin = B/(B+T), value = M/T  (M clipped; B,T donors)
+    // Only consumed by `chroma_lut_apply_pixel_bmt` (the DNG recovery
+    // path); `chroma_lut_apply_pixel` (TIFF/PPM path, MD5-pinned)
+    // ignores them.
+    pub lut_b: [f32; CHROMA_LUT_BINS],
+    pub lut_m: [f32; CHROMA_LUT_BINS],
+    pub valid_b: libc::c_int,
+    pub valid_m: libc::c_int,
+    pub neutral_bm: f64,
+    pub neutral_mt: f64,
 }
 
 /// Read an env var as a NUL-terminated bytestring and run it through
@@ -226,8 +243,18 @@ pub unsafe extern "C" fn chroma_lut_init_defaults(lut: *mut chroma_lut_t) {
     for v in lut.lut.iter_mut() {
         *v = 0.0;
     }
+    for v in lut.lut_b.iter_mut() {
+        *v = 0.0;
+    }
+    for v in lut.lut_m.iter_mut() {
+        *v = 0.0;
+    }
     lut.valid = 0;
+    lut.valid_b = 0;
+    lut.valid_m = 0;
     lut.neutral_tm = 1.0;
+    lut.neutral_bm = 1.0;
+    lut.neutral_mt = 1.0;
     lut.sat_threshold = 0.99;
     lut.donor_min_brightness = 0.20;
     lut.recovery_cap = 1.75; // matches HighlightRestoreThresh
@@ -286,6 +313,22 @@ pub unsafe extern "C" fn chroma_lut_build_from_image(
 
     let mut corr_sum = vec![0.0_f64; CHROMA_LUT_BINS];
     let mut corr_count = vec![0u32; CHROMA_LUT_BINS];
+    // M8 — accumulators for the B- and M-clip reconstruction tables.
+    let mut corr_sum_b = vec![0.0_f64; CHROMA_LUT_BINS];
+    let mut corr_count_b = vec![0u32; CHROMA_LUT_BINS];
+    let mut corr_sum_m = vec![0.0_f64; CHROMA_LUT_BINS];
+    let mut corr_count_m = vec![0u32; CHROMA_LUT_BINS];
+
+    #[inline]
+    fn ratio_bin(num: f64, den: f64) -> usize {
+        let mut bin = (num * (CHROMA_LUT_BINS as f64 - 1.0) / den) as i32;
+        if bin < 0 {
+            bin = 0;
+        } else if bin > CHROMA_LUT_BINS as i32 - 1 {
+            bin = CHROMA_LUT_BINS as i32 - 1;
+        }
+        bin as usize
+    }
 
     let row_stride = image.row_stride as usize;
     let channels = image.channels as usize;
@@ -296,14 +339,6 @@ pub unsafe extern "C" fn chroma_lut_build_from_image(
                 let idx = row_stride * row + channels * col + c;
                 let v = unsafe { *image.data.add(idx) } as f64;
                 s[c] = (v - ilevels.black[c]) / (ilevels.white[c] as f64 - ilevels.black[c]);
-            }
-            // Donor only: T must be unclipped.
-            if s[2] >= lut.sat_threshold {
-                continue;
-            }
-            // And donor must be bright enough to be useful.
-            if s[0] + s[1] <= lut.donor_min_brightness {
-                continue;
             }
 
             let sb = if s[0] > CHROMA_LUT_EPS {
@@ -322,15 +357,24 @@ pub unsafe extern "C" fn chroma_lut_build_from_image(
                 CHROMA_LUT_EPS
             };
 
-            let mut bin = (sb * (CHROMA_LUT_BINS as f64 - 1.0) / (sb + sm)) as i32;
-            if bin < 0 {
-                bin = 0;
-            } else if bin > CHROMA_LUT_BINS as i32 - 1 {
-                bin = CHROMA_LUT_BINS as i32 - 1;
+            // T table: donor needs T unclipped and B+M bright enough.
+            if s[2] < lut.sat_threshold && s[0] + s[1] > lut.donor_min_brightness {
+                let bin = ratio_bin(sb, sb + sm);
+                corr_sum[bin] += st / sm;
+                corr_count[bin] += 1;
             }
-            let bin = bin as usize;
-            corr_sum[bin] += st / sm;
-            corr_count[bin] += 1;
+            // B table: donor needs B unclipped and M+T bright enough.
+            if s[0] < lut.sat_threshold && s[1] + s[2] > lut.donor_min_brightness {
+                let bin = ratio_bin(sm, sm + st);
+                corr_sum_b[bin] += sb / sm;
+                corr_count_b[bin] += 1;
+            }
+            // M table: donor needs M unclipped and B+T bright enough.
+            if s[1] < lut.sat_threshold && s[0] + s[2] > lut.donor_min_brightness {
+                let bin = ratio_bin(sb, sb + st);
+                corr_sum_m[bin] += sm / st;
+                corr_count_m[bin] += 1;
+            }
         }
     }
 
@@ -339,21 +383,19 @@ pub unsafe extern "C" fn chroma_lut_build_from_image(
     } else {
         1.0
     };
-
-    let mut populated = 0;
-    for c in 0..CHROMA_LUT_BINS {
-        if corr_count[c] > 0 {
-            corr_sum[c] /= corr_count[c] as f64;
-            populated += 1;
-        }
-    }
-    if populated == 0 {
-        lut.valid = 0;
-        return 0;
-    }
+    let neutral_bm = if prior[1] > CHROMA_LUT_EPS {
+        prior[0] / prior[1]
+    } else {
+        1.0
+    };
+    let neutral_mt = if prior[2] > CHROMA_LUT_EPS {
+        prior[1] / prior[2]
+    } else {
+        1.0
+    };
 
     // Empty-bin nearest-populated fill (default radius 16; capped so a
-    // genuinely-absent chromaticity falls through to neutral_tm).
+    // genuinely-absent chromaticity falls through to the neutral ratio).
     let mut fill_dist = 16_i32;
     if let Some(v) = env_atoi("X3F_CHROMA_LUT_FILL_DIST") {
         fill_dist = v;
@@ -362,35 +404,85 @@ pub unsafe extern "C" fn chroma_lut_build_from_image(
         fill_dist = 0;
     }
 
-    for c in 0..CHROMA_LUT_BINS {
-        if corr_count[c] > 0 {
-            continue;
-        }
-        let mut found: i32 = -1;
-        for d in 1..=fill_dist {
-            let lo = c as i32 - d;
-            let hi = c as i32 + d;
-            if lo >= 0 && corr_count[lo as usize] > 0 {
-                found = lo;
-                break;
+    /// Average per-bin sums, fill empty bins from the nearest populated
+    /// neighbour (falling back to `neutral`). Returns the populated-bin
+    /// count (0 = table unusable).
+    fn finish_table(
+        sum: &mut [f64],
+        count: &[u32],
+        neutral: f64,
+        fill_dist: i32,
+        out: &mut [f32; CHROMA_LUT_BINS],
+    ) -> i32 {
+        let mut populated = 0;
+        for c in 0..CHROMA_LUT_BINS {
+            if count[c] > 0 {
+                sum[c] /= count[c] as f64;
+                populated += 1;
             }
-            if hi < CHROMA_LUT_BINS as i32 && corr_count[hi as usize] > 0 {
-                found = hi;
-                break;
+        }
+        if populated == 0 {
+            return 0;
+        }
+        for c in 0..CHROMA_LUT_BINS {
+            if count[c] > 0 {
+                continue;
+            }
+            let mut found: i32 = -1;
+            for d in 1..=fill_dist {
+                let lo = c as i32 - d;
+                let hi = c as i32 + d;
+                if lo >= 0 && count[lo as usize] > 0 {
+                    found = lo;
+                    break;
+                }
+                if hi < CHROMA_LUT_BINS as i32 && count[hi as usize] > 0 {
+                    found = hi;
+                    break;
+                }
+            }
+            if found >= 0 {
+                sum[c] = sum[found as usize];
+            } else {
+                sum[c] = neutral;
             }
         }
-        if found >= 0 {
-            corr_sum[c] = corr_sum[found as usize];
-        } else {
-            corr_sum[c] = neutral_tm;
+        for c in 0..CHROMA_LUT_BINS {
+            out[c] = sum[c] as f32;
         }
+        populated
     }
 
-    for c in 0..CHROMA_LUT_BINS {
-        lut.lut[c] = corr_sum[c] as f32;
+    let populated = finish_table(
+        &mut corr_sum,
+        &corr_count,
+        neutral_tm,
+        fill_dist,
+        &mut lut.lut,
+    );
+    if populated == 0 {
+        lut.valid = 0;
+        return 0;
     }
     lut.valid = 1;
     lut.neutral_tm = neutral_tm;
+
+    lut.valid_b = (finish_table(
+        &mut corr_sum_b,
+        &corr_count_b,
+        neutral_bm,
+        fill_dist,
+        &mut lut.lut_b,
+    ) > 0) as libc::c_int;
+    lut.neutral_bm = neutral_bm;
+    lut.valid_m = (finish_table(
+        &mut corr_sum_m,
+        &corr_count_m,
+        neutral_mt,
+        fill_dist,
+        &mut lut.lut_m,
+    ) > 0) as libc::c_int;
+    lut.neutral_mt = neutral_mt;
 
     if env_present("X3F_CHROMA_LUT_TRACE") {
         unsafe {
@@ -444,8 +536,21 @@ pub struct chroma_lut_apply_stats_t {
     pub bm_clip_kill: u64,
     pub bin_evidence_kill: u64,
     pub applied: u64,
+    /// Per-bin counters for the T-clip identity ONLY (`lut`'s
+    /// B/(B+M) bins). The B-/M-identity passes of
+    /// `chroma_lut_apply_pixel_bmt` bin against different tables
+    /// (`lut_b`'s M/(M+T), `lut_m`'s B/(B+T)), so mixing them here
+    /// would make the histogram unreadable — they count into the
+    /// aggregate `*_b` / `*_m` fields below instead.
     pub bin_kill_hist: [u64; CHROMA_LUT_BINS],
     pub bin_applied_hist: [u64; CHROMA_LUT_BINS],
+    // --- M8 BMT extension: aggregate counters for the B- and M-clip
+    // identities of `chroma_lut_apply_pixel_bmt` (DNG path only; the
+    // T identity counts into the original fields above).
+    pub bin_evidence_kill_b: u64,
+    pub bin_evidence_kill_m: u64,
+    pub applied_b: u64,
+    pub applied_m: u64,
 }
 
 #[no_mangle]
@@ -575,6 +680,192 @@ pub unsafe extern "C" fn chroma_lut_apply_pixel(
     1
 }
 
+// ----------------------------------------------------------------------
+// chroma_lut_apply_pixel_bmt — M8 generalized per-channel reconstruction
+// (DNG recovery path only).
+//
+// `chroma_lut_apply_pixel` above only ever repairs a clipped T from
+// unclipped B,M; pixels where B or M clipped fall through to the
+// neutral L*p snap in `reconstruct_highlights`, which destroys scene
+// chroma. Sigma Photo Pro's pipeline ("HPRestoration" + the HR/HN
+// blend in F23RestoreHighlights) instead reconstructs *each* clipped
+// channel from the unclipped ones and only neutralizes as a last
+// resort — that per-channel restoration is why SPP keeps more color
+// in recovered highlights. This function mirrors that: it tries the
+// original T repair first (identical math — it delegates), then the
+// B-clipped and M-clipped identities using the `lut_b` / `lut_m`
+// tables, with the same gate structure (soft clip ramp on the clipped
+// channel, donor-asymmetry damping, donor hard-clip kill, bin-evidence
+// kill, recovery cap) transposed to each case.
+//
+// Returns 1 when any channel was repaired; 0 means the caller should
+// fall back to `reconstruct_highlights`.
+// ----------------------------------------------------------------------
+
+#[no_mangle]
+pub unsafe extern "C" fn chroma_lut_apply_pixel_bmt(
+    s: *mut f64,
+    lut: *const chroma_lut_t,
+    stats: *mut chroma_lut_apply_stats_t,
+) -> libc::c_int {
+    // T-clipped identity first: byte-identical to the original pass.
+    if unsafe { chroma_lut_apply_pixel(s, lut, stats) } != 0 {
+        return 1;
+    }
+    let lut = unsafe { &*lut };
+    if lut.valid == 0 {
+        return 0;
+    }
+    let s = unsafe { std::slice::from_raw_parts_mut(s, 3) };
+
+    // (clipped channel, donor a, donor b, amplitude-from-db, table,
+    //  neutral, valid). The bin is always da/(da+db); the table value is
+    //  a ratio against the amplitude donor:
+    //   B identity: B' = M * lut_b[bin(M/(M+T))]  (amplitude = da = M)
+    //   M identity: M' = T * lut_m[bin(B/(B+T))]  (amplitude = db = T)
+    for &(x, da, db, amp_from_db, table, neutral, valid) in &[
+        (
+            0usize,
+            1usize,
+            2usize,
+            false,
+            &lut.lut_b,
+            lut.neutral_bm,
+            lut.valid_b,
+        ),
+        (
+            1usize,
+            0usize,
+            2usize,
+            true,
+            &lut.lut_m,
+            lut.neutral_mt,
+            lut.valid_m,
+        ),
+    ] {
+        if valid == 0 {
+            continue;
+        }
+
+        // Soft clip ramp on the channel being repaired (mirrors
+        // t_strength in the T pass).
+        let mut x_strength = (s[x] - (lut.sat_threshold - lut.soft_window)) / lut.soft_window;
+        if x_strength <= 0.0 {
+            continue;
+        }
+        if x_strength > 1.0 {
+            x_strength = 1.0;
+        }
+
+        // Donors actually clipped is a hard kill (mirrors bm_clip_kill).
+        if s[da] >= lut.sat_threshold || s[db] >= lut.sat_threshold {
+            continue;
+        }
+
+        // Donor asymmetry damping (mirrors the asym guard).
+        let d_max = if s[da] > s[db] { s[da] } else { s[db] };
+        let mut asym_strength = (lut.asymmetric_max - d_max) / lut.soft_window;
+        if asym_strength <= 0.0 {
+            continue;
+        }
+        if asym_strength > 1.0 {
+            asym_strength = 1.0;
+        }
+
+        // Brightness-blend override — same weighted_lum signal as the
+        // T pass, so very bright regions keep full strength even when
+        // the asym guard damps.
+        let strength = {
+            let (x0, x1, x2) = (s[0], s[1], s[2]);
+            let (mx, md);
+            if x0 >= x1 && x0 >= x2 {
+                mx = x0;
+                md = if x1 >= x2 { x1 } else { x2 };
+            } else if x1 >= x2 {
+                mx = x1;
+                md = if x0 >= x2 { x0 } else { x2 };
+            } else {
+                mx = x2;
+                md = if x0 >= x1 { x0 } else { x1 };
+            }
+            let weighted_lum = mx * (2.0 / 3.0) + md * (1.0 / 3.0);
+            let mut blend_t = (weighted_lum - lut.blend_threshold) / lut.blend_divisor;
+            if blend_t < 0.0 {
+                blend_t = 0.0;
+            } else if blend_t > 1.0 {
+                blend_t = 1.0;
+            }
+            let base = x_strength * asym_strength;
+            if blend_t > base {
+                blend_t
+            } else {
+                base
+            }
+        };
+
+        let va = if s[da] > CHROMA_LUT_EPS {
+            s[da]
+        } else {
+            CHROMA_LUT_EPS
+        };
+        let vb = if s[db] > CHROMA_LUT_EPS {
+            s[db]
+        } else {
+            CHROMA_LUT_EPS
+        };
+
+        let mut bin = (va * (CHROMA_LUT_BINS as f64 - 1.0) / (va + vb)) as i32;
+        if bin < 0 {
+            bin = 0;
+        } else if bin > CHROMA_LUT_BINS as i32 - 1 {
+            bin = CHROMA_LUT_BINS as i32 - 1;
+        }
+        let bin = bin as usize;
+
+        // Bin-evidence kill: a near-neutral table entry carries no
+        // chroma information beyond what the neutral fallback gives.
+        // Counted per-identity (not into `bin_evidence_kill` /
+        // `bin_kill_hist`, which are T-table-only — see the stats
+        // struct).
+        let bin_v = table[bin] as f64;
+        let rel_diff = (bin_v - neutral) / neutral;
+        if rel_diff < 0.05 && rel_diff > -0.05 {
+            if !stats.is_null() {
+                unsafe {
+                    if x == 0 {
+                        (*stats).bin_evidence_kill_b += 1;
+                    } else {
+                        (*stats).bin_evidence_kill_m += 1;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Reconstruct from the amplitude donor (M for the B identity,
+        // T for the M identity).
+        let amp = if amp_from_db { vb } else { va };
+        let mut recovered = amp * bin_v;
+        if recovered > lut.recovery_cap {
+            recovered = lut.recovery_cap;
+        }
+
+        s[x] = (1.0 - strength) * s[x] + strength * recovered;
+
+        if !stats.is_null() {
+            unsafe {
+                if x == 0 {
+                    (*stats).applied_b += 1;
+                } else {
+                    (*stats).applied_m += 1;
+                }
+            }
+        }
+        return 1;
+    }
+    0
+}
+
 /// Print one-line trace stats for the chroma LUT to stderr — exercised
 /// when `X3F_CHROMA_LUT_TRACE` / `X3F_CHROMA_LUT_TRACE_HIST` env vars
 /// are set. No-op on wasm32-unknown-unknown (variadic `fprintf` can't
@@ -604,6 +895,20 @@ pub unsafe extern "C" fn chroma_lut_apply_stats_print(
             s.applied,
             pct,
         );
+        // The BMT B-/M-identity counters (DNG path only) — printed on
+        // their own line, and only when that pass actually ran, so the
+        // T-only TIFF/PPM trace output is byte-identical to before.
+        if s.applied_b + s.applied_m + s.bin_evidence_kill_b + s.bin_evidence_kill_m > 0 {
+            libc::fprintf(
+                libc_stderr(),
+                c"chroma_lut_bmt[%s] applied_b=%llu applied_m=%llu bin_evidence_kill_b=%llu bin_evidence_kill_m=%llu\n".as_ptr(),
+                path,
+                s.applied_b,
+                s.applied_m,
+                s.bin_evidence_kill_b,
+                s.bin_evidence_kill_m,
+            );
+        }
     }
     if env_present("X3F_CHROMA_LUT_TRACE_HIST") {
         for b in 0..CHROMA_LUT_BINS {
@@ -903,6 +1208,12 @@ static _A_CHROMA_LUT_APPLY: unsafe extern "C" fn(
     *mut chroma_lut_apply_stats_t,
 ) -> libc::c_int = chroma_lut_apply_pixel;
 #[used]
+static _A_CHROMA_LUT_APPLY_BMT: unsafe extern "C" fn(
+    *mut f64,
+    *const chroma_lut_t,
+    *mut chroma_lut_apply_stats_t,
+) -> libc::c_int = chroma_lut_apply_pixel_bmt;
+#[used]
 static _A_CHROMA_LUT_STATS: unsafe extern "C" fn(
     *const chroma_lut_apply_stats_t,
     *const libc::c_char,
@@ -944,17 +1255,23 @@ mod tests {
 
     #[test]
     fn chroma_lut_t_layout() {
-        // float[256] = 1024 bytes, then int (with 4 bytes pad to 8-align
-        // doubles), then 8 doubles.
-        // 1024 + 4 (int) + 4 (pad) + 8*8 = 1096
-        assert_eq!(size_of::<chroma_lut_t>(), 1024 + 4 + 4 + 8 * 8);
+        // Original layout: float[256] = 1024 bytes, then int (with 4
+        // bytes pad to 8-align doubles), then 8 doubles = 1096. The M8
+        // extension appends 2×float[256] (2048), 2×int (8), and 2
+        // doubles (16) with no extra padding (1096 and 2048+8 are both
+        // 8-multiples... 2048 + 8 = 2056, 8-aligned).
+        assert_eq!(
+            size_of::<chroma_lut_t>(),
+            (1024 + 4 + 4 + 8 * 8) + 2 * 1024 + 2 * 4 + 2 * 8
+        );
         assert_eq!(align_of::<chroma_lut_t>(), 8);
     }
 
     #[test]
     fn chroma_lut_apply_stats_t_layout() {
         // 6 u64 + 2x[u64; 256] = (6 + 512) * 8
-        assert_eq!(size_of::<chroma_lut_apply_stats_t>(), (6 + 512) * 8);
+        // 6 scalar u64 + 2×256 hist + 4 BMT-identity u64 (M8).
+        assert_eq!(size_of::<chroma_lut_apply_stats_t>(), (6 + 512 + 4) * 8);
         assert_eq!(align_of::<chroma_lut_apply_stats_t>(), 8);
     }
 
@@ -992,6 +1309,120 @@ mod tests {
         let p = [1.0_f64, 1.0, 1.0];
         unsafe { reconstruct_highlights(s.as_mut_ptr(), p.as_ptr(), &hp) };
         assert_eq!(s, [0.5, 0.5, 0.5]);
+    }
+
+    /// Build a `chroma_lut_t` by hand with all three tables valid and a
+    /// constant table value, so the per-identity apply paths can be
+    /// exercised without an image.
+    fn synth_lut(table_value: f32) -> chroma_lut_t {
+        let mut lut: chroma_lut_t = unsafe { std::mem::zeroed() };
+        unsafe { chroma_lut_init_defaults(&mut lut) };
+        lut.lut = [table_value; CHROMA_LUT_BINS];
+        lut.lut_b = [table_value; CHROMA_LUT_BINS];
+        lut.lut_m = [table_value; CHROMA_LUT_BINS];
+        lut.valid = 1;
+        lut.valid_b = 1;
+        lut.valid_m = 1;
+        lut.neutral_tm = 1.0;
+        lut.neutral_bm = 1.0;
+        lut.neutral_mt = 1.0;
+        lut
+    }
+
+    #[test]
+    fn bmt_apply_repairs_clipped_t_like_original() {
+        let lut = synth_lut(1.5);
+        // T clipped (1.0), B/M healthy donors well below asymmetric_max.
+        let mut s = [0.5_f64, 0.5, 1.0];
+        let mut s2 = s;
+        let r1 = unsafe { chroma_lut_apply_pixel(s.as_mut_ptr(), &lut, ptr::null_mut()) };
+        let r2 = unsafe { chroma_lut_apply_pixel_bmt(s2.as_mut_ptr(), &lut, ptr::null_mut()) };
+        assert_eq!(r1, 1);
+        assert_eq!(r2, 1);
+        assert_eq!(s, s2, "T identity must match the original pass exactly");
+        // T' = M * lut = 0.5 * 1.5 at full strength.
+        assert!((s[2] - 0.75).abs() < 1e-9, "T' = {}", s[2]);
+    }
+
+    #[test]
+    fn bmt_apply_repairs_clipped_b_from_m_and_t() {
+        let lut = synth_lut(1.5);
+        // B clipped, M/T healthy donors. The original pass returns 0
+        // (T not in clip zone); the generalized pass must repair B.
+        let mut s_orig = [1.0_f64, 0.5, 0.5];
+        let mut s = s_orig;
+        let r_old = unsafe { chroma_lut_apply_pixel(s_orig.as_mut_ptr(), &lut, ptr::null_mut()) };
+        assert_eq!(r_old, 0);
+        let r = unsafe { chroma_lut_apply_pixel_bmt(s.as_mut_ptr(), &lut, ptr::null_mut()) };
+        assert_eq!(r, 1);
+        // B' = M * 1.5 at full strength (B at sat ⇒ x_strength = 1;
+        // donors at 0.5 ⇒ asym undamped) = 0.75 — chroma kept instead
+        // of a neutral snap.
+        assert!((s[0] - 0.75).abs() < 1e-9, "B' = {}", s[0]);
+        assert_eq!(s[1], 0.5);
+        assert_eq!(s[2], 0.5);
+    }
+
+    #[test]
+    fn bmt_apply_repairs_clipped_m_from_t_amplitude() {
+        let lut = synth_lut(1.4);
+        // M clipped, B/T healthy. M' = T * lut_m = 0.5 * 1.4 = 0.7.
+        let mut s = [0.5_f64, 1.0, 0.5];
+        let r = unsafe { chroma_lut_apply_pixel_bmt(s.as_mut_ptr(), &lut, ptr::null_mut()) };
+        assert_eq!(r, 1);
+        // Tolerance covers the f32 table storage (1.4 is not exact).
+        assert!((s[1] - 0.7).abs() < 1e-6, "M' = {}", s[1]);
+        assert_eq!(s[0], 0.5);
+        assert_eq!(s[2], 0.5);
+    }
+
+    #[test]
+    fn bmt_apply_kills_when_donors_clipped() {
+        let lut = synth_lut(1.5);
+        // B clipped AND T clipped: B identity has a clipped donor (T),
+        // M identity has a clipped donor (B) — no repair, caller falls
+        // back to reconstruct_highlights.
+        let mut s = [1.0_f64, 0.5, 1.0];
+        // T identity also dies (donor B clipped → bm_clip kill).
+        let r = unsafe { chroma_lut_apply_pixel_bmt(s.as_mut_ptr(), &lut, ptr::null_mut()) };
+        assert_eq!(r, 0);
+        assert_eq!(s, [1.0, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn bmt_apply_respects_bin_evidence_kill() {
+        // Table ≈ neutral ⇒ no chroma evidence ⇒ no repair.
+        let lut = synth_lut(1.01);
+        let mut s = [1.0_f64, 0.5, 0.5];
+        let r = unsafe { chroma_lut_apply_pixel_bmt(s.as_mut_ptr(), &lut, ptr::null_mut()) };
+        assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn bmt_apply_keeps_identity_stats_out_of_t_table_counters() {
+        // A B-identity repair must count into `applied_b`, never into
+        // the T-table `applied` / bin histograms (those bins index a
+        // different table).
+        let lut = synth_lut(1.5);
+        let mut stats: chroma_lut_apply_stats_t = unsafe { std::mem::zeroed() };
+        let mut s = [1.0_f64, 0.5, 0.5];
+        let r = unsafe { chroma_lut_apply_pixel_bmt(s.as_mut_ptr(), &lut, &mut stats) };
+        assert_eq!(r, 1);
+        assert_eq!(stats.applied_b, 1);
+        assert_eq!(stats.applied_m, 0);
+        assert_eq!(stats.applied, 0);
+        assert_eq!(stats.bin_applied_hist.iter().sum::<u64>(), 0);
+
+        // Same for a B-identity bin-evidence kill.
+        let lut = synth_lut(1.01);
+        let mut stats: chroma_lut_apply_stats_t = unsafe { std::mem::zeroed() };
+        let mut s = [1.0_f64, 0.5, 0.5];
+        let r = unsafe { chroma_lut_apply_pixel_bmt(s.as_mut_ptr(), &lut, &mut stats) };
+        assert_eq!(r, 0);
+        assert_eq!(stats.bin_evidence_kill_b, 1);
+        assert_eq!(stats.bin_evidence_kill_m, 0);
+        assert_eq!(stats.bin_evidence_kill, 0);
+        assert_eq!(stats.bin_kill_hist.iter().sum::<u64>(), 0);
     }
 
     #[test]

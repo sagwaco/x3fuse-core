@@ -61,8 +61,11 @@ black) + bias` clamp, Quattro top16 → image[2] downsample, full-res
      (color 0/1/2 stagger by 1 u16 with stride `channels`=3, or color
      2 in Quattro layout writes to its own `q.top16.data`). Plus
      per-strip `par_iter` in `encode_strips` since each strip is an
-     independent zlib payload. SD1M DNG: 1.29 s → 0.49 s (1.98× this
-     step / 3.88× cumulative).
+     independent payload. SD1M DNG: 1.29 s → 0.49 s (1.98× this
+     step / 3.88× cumulative). (The strip parallelism now only helps
+     the uncompressed path: `-compress` DNGs are a single full-height
+     lossless-JPEG strip — the layout the dcraw-lineage decoders
+     require — at roughly +0.3 s wall per file.)
 
 `interpolate_bad_pixels` stays serial — iterative passes with
 neighbour reads are not naively row-parallel.

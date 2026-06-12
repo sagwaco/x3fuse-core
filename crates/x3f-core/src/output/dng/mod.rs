@@ -5,7 +5,7 @@
 //! ```text
 //! TIFF header (II + magic + IFD0-offset)
 //! Preview strip bytes               (8-bit RGB, downsampled to 300 px wide)
-//! Raw strip bytes                    (16-bit RGB, full resolution; optional zlib)
+//! Raw strip bytes                    (16-bit RGB, full resolution; optional lossless JPEG)
 //! ExtraCameraProfiles blob           (concatenated MMCR mini-TIFFs)
 //! IFD1 (raw) — external values + body
 //! IFD0 (preview) — external values + body
@@ -20,11 +20,16 @@
 //!   function exists but is unreferenced; the comment cites a "double-
 //!   application of sg" risk in readers that honour the opcode.
 //! - `LinearizationTable`. The image is already linear.
-//! - DNG raw compression formats (LJPEG-92, JXL). We support uncompressed
-//!   and Adobe Deflate, matching the legacy C.
+//! - Adobe Deflate raw compression. The legacy C used it for `-compress`,
+//!   but the DNG spec only allows Deflate for floating-point/32-bit data
+//!   and Apple's RAW engine rejects the whole file when the raw IFD is
+//!   deflated (no Finder/Quick Look previews on macOS). `-compress` now
+//!   emits lossless JPEG ([`ljpeg`]), the compression the spec sanctions
+//!   for 16-bit integer raws and the one all RAW engines decode.
 
 mod exif;
 mod hue_sat_map;
+mod ljpeg;
 mod metadata;
 mod opcodes;
 mod profiles;
@@ -54,8 +59,8 @@ const PREVIEW_MAX_WIDTH: u32 = 300;
 /// Write `reader`'s processed image to `path` as a DNG file.
 ///
 /// `opts` is honoured the same way the legacy CLI honoured its DNG flags:
-/// `compress` enables Adobe Deflate + horizontal predictor on the raw
-/// plane; `wb` overrides the file's recorded white balance; `apply_sgain`,
+/// `compress` enables lossless-JPEG encoding of the raw plane; `wb`
+/// overrides the file's recorded white balance; `apply_sgain`,
 /// `fix_bad`, `denoise` flow through to image processing.
 pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> Result<(), Error> {
     let path = path.as_ref();
@@ -80,10 +85,26 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
     opts.cineon = false;
     let wb = opts.wb.clone().unwrap_or_default();
 
-    let image = reader.get_image(&opts)?;
+    let mut image = reader.get_image(&opts)?;
     if image.channels != 3 {
         return Err(Error::Library(crate::LibraryError::Argument));
     }
+
+    // Equalize the three channels into one shared encoding range
+    // before anything downstream (preview render, strip encode, level
+    // tags) sees the raster. The processed Foveon planes saturate at
+    // very different per-channel levels (e.g. Merrill WhiteLevel
+    // [16383, 7695, 4829]); the DNG spec allows publishing those as a
+    // per-sample WhiteLevel, and Adobe/LibRaw normalize correctly, but
+    // Apple's RAW engine and Capture One do not handle per-channel
+    // WhiteLevel on 3-sample LinearRaw — they normalize all channels
+    // by a single level, destroying the channel ratios (the historical
+    // magenta/green casts in those apps). Baking the normalization
+    // into the raster and tagging a uniform BlackLevel=0 /
+    // WhiteLevel=65535 removes the only metadata those readers
+    // mishandled; the normalized values (and therefore Adobe/LibRaw
+    // renders) are unchanged.
+    equalize_levels(&mut image);
 
     // The legacy CPP and earlier Rust ports wrote the full raw frame
     // (including the masked-pixel border) and marked the usable region
@@ -102,8 +123,21 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
 
     let preview = reader.get_preview(&image, &opts, PREVIEW_MAX_WIDTH)?;
     let preview_bytes = strip::encode_preview_strip(&preview);
+    // Lossless JPEG must go out as ONE full-height strip: the dcraw-
+    // lineage decoders (LibRaw, and Apple's engine behaves the same)
+    // treat a multi-strip LJPEG raw IFD as "first strip, then stop", so
+    // a 32-row strip layout renders as a thin band over black. Real-
+    // world LJ92 DNGs are single-strip or tiled; single-strip is the
+    // minimal layout every reader handles (the cost: the rayon
+    // par_iter over strips degenerates to one serial encode task).
+    // Uncompressed keeps the legacy 32-row strip layout.
+    let rows_per_strip = if opts.compress {
+        out_rows
+    } else {
+        ROWS_PER_STRIP
+    };
     let raw_strips =
-        strip::encode_strips(&image, ROWS_PER_STRIP, opts.compress, crop).map_err(|source| {
+        strip::encode_strips(&image, rows_per_strip, opts.compress, crop).map_err(|source| {
             Error::Io {
                 path: path.display().to_string(),
                 source,
@@ -164,6 +198,24 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
         .and_then(|dir| opcodes::load_for(&capture_meta, dir));
 
     // -- Build IFD1 (raw) first so we know its offset for IFD0's SubIFDs.
+    // When highlight recovery actually overshot WhiteLevel
+    // (`dng_shoulder_ceiling > 1.0` — snapshotted on `image` like
+    // `dng_highlight_scale` above), the top of the encoding range
+    // carries the baked highlight shoulder (see Pass 3 of
+    // `apply_highlight_clip_dng`), so the response above the knee is
+    // intentionally non-linear — publish the knee as
+    // LinearResponseLimit per the DNG spec ("the fraction of the
+    // encoding range above which the response may become significantly
+    // non-linear"). A recovery run where nothing overshot bakes no
+    // shoulder, so the raster stays scene-linear to white and the
+    // limit stays 1.0.
+    let linear_limit = if opts.dng_highlight_recovery && image.dng_shoulder_ceiling > 1.0 {
+        // SAFETY: stateless env read.
+        unsafe { x3f_sys::x3f_get_dng_shoulder_knee() }
+    } else {
+        1.0
+    };
+
     let mut ifd1 = DirectoryWriter::new();
     populate_raw_ifd(
         reader,
@@ -172,7 +224,9 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
         &mut ifd1,
         &raw_strip_offsets,
         &raw_strip_byte_counts,
+        rows_per_strip,
         opts.compress,
+        linear_limit,
     )?;
     if let Some(blob) = opcode_blob {
         ifd1.add(tags::OPCODE_LIST3, Value::Undefined(blob));
@@ -194,7 +248,6 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
         preview_strip_offset,
         preview_strip_bytes,
         &mut ifd0,
-        opts.compress,
         orientation,
     );
     exif::add_top_level_tags(&capture_meta, &mut ifd0);
@@ -223,12 +276,59 @@ fn io_err(path: &Path) -> impl Fn(io::Error) -> Error + '_ {
     }
 }
 
+/// Rescale every channel from its native `[black_c, white_c]` range to a
+/// shared `[0, 65535]` range and update `image.levels` to match. The
+/// linearized value `(v - black) / (white - black)` each DNG reader
+/// computes is identical before and after (modulo one u16 rounding step)
+/// — this only moves the per-channel normalization out of the WhiteLevel
+/// / BlackLevel tags and into the raster, for readers that mishandle
+/// per-channel levels on LinearRaw.
+fn equalize_levels(image: &mut Image) {
+    use rayon::prelude::*;
+
+    const WHITE_OUT: f64 = 65535.0;
+    let black = image.levels.black;
+    let white = image.levels.white;
+    // Already uniform at the target levels — nothing to do.
+    if black == [0.0; 3] && white == [65535; 3] {
+        return;
+    }
+    // A degenerate channel range (white <= black) would turn the scale
+    // into ±inf/NaN and bake garbage into every sample of that channel.
+    // It can only come from a corrupt CAMF; leave the raster and the
+    // native per-channel level tags untouched (the pre-equalization
+    // writer behaviour, which Adobe/LibRaw still render) rather than
+    // destroy the image.
+    if (0..3).any(|c| white[c] as f64 <= black[c]) {
+        return;
+    }
+    let scale: Vec<f64> = (0..3)
+        .map(|c| WHITE_OUT / (white[c] as f64 - black[c]))
+        .collect();
+
+    let channels = image.channels as usize;
+    let cols = image.columns as usize;
+    let stride = image.row_stride as usize;
+    image.data.par_chunks_mut(stride).for_each(|row| {
+        for col in 0..cols {
+            let off = col * channels;
+            for c in 0..3 {
+                let v = row[off + c] as f64;
+                let out = ((v - black[c]) * scale[c]).round();
+                row[off + c] = out.clamp(0.0, WHITE_OUT) as u16;
+            }
+        }
+    });
+
+    image.levels.black = [0.0; 3];
+    image.levels.white = [65535; 3];
+}
+
 fn populate_preview_ifd(
     preview: &crate::Preview,
     strip_offset: u32,
     strip_bytes: u32,
     ifd: &mut DirectoryWriter,
-    compress: bool,
     orientation: u16,
 ) {
     ifd.add(
@@ -261,18 +361,19 @@ fn populate_preview_ifd(
         tags::PLANAR_CONFIGURATION,
         Value::Short(vec![tags::PLANAR_CONFIG_CONTIG]),
     );
-    let backward = if compress {
-        tags::DNG_VERSION_1_4_0_0
-    } else {
-        tags::DNG_VERSION_1_3_0_0
-    };
+    // Lossless JPEG has been part of DNG since 1.0, so compression never
+    // raises the backward version (the old Deflate path needed 1.4).
     ifd.add(
         tags::DNG_VERSION,
         Value::Byte(tags::DNG_VERSION_1_4_0_0.to_vec()),
     );
-    ifd.add(tags::DNG_BACKWARD_VERSION, Value::Byte(backward.to_vec()));
+    ifd.add(
+        tags::DNG_BACKWARD_VERSION,
+        Value::Byte(tags::DNG_VERSION_1_3_0_0.to_vec()),
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn populate_raw_ifd(
     reader: &Reader,
     image: &Image,
@@ -280,7 +381,9 @@ fn populate_raw_ifd(
     ifd: &mut DirectoryWriter,
     strip_offsets: &[u32],
     strip_byte_counts: &[u32],
+    rows_per_strip: u32,
     compress: bool,
+    linear_limit: f64,
 ) -> Result<(), Error> {
     let (out_rows, out_cols) = out_dims;
     // Orientation lives only in IFD0 (the preview IFD); the legacy C code
@@ -291,8 +394,12 @@ fn populate_raw_ifd(
     ifd.add(tags::IMAGE_WIDTH, Value::Long(vec![out_cols]));
     ifd.add(tags::IMAGE_LENGTH, Value::Long(vec![out_rows]));
     ifd.add(tags::BITS_PER_SAMPLE, Value::Short(vec![16, 16, 16]));
+    // Lossless JPEG (7) is the only spec-allowed compression for 16-bit
+    // integer raw data. Deflate (8) is reserved for floating-point/32-bit
+    // data, and Apple's RAW engine enforces that — it refuses the entire
+    // file, killing macOS Finder/Quick Look previews of compressed DNGs.
     let comp = if compress {
-        tags::COMPRESSION_ADOBE_DEFLATE
+        tags::COMPRESSION_LOSSLESS_JPEG
     } else {
         tags::COMPRESSION_NONE
     };
@@ -303,7 +410,7 @@ fn populate_raw_ifd(
     );
     ifd.add(tags::STRIP_OFFSETS, Value::Long(strip_offsets.to_vec()));
     ifd.add(tags::SAMPLES_PER_PIXEL, Value::Short(vec![3]));
-    ifd.add(tags::ROWS_PER_STRIP, Value::Long(vec![ROWS_PER_STRIP]));
+    ifd.add(tags::ROWS_PER_STRIP, Value::Long(vec![rows_per_strip]));
     ifd.add(
         tags::STRIP_BYTE_COUNTS,
         Value::Long(strip_byte_counts.to_vec()),
@@ -312,10 +419,6 @@ fn populate_raw_ifd(
         tags::PLANAR_CONFIGURATION,
         Value::Short(vec![tags::PLANAR_CONFIG_CONTIG]),
     );
-    if compress {
-        ifd.add(tags::PREDICTOR, Value::Short(vec![2]));
-    }
-
     // Per-channel black/white levels.
     // BlackLevel must be SHORT, LONG, or (unsigned) RATIONAL per the DNG
     // 1.6 spec — Capture One rejects SRATIONAL here and renders the raw
@@ -342,7 +445,11 @@ fn populate_raw_ifd(
     ifd.add(tags::CHROMA_BLUR_RADIUS, Value::Rational(vec![(0, 1)]));
     ifd.add(tags::CFA_PLANE_COLOR, Value::Byte(vec![0, 1, 2]));
     ifd.add(tags::DEFAULT_SCALE, Value::Rational(vec![(1, 1), (1, 1)]));
-    ifd.add(tags::LINEAR_RESPONSE_LIMIT, Value::Rational(vec![(1, 1)]));
+    let ll = (linear_limit.clamp(0.5, 1.0) * 10_000.0).round() as u32;
+    ifd.add(
+        tags::LINEAR_RESPONSE_LIMIT,
+        Value::Rational(vec![(ll, 10_000)]),
+    );
     ifd.add(tags::ANTI_ALIAS_STRENGTH, Value::Rational(vec![(0, 1)]));
 
     if let (Some(make), Some(model)) = (reader.dng_camf_text("Make"), reader.dng_camf_text("Model"))
@@ -391,6 +498,12 @@ fn add_dng_top_level_tags(
     ifd: &mut DirectoryWriter,
 ) -> Result<(), Error> {
     // BaselineExposure = log2(capture_iso/sensor_iso) + log2(highlight_scale).
+    // Since the recovery path bakes its highlight shoulder into the
+    // raster, `highlight_scale` is always 1.0 and BE carries only the
+    // ISO ratio — BaselineExposure is an optional-to-honour hint in the
+    // DNG spec, so nothing render-critical may depend on it. The
+    // `> 1.0` arm is kept for the writer-side contract should a future
+    // pipeline publish a scale again.
     if let (Some(sensor), Some(capture)) = (
         reader.dng_camf_float("SensorISO"),
         reader.dng_camf_float("CaptureISO"),
@@ -539,5 +652,73 @@ impl Reader {
         // SAFETY: data + size are owned by the parsed file and stay live
         // for self's lifetime; we copy out to an owned Vec.
         Some(unsafe { std::slice::from_raw_parts(data as *const u8, size) }.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ImageLevels;
+
+    fn image_with_levels(black: [f64; 3], white: [u32; 3], px: [u16; 3]) -> Image {
+        Image {
+            data: px.to_vec(),
+            rows: 1,
+            columns: 1,
+            channels: 3,
+            row_stride: 3,
+            levels: ImageLevels { black, white },
+            dng_highlight_scale: 1.0,
+            dng_shoulder_ceiling: 1.0,
+        }
+    }
+
+    #[test]
+    fn equalize_levels_normalizes_per_channel_ranges() {
+        // Merrill-style per-channel whites. A pixel sitting at half of
+        // each channel's range must land at half of 65535 in all three.
+        let black = [50.0; 3];
+        let white = [16383_u32, 7695, 4829];
+        let px = [
+            (50.0 + (16383.0 - 50.0) * 0.5) as u16,
+            (50.0 + (7695.0 - 50.0) * 0.5) as u16,
+            (50.0 + (4829.0 - 50.0) * 0.5) as u16,
+        ];
+        let mut img = image_with_levels(black, white, px);
+        equalize_levels(&mut img);
+        assert_eq!(img.levels.black, [0.0; 3]);
+        assert_eq!(img.levels.white, [65535; 3]);
+        for c in 0..3 {
+            let v = img.data[c] as f64 / 65535.0;
+            assert!(
+                (v - 0.5).abs() < 1e-3,
+                "channel {c} normalized to {v}, want 0.5"
+            );
+        }
+    }
+
+    #[test]
+    fn equalize_levels_skips_degenerate_ranges() {
+        // white <= black on any channel (corrupt CAMF) must leave the
+        // raster and the native per-channel levels untouched instead of
+        // baking ±inf scales into the samples.
+        let mut img = image_with_levels([100.0, 50.0, 50.0], [100, 7695, 4829], [90, 4000, 2400]);
+        equalize_levels(&mut img);
+        assert_eq!(img.data, vec![90, 4000, 2400]);
+        assert_eq!(img.levels.black, [100.0, 50.0, 50.0]);
+        assert_eq!(img.levels.white, [100, 7695, 4829]);
+    }
+
+    #[test]
+    fn equalize_levels_clamps_and_is_idempotent() {
+        // At-white maps to exactly 65535; below-black clamps to 0.
+        let mut img = image_with_levels([100.0; 3], [16383, 7695, 4829], [16383, 7695, 50]);
+        equalize_levels(&mut img);
+        assert_eq!(&img.data[..2], &[65535, 65535]);
+        assert_eq!(img.data[2], 0);
+        // Second call is a no-op.
+        let before = img.data.clone();
+        equalize_levels(&mut img);
+        assert_eq!(img.data, before);
     }
 }
