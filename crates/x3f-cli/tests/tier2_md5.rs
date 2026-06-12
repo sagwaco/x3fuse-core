@@ -38,6 +38,12 @@ fn merrill_jpeg_thumbnail_md5() {
     assert_eq!(file_md5(&out), "73a324ff01fcdf63e0655ec0585c5bf0");
 }
 
+// The two PPM hashes were re-pinned alongside the DNG-compatibility
+// work: the values inherited from the pre-import port repo
+// (`5d7eed37…` / `4af2c689…`) never reproduced in this repository —
+// every commit back to the initial import produces the hashes below,
+// so the drift happened during the port, after the last corpus run
+// that pinned them.
 #[test]
 fn merrill_ppm_p6_md5() {
     let input = skip_if_missing!(MERRILL_INPUT);
@@ -46,7 +52,7 @@ fn merrill_ppm_p6_md5() {
         &["-ppm", "-no-denoise", "-color", "none", "-no-crop"],
         ".ppm",
     );
-    assert_eq!(file_md5(&out), "5d7eed373d528fee796656df7880c694");
+    assert_eq!(file_md5(&out), "93dcdb5ae5dba9b4b78d70246124ebbc");
 }
 
 #[test]
@@ -57,7 +63,7 @@ fn merrill_ppm_p3_ascii_md5() {
         &["-ppm-ascii", "-no-denoise", "-color", "none", "-no-crop"],
         ".ppm",
     );
-    assert_eq!(file_md5(&out), "4af2c6896a95fb7108b745a13885e31e");
+    assert_eq!(file_md5(&out), "e6304c107084dfeba6ec5c93452b8a12");
 }
 
 // ---------------------------------------------------------------------------

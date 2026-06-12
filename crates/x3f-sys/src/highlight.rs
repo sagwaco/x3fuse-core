@@ -536,8 +536,21 @@ pub struct chroma_lut_apply_stats_t {
     pub bm_clip_kill: u64,
     pub bin_evidence_kill: u64,
     pub applied: u64,
+    /// Per-bin counters for the T-clip identity ONLY (`lut`'s
+    /// B/(B+M) bins). The B-/M-identity passes of
+    /// `chroma_lut_apply_pixel_bmt` bin against different tables
+    /// (`lut_b`'s M/(M+T), `lut_m`'s B/(B+T)), so mixing them here
+    /// would make the histogram unreadable — they count into the
+    /// aggregate `*_b` / `*_m` fields below instead.
     pub bin_kill_hist: [u64; CHROMA_LUT_BINS],
     pub bin_applied_hist: [u64; CHROMA_LUT_BINS],
+    // --- M8 BMT extension: aggregate counters for the B- and M-clip
+    // identities of `chroma_lut_apply_pixel_bmt` (DNG path only; the
+    // T identity counts into the original fields above).
+    pub bin_evidence_kill_b: u64,
+    pub bin_evidence_kill_m: u64,
+    pub applied_b: u64,
+    pub applied_m: u64,
 }
 
 #[no_mangle]
@@ -811,13 +824,19 @@ pub unsafe extern "C" fn chroma_lut_apply_pixel_bmt(
 
         // Bin-evidence kill: a near-neutral table entry carries no
         // chroma information beyond what the neutral fallback gives.
+        // Counted per-identity (not into `bin_evidence_kill` /
+        // `bin_kill_hist`, which are T-table-only — see the stats
+        // struct).
         let bin_v = table[bin] as f64;
         let rel_diff = (bin_v - neutral) / neutral;
         if rel_diff < 0.05 && rel_diff > -0.05 {
             if !stats.is_null() {
                 unsafe {
-                    (*stats).bin_evidence_kill += 1;
-                    (*stats).bin_kill_hist[bin] += 1;
+                    if x == 0 {
+                        (*stats).bin_evidence_kill_b += 1;
+                    } else {
+                        (*stats).bin_evidence_kill_m += 1;
+                    }
                 }
             }
             continue;
@@ -835,8 +854,11 @@ pub unsafe extern "C" fn chroma_lut_apply_pixel_bmt(
 
         if !stats.is_null() {
             unsafe {
-                (*stats).applied += 1;
-                (*stats).bin_applied_hist[bin] += 1;
+                if x == 0 {
+                    (*stats).applied_b += 1;
+                } else {
+                    (*stats).applied_m += 1;
+                }
             }
         }
         return 1;
@@ -873,6 +895,20 @@ pub unsafe extern "C" fn chroma_lut_apply_stats_print(
             s.applied,
             pct,
         );
+        // The BMT B-/M-identity counters (DNG path only) — printed on
+        // their own line, and only when that pass actually ran, so the
+        // T-only TIFF/PPM trace output is byte-identical to before.
+        if s.applied_b + s.applied_m + s.bin_evidence_kill_b + s.bin_evidence_kill_m > 0 {
+            libc::fprintf(
+                libc_stderr(),
+                c"chroma_lut_bmt[%s] applied_b=%llu applied_m=%llu bin_evidence_kill_b=%llu bin_evidence_kill_m=%llu\n".as_ptr(),
+                path,
+                s.applied_b,
+                s.applied_m,
+                s.bin_evidence_kill_b,
+                s.bin_evidence_kill_m,
+            );
+        }
     }
     if env_present("X3F_CHROMA_LUT_TRACE_HIST") {
         for b in 0..CHROMA_LUT_BINS {
@@ -1234,7 +1270,8 @@ mod tests {
     #[test]
     fn chroma_lut_apply_stats_t_layout() {
         // 6 u64 + 2x[u64; 256] = (6 + 512) * 8
-        assert_eq!(size_of::<chroma_lut_apply_stats_t>(), (6 + 512) * 8);
+        // 6 scalar u64 + 2×256 hist + 4 BMT-identity u64 (M8).
+        assert_eq!(size_of::<chroma_lut_apply_stats_t>(), (6 + 512 + 4) * 8);
         assert_eq!(align_of::<chroma_lut_apply_stats_t>(), 8);
     }
 
@@ -1359,6 +1396,33 @@ mod tests {
         let mut s = [1.0_f64, 0.5, 0.5];
         let r = unsafe { chroma_lut_apply_pixel_bmt(s.as_mut_ptr(), &lut, ptr::null_mut()) };
         assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn bmt_apply_keeps_identity_stats_out_of_t_table_counters() {
+        // A B-identity repair must count into `applied_b`, never into
+        // the T-table `applied` / bin histograms (those bins index a
+        // different table).
+        let lut = synth_lut(1.5);
+        let mut stats: chroma_lut_apply_stats_t = unsafe { std::mem::zeroed() };
+        let mut s = [1.0_f64, 0.5, 0.5];
+        let r = unsafe { chroma_lut_apply_pixel_bmt(s.as_mut_ptr(), &lut, &mut stats) };
+        assert_eq!(r, 1);
+        assert_eq!(stats.applied_b, 1);
+        assert_eq!(stats.applied_m, 0);
+        assert_eq!(stats.applied, 0);
+        assert_eq!(stats.bin_applied_hist.iter().sum::<u64>(), 0);
+
+        // Same for a B-identity bin-evidence kill.
+        let lut = synth_lut(1.01);
+        let mut stats: chroma_lut_apply_stats_t = unsafe { std::mem::zeroed() };
+        let mut s = [1.0_f64, 0.5, 0.5];
+        let r = unsafe { chroma_lut_apply_pixel_bmt(s.as_mut_ptr(), &lut, &mut stats) };
+        assert_eq!(r, 0);
+        assert_eq!(stats.bin_evidence_kill_b, 1);
+        assert_eq!(stats.bin_evidence_kill_m, 0);
+        assert_eq!(stats.bin_evidence_kill, 0);
+        assert_eq!(stats.bin_kill_hist.iter().sum::<u64>(), 0);
     }
 
     #[test]

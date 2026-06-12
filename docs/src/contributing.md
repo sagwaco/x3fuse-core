@@ -58,25 +58,42 @@ preserved verbatim with a comment. So is the firmware bug in
 
 ### Byte-identical parity is the gate
 
-Tier-2 MD5s on three baselines must match across a port step unless
-the step is an _intentional_ algorithm change:
+Two layers of MD5 baselines, one automated and one manual:
 
-- SD1M (`sigma_sd1_merrill_15.x3f`) DNG `dcaa9929…`
-- older raw (`_SDI8040.X3F`) DNG `41a80ce6…`
-- Quattro (`_SDI8284.X3F`) DNG `c2f70f35…`
+**Automated (tier-2,
+[`crates/x3f-cli/tests/tier2_md5.rs`](../../crates/x3f-cli/tests/tier2_md5.rs)):**
+metadata dumps, the embedded JPEG thumbnail, and PPM rasters are pinned
+to exact hashes. Processed TIFF/DNG output is deliberately *not* in
+tier-2 — it shifts whenever the highlight-recovery work iterates;
+tier-3 perceptual diffs cover it.
 
-TIFF baselines (no-denoise — these are the ones the tests enforce):
+**Manual (run before merging anything that touches the pipeline):**
+three reference baselines, produced with
 
-- SD1M `277cf4b4…`, `_SDI8040` `b4cc09aa…`, `_SDI8284` `661df021…`.
+```sh
+x3f_extract -dng  -no-denoise <input>   # DNG column
+x3f_extract -tiff -no-denoise <input>   # TIFF column
+```
 
-(The historical "denoise on, M9" TIFF hashes `89a447e6…` / `3b24cdc3…` were
-produced by the old opencv-mobile NLM and no longer reproduce now that denoise
-is the pure-Rust NLM; denoise output is not part of the byte-parity gate.)
+| Input | DNG | TIFF |
+| ----- | --- | ---- |
+| SD1M (`sigma_sd1_merrill_15.x3f`) | `16f0d954b4cb4aea3f3683a33896da21` | `277cf4b4691652bd57c96b15ba03d47f` |
+| older raw (`_SDI8040.X3F`) | `58b0376f041f69e6076bdc498c5952f9` | `b4cc09aa1c8d127274056660a92ffc0d` |
+| Quattro (`_SDI8284.X3F`) | `7402b517b953dfceceebd569e53d0615` | `661df021b16de5164b03624776fd5507` |
 
-Most milestones in [the port plan](./port-plan.md) document the
-expected MD5s. When a hash _should_ change (you're shipping an
-intentional algorithm tweak), call it out in the commit message and
-update the test expectation as part of the same change.
+These must match across a change unless the change is an _intentional_
+algorithm change — in which case re-pin this table in the same commit
+and call the change out in the commit message.
+
+(History: the DNG hashes cited by the port-plan milestones —
+`dcaa9929…` / `41a80ce6…` / `c2f70f35…` — are milestone-era values
+that no longer reproduce: intentional DNG-writer changes since then
+(highlight-recovery iterations, active-area cropping, and most
+recently the per-channel level-equalization bake) each moved the
+bytes without re-pinning the docs. The table above is the current
+re-pin. The "denoise on, M9" TIFF hashes `89a447e6…` / `3b24cdc3…`
+are also historical: they were produced by the old opencv-mobile NLM,
+and denoise output is not part of the byte-parity gate.)
 
 **The denoise output is _not_ part of the byte-parity gate.** Every
 tier-2/tier-3 test runs with `-no-denoise`, so the MD5 baselines above

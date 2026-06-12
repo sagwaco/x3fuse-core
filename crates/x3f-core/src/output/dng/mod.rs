@@ -128,8 +128,9 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
     // treat a multi-strip LJPEG raw IFD as "first strip, then stop", so
     // a 32-row strip layout renders as a thin band over black. Real-
     // world LJ92 DNGs are single-strip or tiled; single-strip is the
-    // minimal layout every reader handles. Uncompressed keeps the
-    // legacy 32-row strips (tier-2 parity surface).
+    // minimal layout every reader handles (the cost: the rayon
+    // par_iter over strips degenerates to one serial encode task).
+    // Uncompressed keeps the legacy 32-row strip layout.
     let rows_per_strip = if opts.compress {
         out_rows
     } else {
@@ -197,14 +198,18 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
         .and_then(|dir| opcodes::load_for(&capture_meta, dir));
 
     // -- Build IFD1 (raw) first so we know its offset for IFD0's SubIFDs.
-    // When highlight recovery ran, the top of the encoding range
+    // When highlight recovery actually overshot WhiteLevel
+    // (`dng_shoulder_ceiling > 1.0` — snapshotted on `image` like
+    // `dng_highlight_scale` above), the top of the encoding range
     // carries the baked highlight shoulder (see Pass 3 of
     // `apply_highlight_clip_dng`), so the response above the knee is
     // intentionally non-linear — publish the knee as
     // LinearResponseLimit per the DNG spec ("the fraction of the
     // encoding range above which the response may become significantly
-    // non-linear").
-    let linear_limit = if opts.dng_highlight_recovery {
+    // non-linear"). A recovery run where nothing overshot bakes no
+    // shoulder, so the raster stays scene-linear to white and the
+    // limit stays 1.0.
+    let linear_limit = if opts.dng_highlight_recovery && image.dng_shoulder_ceiling > 1.0 {
         // SAFETY: stateless env read.
         unsafe { x3f_sys::x3f_get_dng_shoulder_knee() }
     } else {
@@ -286,6 +291,15 @@ fn equalize_levels(image: &mut Image) {
     let white = image.levels.white;
     // Already uniform at the target levels — nothing to do.
     if black == [0.0; 3] && white == [65535; 3] {
+        return;
+    }
+    // A degenerate channel range (white <= black) would turn the scale
+    // into ±inf/NaN and bake garbage into every sample of that channel.
+    // It can only come from a corrupt CAMF; leave the raster and the
+    // native per-channel level tags untouched (the pre-equalization
+    // writer behaviour, which Adobe/LibRaw still render) rather than
+    // destroy the image.
+    if (0..3).any(|c| white[c] as f64 <= black[c]) {
         return;
     }
     let scale: Vec<f64> = (0..3)
@@ -655,6 +669,7 @@ mod tests {
             row_stride: 3,
             levels: ImageLevels { black, white },
             dng_highlight_scale: 1.0,
+            dng_shoulder_ceiling: 1.0,
         }
     }
 
@@ -680,6 +695,18 @@ mod tests {
                 "channel {c} normalized to {v}, want 0.5"
             );
         }
+    }
+
+    #[test]
+    fn equalize_levels_skips_degenerate_ranges() {
+        // white <= black on any channel (corrupt CAMF) must leave the
+        // raster and the native per-channel levels untouched instead of
+        // baking ±inf scales into the samples.
+        let mut img = image_with_levels([100.0, 50.0, 50.0], [100, 7695, 4829], [90, 4000, 2400]);
+        equalize_levels(&mut img);
+        assert_eq!(img.data, vec![90, 4000, 2400]);
+        assert_eq!(img.levels.black, [100.0, 50.0, 50.0]);
+        assert_eq!(img.levels.white, [100, 7695, 4829]);
     }
 
     #[test]

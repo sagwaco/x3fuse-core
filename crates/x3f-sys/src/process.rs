@@ -2330,6 +2330,16 @@ pub unsafe extern "C" fn expand_quattro(
 // so it never touches this cell.
 thread_local! {
     static DNG_HIGHLIGHT_SCALE: std::cell::Cell<f64> = const { std::cell::Cell::new(1.0) };
+    /// The pre-shoulder global max sat_ratio of the last
+    /// `apply_highlight_clip_dng` on this thread (1.0 when no pixel
+    /// overshot WhiteLevel, i.e. Pass 3 baked no shoulder and the
+    /// raster is scene-linear all the way to white). Same publication
+    /// discipline as `DNG_HIGHLIGHT_SCALE` above: written last, and
+    /// snapshotted by `x3f-core`'s `Reader::get_image` immediately
+    /// after return (`Image::dng_shoulder_ceiling`) so the DNG writer
+    /// can publish `LinearResponseLimit = knee` only when the top of
+    /// the encoding range is actually non-linear.
+    static DNG_SHOULDER_CEILING: std::cell::Cell<f64> = const { std::cell::Cell::new(1.0) };
     /// Controls the DNG-path highlight-recovery pipeline. When `false`
     /// (default), `apply_highlight_clip_dng` skips the chroma LUT, L*p
     /// reconstruction, repair_pix, and matrix-pathology gate, and ships
@@ -2365,6 +2375,13 @@ thread_local! {
 #[no_mangle]
 pub unsafe extern "C" fn x3f_get_dng_highlight_scale() -> f64 {
     DNG_HIGHLIGHT_SCALE.with(|c| c.get())
+}
+
+/// FFI accessor for `DNG_SHOULDER_CEILING` — see the cell's doc comment
+/// for the read-immediately-after-`x3f_get_image` contract.
+#[no_mangle]
+pub unsafe extern "C" fn x3f_get_dng_shoulder_ceiling() -> f64 {
+    DNG_SHOULDER_CEILING.with(|c| c.get())
 }
 
 /// The luminance (as a fraction of WhiteLevel) where the DNG recovery
@@ -2854,8 +2871,13 @@ pub unsafe extern "C" fn apply_highlight_clip_dng(
     // emits BE = log2(captureISO/sensorISO) only, with no renderer-
     // dependent compensation. The cell + plumbing are kept so the
     // writer-side contract (`Image::dng_highlight_scale`) is unchanged.
-    let _ = global_max;
     DNG_HIGHLIGHT_SCALE.with(|c| c.set(1.0));
+    // The shoulder ceiling tells the writer whether Pass 3 actually
+    // bent the top of the range (global_max > 1.0): only then does
+    // LinearResponseLimit drop from 1.0 to the knee. `recovery` off
+    // never bakes a shoulder, so publish 1.0 there regardless of what
+    // the (skipped) Pass 2 scan would have found.
+    DNG_SHOULDER_CEILING.with(|c| c.set(if recovery { global_max } else { 1.0 }));
 }
 
 // ----------------------------------------------------------------------

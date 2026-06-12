@@ -144,6 +144,7 @@ mod tests {
             row_stride,
             levels: crate::ImageLevels::default(),
             dng_highlight_scale: 1.0,
+            dng_shoulder_ceiling: 1.0,
         }
     }
 
