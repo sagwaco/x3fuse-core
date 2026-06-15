@@ -1155,13 +1155,21 @@ pub unsafe extern "C" fn repair_pix_apply_pixel(
 
 // ----------------------------------------------------------------------
 // libc stderr accessor — `libc` doesn't expose `stderr` directly on all
-// platforms; on macOS+linux it's `__stderrp` / `stderr`.
+// platforms. On Apple it's the `__stderrp` data symbol; on other Unix /
+// wasm it's `stderr`; on Windows the MSVC CRT has no `stderr` *symbol* at
+// all (it's a macro over `__acrt_iob_func(2)`), so we call that UCRT entry
+// point — linking `stderr` directly fails with LNK2019.
 // ----------------------------------------------------------------------
 extern "C" {
     #[cfg(target_vendor = "apple")]
     static __stderrp: *mut libc::FILE;
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(all(not(target_vendor = "apple"), not(windows)))]
     static stderr: *mut libc::FILE;
+}
+
+#[cfg(windows)]
+extern "C" {
+    fn __acrt_iob_func(index: u32) -> *mut libc::FILE;
 }
 
 #[inline]
@@ -1170,9 +1178,13 @@ fn libc_stderr() -> *mut libc::FILE {
     unsafe {
         __stderrp
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(all(not(target_vendor = "apple"), not(windows)))]
     unsafe {
         stderr
+    }
+    #[cfg(windows)]
+    unsafe {
+        __acrt_iob_func(2)
     }
 }
 

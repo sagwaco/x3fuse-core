@@ -216,8 +216,10 @@ pub enum LibraryError {
     Outfile,
     /// Internal library error (`X3F_INTERNAL_ERROR`).
     Internal,
-    /// An unrecognized non-OK status code.
-    Unknown(u32),
+    /// An unrecognized non-OK status code. Held as `i64` because bindgen
+    /// maps the C `x3f_return_t` enum to `u32` on most targets but to `i32`
+    /// under MSVC (C enums default to `int`); `i64` losslessly holds either.
+    Unknown(i64),
 }
 
 impl LibraryError {
@@ -230,7 +232,7 @@ impl LibraryError {
             sys::x3f_return_e_X3F_INFILE_ERROR => LibraryError::Infile,
             sys::x3f_return_e_X3F_OUTFILE_ERROR => LibraryError::Outfile,
             sys::x3f_return_e_X3F_INTERNAL_ERROR => LibraryError::Internal,
-            other => LibraryError::Unknown(other),
+            other => LibraryError::Unknown(other.into()),
         })
     }
 }
@@ -611,7 +613,7 @@ mod tests {
         let unknown: sys::x3f_return_t = 0x1234_5678;
         assert_eq!(
             LibraryError::from_raw(unknown).unwrap_err(),
-            LibraryError::Unknown(unknown),
+            LibraryError::Unknown(unknown.into()),
         );
     }
 
