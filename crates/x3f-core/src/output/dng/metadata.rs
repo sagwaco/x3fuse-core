@@ -50,6 +50,16 @@ impl Reader {
         (ok != 0).then_some(val)
     }
 
+    /// Per-channel CAMF `DigitalISOGain`, `[1.0; 3]` when absent or on
+    /// Merrill bodies — the skip-list lives in the x3f-sys accessor.
+    pub(crate) fn dng_digital_iso_gain(&self) -> [f64; 3] {
+        let mut gain = [1.0_f64; 3];
+        // SAFETY: x3f is valid for self's lifetime; gain is a 3-slot
+        // out-buffer the accessor always fills.
+        unsafe { sys::x3f_get_digital_iso_gain(self.x3f.as_ptr(), gain.as_mut_ptr()) };
+        gain
+    }
+
     /// Read a 3×3 `M_FLOAT` CAMF matrix into a flat row-major array.
     pub(crate) fn dng_camf_matrix_3x3(&self, name: &str) -> Option<[f64; 9]> {
         let cname = cstr(name);

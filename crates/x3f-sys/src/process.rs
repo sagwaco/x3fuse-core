@@ -1283,13 +1283,14 @@ pub unsafe extern "C" fn apply_wb_color_shading(
 //      DarkShield rects and column ranges (M6e2)
 //   3. Read max_raw and compute intermediate_bias / max_intermediate
 //      (M6e2 helpers); populate the caller's `ilevels` struct
-//   4. Read DigitalISOGain from CAMF (skipped on Merrill — see notes)
-//   5. Per-pixel: out = scale * (raw - black) + intermediate_bias,
-//      clamped to [0, 65535] uint16
-//   6. For Quattro: downsample top16 4-pixel sums into image[2], then
+//   4. Per-pixel: out = scale * (raw - black) + intermediate_bias,
+//      clamped to [0, 65535] uint16. DigitalISOGain is deliberately
+//      NOT part of `scale` — it lives in get_conv's matrix and the
+//      DNG BaselineExposure so sensor saturation maps to `il.white`
+//   5. For Quattro: downsample top16 4-pixel sums into image[2], then
 //      preprocess top16 full resolution with the same rule
-//   7. WB-conditional radial color shading (M6e5; Merrill-only)
-//   8. Bad-pixel interpolation (M6e3) — twice on Quattro: top first,
+//   6. WB-conditional radial color shading (M6e5; Merrill-only)
+//   7. Bad-pixel interpolation (M6e3) — twice on Quattro: top first,
 //      then image
 
 #[no_mangle]
@@ -1431,62 +1432,16 @@ pub unsafe extern "C" fn preprocess_data(
         );
     }
 
-    // DigitalISOGain skipped for Merrill (the legacy comment cites
-    // "color cast issues"). For all other models, read from CAMF; if
-    // missing, default to (1, 1, 1).
-    let mut digital_iso_gain = [1.0_f64; 3];
-    let merrill = {
-        let mut cammodel: *mut libc::c_char = ptr::null_mut();
-        if unsafe { x3f_get_prop_entry(x3f, c"CAMMODEL".as_ptr() as *mut _, &mut cammodel) } != 0 {
-            let model = unsafe { CStr::from_ptr(cammodel) }.to_bytes();
-            matches!(
-                model,
-                b"SIGMA DP1 Merrill"
-                    | b"SIGMA DP2 Merrill"
-                    | b"SIGMA DP3 Merrill"
-                    | b"SIGMA SD1 Merrill"
-            )
-        } else {
-            false
-        }
-    };
-    if merrill {
-        unsafe {
-            x3f_printf(
-                x3f_verbosity_t_DEBUG,
-                c"Merrill model detected, skipping DigitalISOGain\n".as_ptr(),
-            );
-            x3f_printf(
-                x3f_verbosity_t_DEBUG,
-                c"Using digital_ISO_Gain = {1.0,1.0,1.0} for Merrill model\n".as_ptr(),
-            );
-        }
-    } else if unsafe {
-        x3f_get_camf_float_vector(
-            x3f,
-            c"DigitalISOGain".as_ptr() as *mut _,
-            digital_iso_gain.as_mut_ptr(),
-        )
-    } != 0
-    {
-        unsafe {
-            x3f_printf(
-                x3f_verbosity_t_DEBUG,
-                c"digital_ISO_Gain = {%f,%f,%f}\n".as_ptr(),
-                digital_iso_gain[0],
-                digital_iso_gain[1],
-                digital_iso_gain[2],
-            );
-        }
-    } else {
-        digital_iso_gain = [1.0; 3];
-    }
-
+    // No DigitalISOGain here: baking it into `scale` pushed genuine
+    // unsaturated raw values above `il.white` (sensor saturation must
+    // map exactly to the published white level, or the top log2(gain)
+    // of a stop gets falsely clipped/recovered downstream). The gain
+    // is applied where brightness belongs instead: get_conv folds it
+    // into the conversion matrix, the DNG writer into BaselineExposure.
     let mut scale = [0.0_f64; 3];
     for color in 0..3 {
-        scale[color] = ((il.white[color] as f64 - il.black[color])
-            / (max_raw[color] as f64 - black_level[color]))
-            * digital_iso_gain[color];
+        scale[color] = (il.white[color] as f64 - il.black[color])
+            / (max_raw[color] as f64 - black_level[color]);
     }
 
     // Preprocess image data (HUF/TRU -> x3rgb16). Per pixel:
@@ -1599,6 +1554,68 @@ pub unsafe extern "C" fn preprocess_data(
 
 const LUTSIZE: libc::c_int = 1024;
 const MAX_CORR: usize = 6; // x3f_spatial_gain.h MAXCORR
+
+/// Per-channel CAMF `DigitalISOGain`. Always fills `gain[0..3]`:
+/// `(1, 1, 1)` for Merrill bodies (the legacy comment cites "color
+/// cast issues") and when the CAMF entry is absent. Returns 1 iff a
+/// real CAMF entry was used. Single source of truth — get_conv folds
+/// the gain into the conversion matrix and the DNG writer carries it
+/// in BaselineExposure; it must never be baked into raw samples (see
+/// preprocess_data).
+#[no_mangle]
+pub unsafe extern "C" fn x3f_get_digital_iso_gain(x3f: *mut x3f_t, gain: *mut f64) -> libc::c_int {
+    let mut digital_iso_gain = [1.0_f64; 3];
+    let mut used_camf = 0;
+    let merrill = {
+        let mut cammodel: *mut libc::c_char = ptr::null_mut();
+        if unsafe { x3f_get_prop_entry(x3f, c"CAMMODEL".as_ptr() as *mut _, &mut cammodel) } != 0 {
+            let model = unsafe { CStr::from_ptr(cammodel) }.to_bytes();
+            matches!(
+                model,
+                b"SIGMA DP1 Merrill"
+                    | b"SIGMA DP2 Merrill"
+                    | b"SIGMA DP3 Merrill"
+                    | b"SIGMA SD1 Merrill"
+            )
+        } else {
+            false
+        }
+    };
+    if merrill {
+        unsafe {
+            x3f_printf(
+                x3f_verbosity_t_DEBUG,
+                c"Merrill model detected, skipping DigitalISOGain\n".as_ptr(),
+            );
+            x3f_printf(
+                x3f_verbosity_t_DEBUG,
+                c"Using digital_ISO_Gain = {1.0,1.0,1.0} for Merrill model\n".as_ptr(),
+            );
+        }
+    } else if unsafe {
+        x3f_get_camf_float_vector(
+            x3f,
+            c"DigitalISOGain".as_ptr() as *mut _,
+            digital_iso_gain.as_mut_ptr(),
+        )
+    } != 0
+    {
+        unsafe {
+            x3f_printf(
+                x3f_verbosity_t_DEBUG,
+                c"digital_ISO_Gain = {%f,%f,%f}\n".as_ptr(),
+                digital_iso_gain[0],
+                digital_iso_gain[1],
+                digital_iso_gain[2],
+            );
+        }
+        used_camf = 1;
+    } else {
+        digital_iso_gain = [1.0; 3];
+    }
+    unsafe { std::slice::from_raw_parts_mut(gain, 3) }.copy_from_slice(&digital_iso_gain);
+    used_camf
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn get_conv(
@@ -1716,6 +1733,24 @@ pub unsafe extern "C" fn get_conv(
             raw_to_rgb.as_mut_ptr(),
         );
         x3f_scalar_3x3_mul(iso_scaling, raw_to_rgb.as_mut_ptr(), conv_matrix);
+
+        // Fold the per-channel CAMF DigitalISOGain into the matrix as
+        // conv_matrix · diag(g): the matrix input is per-channel
+        // sat_ratio, so the gain is a column scale. Applying it here —
+        // after highlight reconstruction has run on honest sat_ratio —
+        // rather than baking it into the raw samples keeps sensor
+        // saturation at `il.white`. Guarded so the no-gain path stays
+        // bit-identical.
+        let mut dig_gain = [1.0_f64; 3];
+        x3f_get_digital_iso_gain(x3f, dig_gain.as_mut_ptr());
+        if dig_gain != [1.0; 3] {
+            let cm = std::slice::from_raw_parts_mut(conv_matrix, 9);
+            for row in 0..3 {
+                for col in 0..3 {
+                    cm[3 * row + col] *= dig_gain[col];
+                }
+            }
+        }
 
         x3f_printf(x3f_verbosity_t_DEBUG, c"raw_to_rgb\n".as_ptr());
         x3f_3x3_print(x3f_verbosity_t_DEBUG, raw_to_rgb.as_mut_ptr());

@@ -61,7 +61,11 @@ The `convert_data` function is the hot loop. In order:
    H → skip Bottom; Merrill family → skip Right) are preserved
    verbatim.
 2. **white-level normalisation** + per-pixel `out = scale*(raw -
-   black) + bias` clamp.
+   black) + bias` clamp. `DigitalISOGain` is deliberately *not* part
+   of `scale`: sensor saturation must land exactly on the published
+   white level, or the top `log2(gain)` of a stop of genuine raw data
+   gets falsely clipped/"recovered" downstream. The gain is applied at
+   stage 7 (and as DNG `BaselineExposure`) instead.
 3. **spatial gain (lens shading) correction** —
    [`crates/x3f-sys/src/spatial_gain.rs`](../../crates/x3f-sys/src/spatial_gain.rs).
    Reads `IncludeBlocks` and the four nearest neighbours in
@@ -77,7 +81,12 @@ The `convert_data` function is the hot loop. In order:
 6. **white balance** — multiplies from `WhiteBalanceGains` /
    `DP1_WhiteBalanceGains`.
 7. **color-matrix transform** — sensor RGB → sRGB / AdobeRGB /
-   ProPhoto / linear via the M6a matrix kernel.
+   ProPhoto / linear via the M6a matrix kernel. `get_conv` scales the
+   matrix by `CaptureISO/SensorISO` and folds the per-channel CAMF
+   `DigitalISOGain` in as a column scale (`conv_matrix · diag(g)`,
+   Merrill bodies skip-listed in `x3f_get_digital_iso_gain`), so the
+   digital part of ISO brightening happens after highlight recovery
+   has seen honest sensor data.
 8. **highlight recovery** — the chroma LUT, RepairPix, and
    matrix-pathology gate ported in M6e4. Active research area: see
    the project memory entries on Foveon highlight handling.
@@ -102,6 +111,16 @@ divided the whole raster down and compensated via a
 `BaselineExposure = log2(scale)` nudge instead — that rendered
 correctly only in readers that honour BE (it is an optional hint in
 the DNG spec), so it was replaced by the baked shoulder.
+
+The DNG's `BaselineExposure` carries the ISO brightening that is
+deliberately kept out of the raster:
+`log2(CaptureISO/SensorISO) + log2(geometric mean of DigitalISOGain)`.
+Baking `DigitalISOGain` into the raw samples instead (as an earlier
+revision did in `preprocess_data`) falsely clipped the top
+`log2(gain)` of a stop of real highlight data at `WhiteLevel`; readers
+that ignore BE render those files a fraction of a stop darker, which
+matches the existing (much larger) BE reliance for Merrill ISO
+brightness.
 
 The writer then equalizes the three channels into one shared
 encoding range (`output::dng::equalize_levels`): the per-channel

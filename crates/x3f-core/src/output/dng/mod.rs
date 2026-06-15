@@ -490,6 +490,16 @@ fn active_area_crop(reader: &Reader, image: &Image) -> Option<strip::CropWindow>
     Some((top, left, bottom - top, right - left))
 }
 
+/// BaselineExposure contribution of the per-channel `DigitalISOGain`:
+/// log2 of the geometric mean, exactly 0.0 for the unit gain so the
+/// no-gain DNG stays byte-identical.
+fn digital_iso_gain_be(gain: [f64; 3]) -> f64 {
+    if gain == [1.0; 3] {
+        return 0.0;
+    }
+    (gain[0] * gain[1] * gain[2]).cbrt().log2()
+}
+
 fn add_dng_top_level_tags(
     reader: &Reader,
     capture_meta: &exif::CaptureMetadata,
@@ -497,18 +507,30 @@ fn add_dng_top_level_tags(
     highlight_scale: f64,
     ifd: &mut DirectoryWriter,
 ) -> Result<(), Error> {
-    // BaselineExposure = log2(capture_iso/sensor_iso) + log2(highlight_scale).
-    // Since the recovery path bakes its highlight shoulder into the
-    // raster, `highlight_scale` is always 1.0 and BE carries only the
-    // ISO ratio — BaselineExposure is an optional-to-honour hint in the
-    // DNG spec, so nothing render-critical may depend on it. The
-    // `> 1.0` arm is kept for the writer-side contract should a future
-    // pipeline publish a scale again.
-    if let (Some(sensor), Some(capture)) = (
+    // BaselineExposure = log2(capture_iso/sensor_iso)
+    //                  + log2(DigitalISOGain) + log2(highlight_scale).
+    // The DigitalISOGain term is the digital part of the camera's ISO
+    // (Quattro-era CAMF); it is carried here instead of being baked
+    // into the raster so genuine raw data just below sensor saturation
+    // survives into the DNG (baking it falsely clipped the top
+    // log2(gain) of a stop at `il.white`). BE is scalar, so a
+    // per-channel-unequal gain contributes its geometric mean — the
+    // residual per-channel trim is a known limitation. Since the
+    // recovery path bakes its highlight shoulder into the raster,
+    // `highlight_scale` is always 1.0 today; the `> 1.0` arm is kept
+    // for the writer-side contract should a future pipeline publish a
+    // scale again. BaselineExposure is an optional-to-honour hint in
+    // the DNG spec, so nothing render-critical may depend on it.
+    let gain_be = digital_iso_gain_be(reader.dng_digital_iso_gain());
+    let iso_be = match (
         reader.dng_camf_float("SensorISO"),
         reader.dng_camf_float("CaptureISO"),
     ) {
-        let mut be = (capture / sensor).log2();
+        (Some(sensor), Some(capture)) => Some((capture / sensor).log2()),
+        _ => None,
+    };
+    if iso_be.is_some() || gain_be != 0.0 {
+        let mut be = iso_be.unwrap_or(0.0) + gain_be;
         if highlight_scale > 1.0 {
             be += highlight_scale.log2();
         }
@@ -707,6 +729,16 @@ mod tests {
         assert_eq!(img.data, vec![90, 4000, 2400]);
         assert_eq!(img.levels.black, [100.0, 50.0, 50.0]);
         assert_eq!(img.levels.white, [100, 7695, 4829]);
+    }
+
+    #[test]
+    fn digital_iso_gain_be_is_log2_of_geometric_mean() {
+        assert_eq!(digital_iso_gain_be([1.0; 3]), 0.0);
+        assert!((digital_iso_gain_be([2.0; 3]) - 1.0).abs() < 1e-12);
+        // Unequal channels: geometric mean of {1, 2, 4} is 2 → one stop.
+        assert!((digital_iso_gain_be([1.0, 2.0, 4.0]) - 1.0).abs() < 1e-12);
+        // Gain below one (ISO pull) goes negative.
+        assert!((digital_iso_gain_be([0.5; 3]) + 1.0).abs() < 1e-12);
     }
 
     #[test]
