@@ -18,10 +18,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libtiff-dev libjpeg-turbo8-dev zlib1g-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -55,16 +51,11 @@ jobs:
             ext: .exe
     steps:
       - uses: actions/checkout@v4
-      - name: Install system deps (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libtiff-dev libjpeg-turbo8-dev zlib1g-dev pkg-config
-      - name: Install system deps (macOS)
-        if: runner.os == 'macOS'
-        run: brew install libtiff jpeg-turbo
-      # x3f-sys runs bindgen, which needs libclang. The Windows runner ships
-      # LLVM at this path; point clang-sys at it so bindgen finds libclang.dll.
+      # The decode + TIFF/JPEG/DNG pipeline is pure Rust (tiff + zune-jpeg +
+      # flate2/miniz_oxide), so no libtiff/libjpeg/zlib install is needed on
+      # any runner. The only native tooling is libclang, which x3f-sys's
+      # bindgen needs: it's preinstalled on the Linux and macOS runners, but
+      # the Windows runner needs LIBCLANG_PATH pointed at its bundled LLVM.
       - name: Set up libclang (Windows)
         if: runner.os == 'Windows'
         run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
