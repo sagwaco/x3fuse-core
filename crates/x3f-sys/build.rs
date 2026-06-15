@@ -203,16 +203,14 @@ fn main() {
         }
     }
 
-    let bindings = apply_bindgen_blocklists(
-        bindgen_builder.allowlist_file(x3f_header_allowlist()),
-    )
-    .derive_debug(true)
-    .derive_default(true)
-    .layout_tests(false)
-    .generate_comments(false)
-    .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-    .generate()
-    .expect("bindgen failed");
+    let bindings = apply_bindgen_blocklists(bindgen_builder.allowlist_file(x3f_header_allowlist()))
+        .derive_debug(true)
+        .derive_default(true)
+        .layout_tests(false)
+        .generate_comments(false)
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .generate()
+        .expect("bindgen failed");
 
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("bindings.rs");
     bindings
