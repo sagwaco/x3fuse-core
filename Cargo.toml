@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.80"
 license = "Apache-2.0"
@@ -17,8 +17,8 @@ readme = "README.md"
 keywords = ["foveon", "x3f", "sigma", "raw", "dng"]
 
 [workspace.dependencies]
-x3f-sys = { path = "crates/x3f-sys", version = "0.1.1" }
-x3f-core = { path = "crates/x3f-core", version = "0.1.1" }
+x3f-sys = { path = "crates/x3f-sys", version = "0.1.2" }
+x3f-core = { path = "crates/x3f-core", version = "0.1.2" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
