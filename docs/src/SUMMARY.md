@@ -16,4 +16,5 @@
 # Project
 
 - [Contributor guide](./contributing.md)
+- [Releasing](./releasing.md)
 - [Port plan](./port-plan.md)
