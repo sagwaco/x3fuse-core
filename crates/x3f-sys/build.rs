@@ -59,6 +59,17 @@ fn compile_wasm_only(manifest_dir: &Path, c_src: &Path, out_dir: &Path, host: &s
         .expect("write bindings.rs");
 }
 
+/// Regex for bindgen's `allowlist_file`, matched against each header's
+/// canonical path. We deliberately don't embed `c_src` itself: on Windows
+/// its path separators are backslashes, which `allowlist_file` would treat
+/// as regex escapes — the pattern then matches no header and bindgen emits
+/// an empty `bindings.rs`. Instead match any `x3f_*.h` filename sitting
+/// directly after a path separator (`/` or `\`), which selects exactly the
+/// same headers on every host (they all live in `csrc/`).
+fn x3f_header_allowlist() -> &'static str {
+    r".*[/\\]x3f_.*\.h"
+}
+
 /// Build the full bindgen Builder, applied identically on every target.
 /// `clang_target` is what we pass via `--target=…`; for wasm32 we override
 /// to the host triple so `<inttypes.h>` resolves through the host's
@@ -67,7 +78,7 @@ fn run_bindgen(manifest_dir: &Path, c_src: &Path, clang_target: Option<&str>) ->
     let mut b = bindgen::Builder::default()
         .header(manifest_dir.join("wrapper.h").to_string_lossy().to_string())
         .clang_arg(format!("-I{}", c_src.display()))
-        .allowlist_file(format!("{}/x3f_.*\\.h", c_src.display()));
+        .allowlist_file(x3f_header_allowlist());
     if let Some(t) = clang_target {
         b = b.clang_arg(format!("--target={t}"));
     }
@@ -193,7 +204,7 @@ fn main() {
     }
 
     let bindings = apply_bindgen_blocklists(
-        bindgen_builder.allowlist_file(format!("{}/x3f_.*\\.h", c_src.display())),
+        bindgen_builder.allowlist_file(x3f_header_allowlist()),
     )
     .derive_debug(true)
     .derive_default(true)
