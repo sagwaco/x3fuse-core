@@ -3,6 +3,12 @@
 //! in environments without a host filesystem (browser, JNI, …); the
 //! same code path runs on host via libc's `fmemopen`, so this test
 //! gives us host coverage of every byte the wasm version will execute.
+//!
+//! `Reader::from_bytes` only exists where libc has `fmemopen` (Unix) or the
+//! wasm `MemFile` shim does — not on Windows (MSVC's CRT has no `fmemopen`).
+//! Gate the whole file to match, so it compiles to an empty test binary on
+//! Windows rather than failing to build.
+#![cfg(any(unix, target_arch = "wasm32"))]
 
 use std::path::PathBuf;
 

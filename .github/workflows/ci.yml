@@ -34,6 +34,11 @@ jobs:
   build:
     name: build + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Run every step under bash so the staging/smoke shell snippets behave
+    # identically on the Windows runner (Git Bash) as on Linux/macOS.
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -44,6 +49,10 @@ jobs:
             asset: x3f_extract-macos-arm64
           - os: macos-15-intel
             asset: x3f_extract-macos-x86_64
+          - os: windows-latest
+            asset: x3f_extract-windows-x86_64.exe
+            # Suffix the built binary carries on this host (empty elsewhere).
+            ext: .exe
     steps:
       - uses: actions/checkout@v4
       - name: Install system deps (Linux)
@@ -54,6 +63,11 @@ jobs:
       - name: Install system deps (macOS)
         if: runner.os == 'macOS'
         run: brew install libtiff jpeg-turbo
+      # x3f-sys runs bindgen, which needs libclang. The Windows runner ships
+      # LLVM at this path; point clang-sys at it so bindgen finds libclang.dll.
+      - name: Set up libclang (Windows)
+        if: runner.os == 'Windows'
+        run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo build
@@ -69,28 +83,13 @@ jobs:
       - name: stage release binary
         run: |
           mkdir -p dist
-          cp target/release/x3f_extract "dist/${{ matrix.asset }}"
+          cp "target/release/x3f_extract${{ matrix.ext }}" "dist/${{ matrix.asset }}"
       - name: upload CLI binary
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
           path: dist/${{ matrix.asset }}
           retention-days: 7
-
-  # Windows full build is gated on M3, when libtiff/libjpeg/zlib are
-  # replaced by Rust crates and the pkg-config dependency disappears.
-  # Until then, run the formatting check on Windows so portability bugs
-  # in the Rust source are caught early.
-  windows-fmt:
-    name: fmt (windows-latest, no build)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: cargo fmt --check
-        run: cargo fmt --all --check
 
   # M8b: cross-compile x3f-ffi-c for iOS device + simulator and build the
   # xcframework. Validates that the cbindgen header and the bindgen iOS

@@ -20,6 +20,15 @@
 //! same Rust call sequence, so this smoke test exercising the wasi
 //! path validates the wasm32 cdylib's behaviour by proxy.
 
+// `Reader::from_bytes` is unavailable on Windows (no `fmemopen`); keep a
+// stub `main` there so `cargo build --all-targets` still links this example.
+#[cfg(not(any(unix, target_arch = "wasm32")))]
+fn main() -> std::process::ExitCode {
+    eprintln!("wasi_from_bytes: Reader::from_bytes is unavailable on this platform (no fmemopen)");
+    std::process::ExitCode::from(69)
+}
+
+#[cfg(any(unix, target_arch = "wasm32"))]
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let Some(path) = args.get(1) else {

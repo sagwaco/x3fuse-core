@@ -6,7 +6,6 @@
 //! subcommand layout will be introduced in a later milestone after the test
 //! harness stabilises in M2.
 
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -381,7 +380,11 @@ fn make_paths(infile: &Path, outdir: Option<&Path>, ext: &str) -> (PathBuf, Path
     let mut outfile = OsString::new();
     if let Some(dir) = outdir {
         outfile.push(dir);
-        let dir_bytes = dir.as_os_str().as_bytes();
+        // `as_encoded_bytes()` (stable since 1.74) is byte-identical to the
+        // Unix-only `OsStrExt::as_bytes()` on Unix, but also compiles on
+        // Windows — keeping the legacy `/`-separator spelling cross-platform.
+        // ASCII bytes like `/` survive the encoding intact on every host.
+        let dir_bytes = dir.as_os_str().as_encoded_bytes();
         if !dir_bytes.ends_with(b"/") {
             outfile.push("/");
         }
