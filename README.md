@@ -83,6 +83,7 @@ x3f_extract -meta input.X3F
 Foveon sensors have no demosaicing step, so DNGs are written as **Linear DNGs** (`PhotometricInterpretation = LinearRaw`). To render consistently across RAW engines (Adobe Camera Raw / Lightroom, LibRaw / RawTherapee, Capture One, and Apple's RAW engine) the writer bakes per-channel saturation into the raster and tags a uniform `BlackLevel = 0` / `WhiteLevel = 65535`, and never relies on optional hints like `BaselineExposure`.
 
 - **`-compress`**: lossless compression. TIFF uses Deflate/ZIP; DNG uses **lossless JPEG** (`Compression = 7`), the only 16-bit integer raw compression the spec allows and the one every engine decodes. Compressed output is bit-identical to uncompressed.
+- **Merrill highlight correction**: always applies Sigma's camera-authored `SatMapR/G/B` restoration and late `Sigma_HN` neutralization. These stages prevent asymmetrically clipped Foveon planes from becoming bright green, red, or magenta after color conversion.
 - **`-dng-highlight-recovery`**: reconstructs clipped channels from a scene-derived chroma LUT and folds recovered highlights back under `WhiteLevel` via a soft shoulder baked into the raster (published as `LinearResponseLimit`).
 
 See the [conversion pipeline](docs/src/pipeline.md) chapter for the full DNG writer design.

@@ -1790,6 +1790,7 @@ struct ConvCtx {
     rows: i32,
     cols: i32,
     channels: usize,
+    sigma_hn: *const MerrillSigmaHn,
 }
 
 // SAFETY: see ConvCtx doc-comment above. The pointers are either
@@ -1942,11 +1943,12 @@ unsafe fn convert_row(
         }
 
         // Final matrix multiply + EV scale + gamma LUT.
-        let input = [
+        let mut input = [
             sg[0] * sat_ratio[0],
             sg[1] * sat_ratio[1],
             sg[2] * sat_ratio[2],
         ];
+        unsafe { apply_merrill_sigma_hn_raw(&*ctx.sigma_hn, &mut input) };
         let output = mat3x1_mul_native(m, input);
         for color in 0..3 {
             let scaled = output[color] * ctx.ev_scale;
@@ -2018,6 +2020,18 @@ pub unsafe extern "C" fn convert_data(
     // reads the same value. Defaults to false for external C callers
     // that never set the hook, preserving the unchanged pre-cineon path.
     let cineon = CINEON.with(|c| c.get());
+
+    let mut sensorid: *mut libc::c_char = ptr::null_mut();
+    let is_f20 = unsafe {
+        x3f_get_prop_entry(x3f, c"SENSORID".as_ptr() as *mut _, &mut sensorid) != 0
+            && !sensorid.is_null()
+            && CStr::from_ptr(sensorid).to_bytes() == b"F20"
+    };
+    let sigma_hn = if is_f20 && !cineon {
+        unsafe { prepare_merrill_sigma_hn(x3f, conv_matrix.as_ptr()) }
+    } else {
+        MerrillSigmaHn::default()
+    };
 
     // Sigma-style chromaticity LUT (production highlight path). Forced
     // off in cineon mode — it bakes scene-derived chroma recovery into
@@ -2092,6 +2106,7 @@ pub unsafe extern "C" fn convert_data(
         rows: img.rows as i32,
         cols: img.columns as i32,
         channels,
+        sigma_hn: &sigma_hn,
     };
 
     let total_u16 = (img.rows as usize) * row_stride;
@@ -2497,6 +2512,7 @@ struct DngCtx {
     rows: i32,
     cols: i32,
     channels: usize,
+    sigma_hn: *const MerrillSigmaHn,
     /// Per-conversion DNG highlight-recovery toggle (snapshot of the
     /// `DNG_HIGHLIGHT_RECOVERY` thread-local taken at the entry to
     /// `apply_highlight_clip_dng`).
@@ -2635,9 +2651,13 @@ unsafe fn dng_clip_row(
         // ON we let values overshoot here — the global_max scan +
         // scale-down loop below pulls them back uniformly so the
         // BE-compensated render preserves recovered highlights.
-        let v0 = sg[0] * sat_ratio[0];
-        let v1 = sg[1] * sat_ratio[1];
-        let v2 = sg[2] * sat_ratio[2];
+        let mut corrected = [
+            sg[0] * sat_ratio[0],
+            sg[1] * sat_ratio[1],
+            sg[2] * sat_ratio[2],
+        ];
+        unsafe { apply_merrill_sigma_hn_raw(&*ctx.sigma_hn, &mut corrected) };
+        let [v0, v1, v2] = corrected;
         let cap_scale = if !ctx.recovery {
             let pixel_max = v0.max(v1).max(v2);
             if pixel_max > 1.0 {
@@ -2711,6 +2731,18 @@ pub unsafe extern "C" fn apply_highlight_clip_dng(
         compute_chroma_prior(conv_matrix.as_ptr(), prior.as_mut_ptr());
     }
 
+    let mut sensorid: *mut libc::c_char = ptr::null_mut();
+    let is_f20 = unsafe {
+        x3f_get_prop_entry(x3f, c"SENSORID".as_ptr() as *mut _, &mut sensorid) != 0
+            && !sensorid.is_null()
+            && CStr::from_ptr(sensorid).to_bytes() == b"F20"
+    };
+    let sigma_hn = if is_f20 {
+        unsafe { prepare_merrill_sigma_hn(x3f, conv_matrix.as_ptr()) }
+    } else {
+        MerrillSigmaHn::default()
+    };
+
     let mut clut: chroma_lut_t = unsafe { std::mem::zeroed() };
     let mut use_clut = !env_present("X3F_NO_CHROMA_LUT");
     if use_clut {
@@ -2770,6 +2802,7 @@ pub unsafe extern "C" fn apply_highlight_clip_dng(
         rows: img.rows as i32,
         cols: img.columns as i32,
         channels,
+        sigma_hn: &sigma_hn,
         recovery,
     };
 
@@ -2981,6 +3014,17 @@ pub unsafe extern "C" fn x3f_get_image(
     let mut il: x3f_image_levels_t = unsafe { std::mem::zeroed() };
     if unsafe { preprocess_data(x3f, fix_bad, wb, &mut il) } == 0 {
         return 0;
+    }
+
+    // Sigma Photo Pro restores Merrill highlights before denoising and
+    // color conversion, using the camera-authored SatMapR/G/B records.
+    // This is independent of the optional DNG highlight-recovery heuristic.
+    let mut sensorid: *mut libc::c_char = ptr::null_mut();
+    if unsafe { x3f_get_prop_entry(x3f, c"SENSORID".as_ptr() as *mut _, &mut sensorid) } != 0
+        && !sensorid.is_null()
+        && unsafe { CStr::from_ptr(sensorid) }.to_bytes() == b"F20"
+    {
+        unsafe { apply_merrill_highlight_restoration(x3f, &mut original_image) };
     }
 
     let mut is_quattro = false;

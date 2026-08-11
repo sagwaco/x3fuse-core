@@ -939,6 +939,409 @@ pub unsafe extern "C" fn chroma_lut_apply_stats_print(
 }
 
 // ----------------------------------------------------------------------
+// Merrill F20RestoreHighlights
+// ----------------------------------------------------------------------
+
+/// Expand one of the compact F20 saturation maps. Each pair is a delta
+/// from the previous run end followed by a run length, in row-major order.
+unsafe fn decode_merrill_satmap(
+    x3f: *mut x3f_t,
+    name: *mut libc::c_char,
+    map: &mut [u8],
+    pixels: usize,
+    color: usize,
+) -> Option<usize> {
+    let mut count = 0;
+    let mut runs: *mut libc::c_void = ptr::null_mut();
+    if unsafe {
+        x3f_get_camf_matrix_var(
+            x3f,
+            name,
+            &mut count,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            matrix_type_t_M_UINT,
+            &mut runs,
+        )
+    } == 0
+    {
+        return None;
+    }
+
+    let runs = unsafe { std::slice::from_raw_parts(runs as *const u32, count.max(0) as usize) };
+    let mut previous_end = 0_u64;
+    let mut marked = 0_usize;
+    for pair in runs.chunks_exact(2) {
+        let start = previous_end + u64::from(pair[0]);
+        let mut end = start + u64::from(pair[1]);
+        if start >= pixels as u64 {
+            if start != pixels as u64 || end != pixels as u64 {
+                unsafe {
+                    x3f_printf(
+                        x3f_verbosity_t_WARN,
+                        c"F20 saturation-map run starts outside image (%llu >= %llu)\n".as_ptr(),
+                        start,
+                        pixels as u64,
+                    );
+                }
+            }
+            break;
+        }
+        if end > pixels as u64 {
+            unsafe {
+                x3f_printf(
+                    x3f_verbosity_t_WARN,
+                    c"F20 saturation-map run clipped to image (%llu > %llu)\n".as_ptr(),
+                    end,
+                    pixels as u64,
+                );
+            }
+            end = pixels as u64;
+        }
+        for pixel in start as usize..end as usize {
+            map[3 * pixel + color] = 1;
+        }
+        marked += end as usize - start as usize;
+        previous_end = end;
+    }
+    Some(marked)
+}
+
+fn merrill_highlight_threshold(x3f: *mut x3f_t) -> f64 {
+    let mut estimate = 0.0_f64;
+    let mut net = 0.0_f64;
+    unsafe {
+        x3f_get_camf_float(x3f, c"ExpEstimate".as_ptr() as *mut _, &mut estimate);
+        x3f_get_camf_float(x3f, c"ExpNet".as_ptr() as *mut _, &mut net);
+    }
+    let exposure = (estimate + net - 1.5).max(0.0);
+    let blend = if exposure <= 1.0 { 1.0 - exposure } else { 0.0 };
+    blend * 3000.0 + 4000.0
+}
+
+#[inline]
+fn merrill_highlight_amount(planes: [f64; 3], threshold: f64, support: f64) -> f64 {
+    let maximum = planes[0].max(planes[1]).max(planes[2]);
+    let minimum = planes[0].min(planes[1]).min(planes[2]);
+    let middle = planes[0] + planes[1] + planes[2] - maximum - minimum;
+    let signal =
+        ((2.0 / 3.0) * maximum + (1.0 / 3.0) * middle - threshold).clamp(0.0, 1000.0) / 1000.0;
+    (0.5 * (signal * signal + support * support))
+        .sqrt()
+        .min(1.0)
+}
+
+#[derive(Copy, Clone)]
+pub struct MerrillSigmaHn {
+    enabled: bool,
+    conv: [f64; 9],
+    inverse_conv: [f64; 9],
+    inverse_cc: [f64; 9],
+    code_scale: f64,
+}
+
+impl Default for MerrillSigmaHn {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            conv: [0.0; 9],
+            inverse_conv: [0.0; 9],
+            inverse_cc: [0.0; 9],
+            code_scale: 1.0,
+        }
+    }
+}
+
+#[inline(always)]
+fn hn_mat3_mul(matrix: &[f64; 9], vector: [f64; 3]) -> [f64; 3] {
+    [
+        matrix[0] * vector[0] + matrix[1] * vector[1] + matrix[2] * vector[2],
+        matrix[3] * vector[0] + matrix[4] * vector[1] + matrix[5] * vector[2],
+        matrix[6] * vector[0] + matrix[7] * vector[1] + matrix[8] * vector[2],
+    ]
+}
+
+/// Prepare Sigma Photo Pro's late Merrill highlight-neutralization stage.
+/// `conv = CC * diag(gain)`; native Stage 3 receives `inverse(CC)`.
+pub unsafe fn prepare_merrill_sigma_hn(x3f: *mut x3f_t, conv_matrix: *const f64) -> MerrillSigmaHn {
+    let mut hn = MerrillSigmaHn::default();
+    let mut gain = [0.0_f64; 3];
+    if unsafe { x3f_get_gain(x3f, x3f_get_wb(x3f), gain.as_mut_ptr()) } == 0 {
+        return hn;
+    }
+    let max_gain = gain[0].max(gain[1]).max(gain[2]);
+    if max_gain <= 0.0 {
+        return hn;
+    }
+
+    hn.conv
+        .copy_from_slice(unsafe { std::slice::from_raw_parts(conv_matrix, 9) });
+    let mut cc = [0.0_f64; 9];
+    for row in 0..3 {
+        for col in 0..3 {
+            cc[3 * row + col] = hn.conv[3 * row + col] / gain[col];
+        }
+    }
+    unsafe {
+        x3f_3x3_inverse(cc.as_mut_ptr(), hn.inverse_cc.as_mut_ptr());
+        x3f_3x3_inverse(hn.conv.as_mut_ptr(), hn.inverse_conv.as_mut_ptr());
+    }
+    hn.code_scale = 16383.0 / max_gain;
+    hn.enabled = true;
+    hn
+}
+
+/// Apply `Sigma_HN` in camera space. Sigma performs this after its color
+/// matrix; multiplying the result by the inverse matrix makes the operation
+/// exactly representable in a LinearRaw DNG without baking an output color
+/// space into the raster.
+#[inline(always)]
+pub fn apply_merrill_sigma_hn_raw(hn: &MerrillSigmaHn, raw: &mut [f64; 3]) {
+    if !hn.enabled {
+        return;
+    }
+    let mut code_rgb = hn_mat3_mul(&hn.conv, *raw);
+    for value in &mut code_rgb {
+        *value *= hn.code_scale;
+    }
+    let sensor = hn_mat3_mul(&hn.inverse_cc, code_rgb);
+    let signal = 0.03125 * sensor[0] + 0.03125 * sensor[1] + 0.9375 * sensor[2];
+    let neutral = 0.25 * sensor[0] + 0.5 * sensor[1] + 0.25 * sensor[2];
+    let amount = ((signal - 2500.0) / 950.0).clamp(0.0, 1.0);
+    if amount <= 0.0 {
+        return;
+    }
+    for value in &mut code_rgb {
+        *value = ((1.0 - amount) * *value + amount * neutral) / hn.code_scale;
+    }
+    *raw = hn_mat3_mul(&hn.inverse_conv, code_rgb);
+}
+
+/// Port of Sigma Photo Pro's Merrill `F20RestoreHighlights` pass. The
+/// camera-authored SatMapR/G/B runs identify genuinely clipped sensor
+/// samples; isolated flags are discarded, a scene-specific top/middle
+/// ratio reconstructs the top plane, and marked highlight neighborhoods
+/// converge toward the deep sensor plane before denoising and color
+/// conversion. This prevents asymmetric sensor clipping from becoming
+/// saturated red/green after the camera matrix.
+pub unsafe fn apply_merrill_highlight_restoration(
+    x3f: *mut x3f_t,
+    image: *mut x3f_area16_t,
+) -> bool {
+    let img = unsafe { &mut *image };
+    if img.channels < 3 || img.columns < 5 || img.rows < 5 {
+        return false;
+    }
+
+    let mut active = [0_u32; 4];
+    if unsafe {
+        x3f_get_camf_rect(
+            x3f,
+            c"ActiveImageArea".as_ptr() as *mut _,
+            image,
+            1,
+            active.as_mut_ptr(),
+        )
+    } == 0
+    {
+        return false;
+    }
+
+    let rows = img.rows as usize;
+    let cols = img.columns as usize;
+    let channels = img.channels as usize;
+    let stride = img.row_stride as usize;
+    let Some(pixels) = rows.checked_mul(cols) else {
+        return false;
+    };
+    let Some(map_len) = pixels.checked_mul(3) else {
+        return false;
+    };
+    let mut satmap = vec![0_u8; map_len];
+    let mut neighborhood = vec![0_u8; pixels];
+    let marked = [
+        unsafe {
+            decode_merrill_satmap(x3f, c"SatMapR".as_ptr() as *mut _, &mut satmap, pixels, 0)
+        },
+        unsafe {
+            decode_merrill_satmap(x3f, c"SatMapG".as_ptr() as *mut _, &mut satmap, pixels, 1)
+        },
+        unsafe {
+            decode_merrill_satmap(x3f, c"SatMapB".as_ptr() as *mut _, &mut satmap, pixels, 2)
+        },
+    ];
+    let [Some(marked_r), Some(marked_g), Some(marked_b)] = marked else {
+        unsafe {
+            x3f_printf(
+                x3f_verbosity_t_WARN,
+                c"Merrill compact saturation maps unavailable; highlight restoration skipped\n"
+                    .as_ptr(),
+            );
+        }
+        return false;
+    };
+
+    // Photo Pro clears isolated flags in place, retaining only flags with
+    // an eight-connected neighbor in the same sensor plane.
+    for row in 1..rows - 1 {
+        for col in 1..cols - 1 {
+            let pixel = row * cols + col;
+            for color in 0..3 {
+                if satmap[3 * pixel + color] == 0 {
+                    continue;
+                }
+                let mut keep = false;
+                for dr in -1_isize..=1 {
+                    for dc in -1_isize..=1 {
+                        if dr == 0 && dc == 0 {
+                            continue;
+                        }
+                        let neighbor =
+                            (row.wrapping_add_signed(dr)) * cols + col.wrapping_add_signed(dc);
+                        if satmap[3 * neighbor + color] != 0 {
+                            keep = true;
+                            break;
+                        }
+                    }
+                    if keep {
+                        break;
+                    }
+                }
+                satmap[3 * pixel + color] = u8::from(keep);
+            }
+        }
+    }
+
+    // A pixel clipped in at least two planes seeds a 5x5 support mask.
+    for row in 2..rows - 2 {
+        for col in 2..cols - 2 {
+            let pixel = row * cols + col;
+            if satmap[3 * pixel] + satmap[3 * pixel + 1] + satmap[3 * pixel + 2] < 2 {
+                continue;
+            }
+            for dr in -2_isize..=2 {
+                for dc in -2_isize..=2 {
+                    let neighbor =
+                        (row.wrapping_add_signed(dr)) * cols + col.wrapping_add_signed(dc);
+                    neighborhood[neighbor] = 1;
+                }
+            }
+        }
+    }
+
+    let data = unsafe { std::slice::from_raw_parts_mut(img.data, rows * stride) };
+    let mut ratio_sum = [0.0_f32; CHROMA_LUT_BINS];
+    let mut ratio_count = [0_u32; CHROMA_LUT_BINS];
+    let row_start = active[1] as usize;
+    let row_end = (active[3] as usize).min(rows - 1);
+    let col_start = active[0] as usize;
+    let col_end = (active[2] as usize).min(cols - 1);
+
+    // Learn top/middle from unsaturated bright pixels in this exposure.
+    for row in row_start..=row_end {
+        for col in col_start..=col_end {
+            let pixel = row * cols + col;
+            let off = row * stride + col * channels;
+            if satmap[3 * pixel + 2] != 0 || u32::from(data[off]) + u32::from(data[off + 1]) <= 4000
+            {
+                continue;
+            }
+            let bottom = f32::from(data[off].max(1));
+            let middle = f32::from(data[off + 1].max(1));
+            let top = f32::from(data[off + 2].max(1));
+            let bin = (bottom * 255.0 / (bottom + middle)) as usize;
+            ratio_sum[bin] += top / middle;
+            ratio_count[bin] += 1;
+        }
+    }
+
+    let mut ratio_curve = [0.0_f32; CHROMA_LUT_BINS];
+    let mut first_bin = None;
+    for bin in 0..CHROMA_LUT_BINS {
+        if ratio_count[bin] == 0 {
+            continue;
+        }
+        ratio_curve[bin] = ratio_sum[bin] / ratio_count[bin] as f32;
+        first_bin.get_or_insert(bin);
+    }
+    if let Some(first) = first_bin {
+        let mut previous = ratio_curve[first];
+        for ratio in &mut ratio_curve {
+            if *ratio == 0.0 {
+                *ratio = previous;
+            } else {
+                previous = *ratio;
+            }
+        }
+    }
+
+    let threshold = merrill_highlight_threshold(x3f);
+    let mut restored = 0_usize;
+    let mut neutralized = 0_usize;
+    let work_row_start = row_start.max(2);
+    let work_row_end = row_end.min(rows - 3);
+    let work_col_start = col_start.max(2);
+    let work_col_end = col_end.min(cols - 3);
+    for row in work_row_start..=work_row_end {
+        for col in work_col_start..=work_col_end {
+            let pixel = row * cols + col;
+            let off = row * stride + col * channels;
+            let mut planes = [
+                f64::from(data[off]),
+                f64::from(data[off + 1]),
+                f64::from(data[off + 2]),
+            ];
+            if first_bin.is_some() && satmap[3 * pixel + 2] != 0 && planes[0] + planes[1] > 0.0 {
+                let bin = (planes[0] * 255.0 / (planes[0] + planes[1])) as usize;
+                planes[2] = (planes[1] * f64::from(ratio_curve[bin])).min(32767.0);
+                restored += 1;
+            }
+
+            let mut support = 0.0_f64;
+            for dr in -2_isize..=2 {
+                for dc in -2_isize..=2 {
+                    let neighbor =
+                        (row.wrapping_add_signed(dr)) * cols + col.wrapping_add_signed(dc);
+                    support += f64::from(neighborhood[neighbor]);
+                }
+            }
+            support *= 0.04;
+            let amount = merrill_highlight_amount(planes, threshold, support);
+            if amount <= 0.0 {
+                continue;
+            }
+            for color in 0..3 {
+                let output =
+                    (amount * planes[0] + (1.0 - amount) * planes[color]).clamp(0.0, 32767.0);
+                data[off + color] = output.round() as u16;
+            }
+            neutralized += 1;
+        }
+    }
+
+    unsafe {
+        x3f_printf(
+            x3f_verbosity_t_DEBUG,
+            c"Merrill F20 highlights: image=%ux%u active={%u,%u,%u,%u} sat={%llu,%llu,%llu} curve_bins=%d threshold=%g restored=%llu neutralized=%llu\n".as_ptr(),
+            img.columns,
+            img.rows,
+            active[0],
+            active[1],
+            active[2],
+            active[3],
+            marked_r as u64,
+            marked_g as u64,
+            marked_b as u64,
+            first_bin.map_or(0, |first| (CHROMA_LUT_BINS - first) as i32),
+            threshold,
+            restored as u64,
+            neutralized as u64,
+        );
+    }
+    true
+}
+
+// ----------------------------------------------------------------------
 // repair_pix_t  (matches the C typedef)
 // ----------------------------------------------------------------------
 
@@ -1451,5 +1854,53 @@ mod tests {
         unsafe { reconstruct_highlights(s.as_mut_ptr(), p.as_ptr(), &hp) };
         // L = u_max * sat_factor = 2.0; output = L * p = (2.0, 2.0, 2.0).
         assert_eq!(s, [2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn merrill_highlight_amount_is_zero_below_threshold() {
+        assert_eq!(merrill_highlight_amount([3000.0; 3], 4000.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn merrill_highlight_amount_combines_signal_and_support() {
+        let amount = merrill_highlight_amount([5000.0; 3], 4000.0, 0.0);
+        assert!((amount - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-12);
+        assert_eq!(
+            merrill_highlight_amount([8000.0, 4000.0, 3000.0], 4000.0, 1.0),
+            1.0
+        );
+    }
+
+    #[test]
+    fn sigma_hn_snaps_a_bright_identity_matrix_pixel_to_neutral() {
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let hn = MerrillSigmaHn {
+            enabled: true,
+            conv: identity,
+            inverse_conv: identity,
+            inverse_cc: identity,
+            code_scale: 16383.0,
+        };
+        let mut raw = [0.1, 0.1, 0.3];
+        apply_merrill_sigma_hn_raw(&hn, &mut raw);
+        for value in raw {
+            assert!((value - 0.15).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn sigma_hn_leaves_low_signal_untouched() {
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let hn = MerrillSigmaHn {
+            enabled: true,
+            conv: identity,
+            inverse_conv: identity,
+            inverse_cc: identity,
+            code_scale: 16383.0,
+        };
+        let mut raw = [0.05, 0.05, 0.05];
+        let before = raw;
+        apply_merrill_sigma_hn_raw(&hn, &mut raw);
+        assert_eq!(raw, before);
     }
 }

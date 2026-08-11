@@ -78,25 +78,36 @@ The `convert_data` function is the hot loop. In order:
 5. **WB-conditional radial color shading** (Merrill only) —
    `pix[B] *= 1 + a·rr⁴ + b·rr²` and `pix[T] *= 1 + c·rr⁴ + d·rr²`
    from `WhiteBalanceColorShadingFactor`.
-6. **white balance** — multiplies from `WhiteBalanceGains` /
+6. **camera-authored highlight restoration** (Merrill only) — expands
+   the compact `SatMapR/G/B` CAMF runs, rejects isolated flags, learns
+   the exposure's top/middle relationship from unsaturated bright pixels,
+   and converges camera-marked clipped neighborhoods toward the deep
+   sensor plane. This is Sigma's `F20RestoreHighlights` stage and runs
+   before denoising or color conversion.
+7. **white balance** — multiplies from `WhiteBalanceGains` /
    `DP1_WhiteBalanceGains`.
-7. **color-matrix transform** — sensor RGB → sRGB / AdobeRGB /
+8. **color-matrix transform** — sensor RGB → sRGB / AdobeRGB /
    ProPhoto / linear via the M6a matrix kernel. `get_conv` scales the
    matrix by `CaptureISO/SensorISO` and folds the per-channel CAMF
    `DigitalISOGain` in as a column scale (`conv_matrix · diag(g)`,
    Merrill bodies skip-listed in `x3f_get_digital_iso_gain`), so the
    digital part of ISO brightening happens after highlight recovery
    has seen honest sensor data.
-8. **highlight recovery** — the chroma LUT, RepairPix, and
-   matrix-pathology gate ported in M6e4. Active research area: see
-   the project memory entries on Foveon highlight handling.
-9. **gamma LUT application** — sRGB / AdobeRGB-2.2 / ProPhoto-1.8 (D65
+9. **highlight recovery** — the chroma LUT, RepairPix, and
+   matrix-pathology gate ported in M6e4, followed on Merrill by Sigma's
+   late `Sigma_HN` fade toward a weighted sensor-neutral value. Active
+   research area: see the project memory entries on Foveon highlight
+   handling.
+10. **gamma LUT application** — sRGB / AdobeRGB-2.2 / ProPhoto-1.8 (D65
    → D50 Bradford for ProPhoto).
 
-The DNG path replaces stages 7–9 with `apply_highlight_clip_dng`
+The DNG path replaces stages 8–10 with `apply_highlight_clip_dng`
 (M6e9): per-pixel CLUT/RepairPix/`L*p`/matrix-pathology gate
-(sg-amplified preview) → bake-sg-into-raw → baked soft highlight
-shoulder. With `-dng-highlight-recovery` the CLUT step uses the
+(sg-amplified preview) → Merrill `Sigma_HN` → bake-sg-into-raw → baked
+soft highlight shoulder. `Sigma_HN` is mathematically moved back through
+the inverse color matrix so its result remains representable as camera-space
+LinearRaw data rather than baking sRGB into the DNG. With
+`-dng-highlight-recovery` the CLUT step uses the
 generalized BMT apply (`chroma_lut_apply_pixel_bmt`): three
 scene-derived tables reconstruct whichever single channel clipped
 (T from B,M; B from M,T; M from B,T) so recovered highlights keep
