@@ -335,10 +335,10 @@ pub unsafe extern "C" fn x3f_get_wb(x3f: *mut x3f_t) -> *mut c_char {
         let s: &'static [u8] = match wb_code {
             1 => b"Auto\0",
             2 => b"Sunlight\0",
-            3 => b"Shadow\0",
+            3 => b"Shade\0",
             4 => b"Overcast\0",
             5 => b"Incandescent\0",
-            6 => b"Florescent\0",
+            6 => b"Fluorescent\0",
             7 => b"Flash\0",
             8 => b"Custom\0",
             11 => b"ColorTemp\0",

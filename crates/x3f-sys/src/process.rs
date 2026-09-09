@@ -70,6 +70,98 @@ const INTERMEDIATE_DEPTH: u32 = 14;
 const INTERMEDIATE_UNIT: u32 = (1u32 << INTERMEDIATE_DEPTH) - 1;
 const INTERMEDIATE_BIAS_FACTOR: f64 = 4.0;
 
+// Quattro bodies store manual colour-temperature white balance outside the
+// normal WhiteBalanceGains / WhiteBalanceColorCorrections property lists.
+// Each ColorTempTableInfo row is:
+//
+//   kelvin, gain[0], gain[2], 3x3 colour-correction matrix
+//
+// The middle-layer gain is implicitly 1.0.  Older x3f-tools returned the
+// literal preset name "ColorTemp" and then failed because that key is not in
+// either property list.  Interpolate the camera-provided table instead.
+const COLOR_TEMP_TABLE_COLUMNS: usize = 12;
+
+fn interpolate_color_temp_row(
+    table: &[f64],
+    rows: usize,
+    columns: usize,
+    kelvin: f64,
+) -> Option<[f64; COLOR_TEMP_TABLE_COLUMNS]> {
+    if rows == 0
+        || columns < COLOR_TEMP_TABLE_COLUMNS
+        || table.len() < rows.checked_mul(columns)?
+        || !kelvin.is_finite()
+    {
+        return None;
+    }
+
+    let first = &table[..columns];
+    let last = &table[(rows - 1) * columns..rows * columns];
+    let (lower, upper) = if kelvin <= first[0] {
+        (first, first)
+    } else if kelvin >= last[0] {
+        (last, last)
+    } else {
+        let upper_index = (1..rows).find(|&row| table[row * columns] >= kelvin)?;
+        (
+            &table[(upper_index - 1) * columns..upper_index * columns],
+            &table[upper_index * columns..(upper_index + 1) * columns],
+        )
+    };
+
+    let span = upper[0] - lower[0];
+    let weight = if span > 0.0 {
+        ((kelvin - lower[0]) / span).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let mut result = [0.0; COLOR_TEMP_TABLE_COLUMNS];
+    for (column, value) in result.iter_mut().enumerate() {
+        *value = lower[column] + weight * (upper[column] - lower[column]);
+    }
+    Some(result)
+}
+
+unsafe fn get_color_temp_row(
+    x3f: *mut x3f_t,
+    wb: *mut libc::c_char,
+) -> Option<[f64; COLOR_TEMP_TABLE_COLUMNS]> {
+    if wb.is_null() || unsafe { CStr::from_ptr(wb) }.to_bytes() != b"ColorTemp" {
+        return None;
+    }
+
+    let mut kelvin = 0.0;
+    if unsafe { x3f_get_camf_float(x3f, c"ColorTempValue".as_ptr() as *mut _, &mut kelvin) } == 0 {
+        return None;
+    }
+
+    let mut rows = 0;
+    let mut columns = 0;
+    let mut table: *mut libc::c_void = ptr::null_mut();
+    if unsafe {
+        x3f_get_camf_matrix_var(
+            x3f,
+            c"ColorTempTableInfo".as_ptr() as *mut _,
+            &mut rows,
+            &mut columns,
+            ptr::null_mut(),
+            matrix_type_t_M_FLOAT,
+            &mut table,
+        )
+    } == 0
+        || rows <= 0
+        || columns < COLOR_TEMP_TABLE_COLUMNS as libc::c_int
+        || table.is_null()
+    {
+        return None;
+    }
+
+    let rows = rows as usize;
+    let columns = columns as usize;
+    let values = unsafe { std::slice::from_raw_parts(table as *const f64, rows * columns) };
+    interpolate_color_temp_row(values, rows, columns, kelvin)
+}
+
 const D65_XYZ: [f64; 3] = [0.95047, 1.00000, 1.08883];
 
 /// Compute the raw-space neutral that corresponds to D65 white through
@@ -106,17 +198,26 @@ pub unsafe extern "C" fn x3f_get_gain(
     // The empty body on the first branch means: try A, if A fails try
     // B; either succeeds → fall through with gain populated. We mirror
     // that as a short-circuit OR.
-    let direct = unsafe {
-        x3f_get_camf_matrix_for_wb(x3f, c"WhiteBalanceGains".as_ptr() as *mut _, wb, 3, 0, gain)
-            != 0
-            || x3f_get_camf_matrix_for_wb(
-                x3f,
-                c"DP1_WhiteBalanceGains".as_ptr() as *mut _,
-                wb,
-                3,
-                0,
-                gain,
-            ) != 0
+    let direct = if let Some(row) = unsafe { get_color_temp_row(x3f, wb) } {
+        unsafe {
+            *gain.add(0) = row[1];
+            *gain.add(1) = 1.0;
+            *gain.add(2) = row[2];
+        }
+        true
+    } else {
+        unsafe {
+            x3f_get_camf_matrix_for_wb(x3f, c"WhiteBalanceGains".as_ptr() as *mut _, wb, 3, 0, gain)
+                != 0
+                || x3f_get_camf_matrix_for_wb(
+                    x3f,
+                    c"DP1_WhiteBalanceGains".as_ptr() as *mut _,
+                    wb,
+                    3,
+                    0,
+                    gain,
+                ) != 0
+        }
     };
 
     if !direct {
@@ -208,23 +309,28 @@ pub unsafe extern "C" fn x3f_get_bmt_to_xyz(
     let mut cam_to_xyz = [0.0_f64; 9];
     let mut wb_correction = [0.0_f64; 9];
 
-    let cc_path = unsafe {
-        x3f_get_camf_matrix_for_wb(
-            x3f,
-            c"WhiteBalanceColorCorrections".as_ptr() as *mut _,
-            wb,
-            3,
-            3,
-            cc_matrix.as_mut_ptr(),
-        ) != 0
-            || x3f_get_camf_matrix_for_wb(
+    let cc_path = if let Some(row) = unsafe { get_color_temp_row(x3f, wb) } {
+        cc_matrix.copy_from_slice(&row[3..12]);
+        true
+    } else {
+        unsafe {
+            x3f_get_camf_matrix_for_wb(
                 x3f,
-                c"DP1_WhiteBalanceColorCorrections".as_ptr() as *mut _,
+                c"WhiteBalanceColorCorrections".as_ptr() as *mut _,
                 wb,
                 3,
                 3,
                 cc_matrix.as_mut_ptr(),
             ) != 0
+                || x3f_get_camf_matrix_for_wb(
+                    x3f,
+                    c"DP1_WhiteBalanceColorCorrections".as_ptr() as *mut _,
+                    wb,
+                    3,
+                    3,
+                    cc_matrix.as_mut_ptr(),
+                ) != 0
+        }
     };
 
     if cc_path {
@@ -3665,7 +3771,7 @@ static _A_X3F_GET_PREVIEW: unsafe extern "C" fn(
 
 #[cfg(test)]
 mod tests {
-    use super::{intermediate_levels, shoulder_compress, INTERMEDIATE_UNIT};
+    use super::{intermediate_levels, interpolate_color_temp_row, shoulder_compress, INTERMEDIATE_UNIT};
 
     #[test]
     fn uniform_digital_gain_preserves_intermediate_levels() {
@@ -3758,6 +3864,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn color_temp_table_interpolates_gain_and_matrix_values() {
+        let mut table = Vec::new();
+        table.extend([
+            5000.0, 0.9, 0.8, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0,
+        ]);
+        table.extend([
+            5500.0, 1.0, 1.2, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0,
+        ]);
+
+        let row = interpolate_color_temp_row(&table, 2, 12, 5250.0).unwrap();
+        assert_eq!(row[0], 5250.0);
+        assert!((row[1] - 0.95).abs() < 1e-12);
+        assert_eq!(row[2], 1.0);
+        assert_eq!(row[11], 9.5);
+    }
+
+    #[test]
+    fn color_temp_table_clamps_out_of_range_temperature() {
+        let low = [
+            5000.0, 0.9, 0.8, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0,
+        ];
+        let high = [
+            5500.0, 1.0, 1.2, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0,
+        ];
+        let table = [low, high].concat();
+
+        assert_eq!(
+            interpolate_color_temp_row(&table, 2, 12, 1000.0).unwrap(),
+            low
+        );
+        assert_eq!(
+            interpolate_color_temp_row(&table, 2, 12, 9000.0).unwrap(),
+            high
+        );
+    }
+
+    #[test]
+    fn color_temp_table_rejects_malformed_data() {
+        assert!(interpolate_color_temp_row(&[], 0, 12, 5200.0).is_none());
+        assert!(interpolate_color_temp_row(&[0.0; 11], 1, 11, 5200.0).is_none());
+        assert!(interpolate_color_temp_row(&[0.0; 12], 2, 12, 5200.0).is_none());
+        assert!(interpolate_color_temp_row(&[0.0; 12], 1, 12, f64::NAN).is_none());
     }
 
     fn s_for(global_max: f64, knee: f64) -> f64 {
