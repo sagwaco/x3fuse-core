@@ -552,6 +552,45 @@ pub unsafe extern "C" fn get_max_intermediate(
         return 0;
     }
 
+    let mut digital_gain = [1.0; 3];
+    unsafe { x3f_get_digital_iso_gain(x3f, digital_gain.as_mut_ptr()) };
+    let levels = intermediate_levels(gain, digital_gain, intermediate_bias);
+    if levels == [0; 3] {
+        unsafe {
+            x3f_printf(
+                x3f_verbosity_t_ERR,
+                c"Invalid DigitalISOGain value(s); expected finite positive channel gains\n".as_ptr(),
+            );
+        }
+        return 0;
+    }
+
+    unsafe { std::slice::from_raw_parts_mut(max_intermediate, 3) }.copy_from_slice(&levels);
+    1
+}
+
+fn intermediate_levels(
+    mut gain: [f64; 3],
+    digital_gain: [f64; 3],
+    intermediate_bias: f64,
+) -> [u32; 3] {
+    if !digital_gain.iter().all(|&gain| gain.is_finite() && gain > 0.0) {
+        return [0; 3];
+    }
+
+    // Quattro's Yis4T upsampler adds the same high-frequency T detail to
+    // all three intermediate channels. Those counts must therefore have
+    // a neutral white-balanced basis, including relative DigitalISOGain.
+    // This changes the encoding ranges, not normalized raw values: the
+    // same range is used by preprocessing and its later inverse.
+    // Uniform digital gain cancels from the normalization; skip it to
+    // preserve the existing arithmetic exactly for those cameras.
+    if digital_gain[0] != digital_gain[1] || digital_gain[1] != digital_gain[2] {
+        for color in 0..3 {
+            gain[color] *= digital_gain[color];
+        }
+    }
+
     // Cap the gains to 1.0 to avoid clipping (i.e. divide by max).
     let mut maxgain = 0.0_f64;
     for &g in &gain {
@@ -559,13 +598,11 @@ pub unsafe extern "C" fn get_max_intermediate(
             maxgain = g;
         }
     }
-    let max_slice = unsafe { std::slice::from_raw_parts_mut(max_intermediate, 3) };
-    for i in 0..3 {
+    std::array::from_fn(|i| {
         let v =
             gain[i] * (INTERMEDIATE_UNIT as f64 - intermediate_bias) / maxgain + intermediate_bias;
-        max_slice[i] = v.round() as i32 as u32;
-    }
-    1
+        v.round() as i32 as u32
+    })
 }
 
 #[no_mangle]
@@ -1432,12 +1469,12 @@ pub unsafe extern "C" fn preprocess_data(
         );
     }
 
-    // No DigitalISOGain here: baking it into `scale` pushed genuine
-    // unsaturated raw values above `il.white` (sensor saturation must
-    // map exactly to the published white level, or the top log2(gain)
-    // of a stop gets falsely clipped/recovered downstream). The gain
-    // is applied where brightness belongs instead: get_conv folds it
-    // into the conversion matrix, the DNG writer into BaselineExposure.
+    // Intermediate ranges are proportional to WhiteBalanceGains × DigitalISOGain,
+    // with the same relative gain used by the inverse normalization in
+    // preprocess_data so the final normalized sample domain stays unchanged.
+    // The geometric-mean component goes to BaselineExposure; only the relative
+    // gain is visible in per-channel pre-scaling and therefore in both
+    // recovered highlights and raw sample ratios.
     let mut scale = [0.0_f64; 3];
     for color in 0..3 {
         scale[color] = (il.white[color] as f64 - il.black[color])
@@ -3007,12 +3044,16 @@ pub unsafe extern "C" fn x3f_get_image(
     }
 
     // `apply_highlight_clip_dng` is the DNG path's clip-curve renderer.
-    // Cineon-log callers using `-color none` (camera-native log) want
-    // the log curve baked into raw BMT samples without the DNG tone
-    // curve fighting it — skip it for them, just like the Quattro
-    // branch already does.
+    // Quattro must also run this pass when recovery is requested; its
+    // expanded BMT raster uses the same normalized camera coordinates.
+    // Keep its recovery-off path unchanged, including spatial gain.
+    // Cineon-log callers using `-color none` need the log curve without
+    // the DNG highlight pass.
     let cineon = CINEON.with(|c| c.get());
-    if encoding == x3f_color_encoding_e_NONE && !is_quattro && !cineon {
+    if encoding == x3f_color_encoding_e_NONE
+        && !cineon
+        && (!is_quattro || DNG_HIGHLIGHT_RECOVERY.with(|c| c.get()))
+    {
         unsafe { apply_highlight_clip_dng(x3f, image, &mut il, wb) };
     }
 
@@ -3286,7 +3327,100 @@ static _A_X3F_GET_PREVIEW: unsafe extern "C" fn(
 
 #[cfg(test)]
 mod tests {
-    use super::shoulder_compress;
+    use super::{intermediate_levels, shoulder_compress, INTERMEDIATE_UNIT};
+
+    #[test]
+    fn uniform_digital_gain_preserves_intermediate_levels() {
+        let gain = [1.13, 1.05, 0.98];
+        let unit = intermediate_levels(gain, [1.0; 3], 13.137854439984503);
+        assert_eq!(
+            unit,
+            intermediate_levels(gain, [4.0; 3], 13.137854439984503)
+        );
+        assert_eq!(unit[0], INTERMEDIATE_UNIT);
+    }
+
+    #[test]
+    fn quattro_top_detail_preserves_neutral_color_with_unequal_digital_gain() {
+        use crate::quattro::{x3f_expand_quattro, Area16};
+        use std::ptr::null_mut;
+
+        let gain = [1.1, 1.05, 0.99];
+        let digital_gain = [4.0, 4.0, 2.0];
+        let black = 100.0;
+        let white = intermediate_levels(gain, digital_gain, black);
+        let ranges: [f64; 3] = std::array::from_fn(|c| white[c] as f64 - black);
+        let total_gain: [f64; 3] = std::array::from_fn(|c| gain[c] * digital_gain[c]);
+        let encode = |luminance: f64, c: usize| {
+            (black + ranges[c] * luminance / total_gain[c]).round() as u16
+        };
+
+        // A neutral high-frequency pattern whose 2x2 average is constant.
+        // B/M record only that average; the full-resolution T plane records
+        // alternating brighter and darker samples. Neither is clipped.
+        let mut low = Vec::new();
+        for _ in 0..16 {
+            low.extend((0..3).map(|c| encode(0.1, c)));
+        }
+        let luminance = |row: usize, col: usize| {
+            if (row + col).is_multiple_of(2) {
+                0.14
+            } else {
+                0.06
+            }
+        };
+        let mut top: Vec<u16> = (0..8)
+            .flat_map(|row| (0..8).map(move |col| encode(luminance(row, col), 2)))
+            .collect();
+        let mut output = vec![0u16; 8 * 8 * 3];
+        let mut image = Area16 {
+            data: low.as_mut_ptr(),
+            buf: null_mut(),
+            rows: 4,
+            columns: 4,
+            channels: 3,
+            row_stride: 12,
+        };
+        let mut qtop = Area16 {
+            data: top.as_mut_ptr(),
+            buf: null_mut(),
+            rows: 8,
+            columns: 8,
+            channels: 1,
+            row_stride: 8,
+        };
+        let mut expanded = Area16 {
+            data: output.as_mut_ptr(),
+            buf: null_mut(),
+            rows: 8,
+            columns: 8,
+            channels: 3,
+            row_stride: 24,
+        };
+        unsafe {
+            x3f_expand_quattro(
+                &mut image,
+                null_mut(),
+                &mut qtop,
+                &mut expanded,
+                null_mut(),
+                0.0,
+            );
+        }
+        for row in 0..8 {
+            for col in 0..8 {
+                for c in 0..3 {
+                    let count = output[(row * 8 + col) * 3 + c] as f64;
+                    let balanced = (count - black) / ranges[c] * total_gain[c];
+                    assert!(
+                        (balanced - luminance(row, col)).abs() < 1e-3,
+                        "pixel ({row},{col}) channel {c}: {balanced} is not neutral detail {}",
+                        luminance(row, col),
+                    );
+                }
+            }
+        }
+    }
 
     fn s_for(global_max: f64, knee: f64) -> f64 {
         (global_max - knee) / (1.0 - knee)

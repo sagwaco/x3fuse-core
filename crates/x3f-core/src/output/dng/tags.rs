@@ -128,10 +128,6 @@ pub const DNG_VERSION_1_3_0_0: [u8; 4] = [1, 3, 0, 0];
 pub const CALIB_ILLUMINANT_D65: u16 = 21;
 pub const CALIB_ILLUMINANT_D50: u16 = 23;
 /// TIFF/EXIF code 15 — "white fluorescent (WW 3250–3800 K)".
-/// Sigma's native Quattro DNGs use this as `CalibrationIlluminant2` and
-/// the `ForwardMatrix2` shipped under that label is byte-equivalent (to
-/// 4 decimal places) to what we emit for our Quattro picture profiles.
 pub const CALIB_ILLUMINANT_WHITE_FLUORESCENT: u16 = 15;
-/// TIFF/EXIF code 17 — Standard Light A (≈2856 K). Sigma's native Quattro
-/// DNGs use this as `CalibrationIlluminant1`.
+/// TIFF/EXIF code 17 — Standard Light A (≈2856 K).
 pub const CALIB_ILLUMINANT_STANDARD_A: u16 = 17;

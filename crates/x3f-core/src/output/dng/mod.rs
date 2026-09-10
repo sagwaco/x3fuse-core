@@ -27,6 +27,7 @@
 //!   emits lossless JPEG ([`ljpeg`]), the compression the spec sanctions
 //!   for 16-bit integer raws and the one all RAW engines decode.
 
+mod color;
 mod exif;
 mod hue_sat_map;
 mod ljpeg;
@@ -38,20 +39,15 @@ pub(crate) mod tags;
 pub(crate) mod tiff_writer;
 mod tone_curves;
 
-use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 use crate::{Error, Image, ProcessOptions, Reader};
 
-use metadata::{vec3_invert, vec3_to_f32};
+use color::ColorCalibration;
 use profiles::{build_extra_profiles_blob, srational_from_floats, write_default_profile};
 use tiff_writer::{DirectoryWriter, TiffWriter, Value};
-
-/// White-balance preset used to compute `CameraCalibration1`. Matches the
-/// `WB_D65` define in `x3f_output_dng.c`.
-const WB_CALIBRATION: &str = "Overcast";
 
 const ROWS_PER_STRIP: u32 = 32;
 const PREVIEW_MAX_WIDTH: u32 = 300;
@@ -84,6 +80,8 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
     // log curve to the DNG raw plane.
     opts.cineon = false;
     let wb = opts.wb.clone().unwrap_or_default();
+    let calibration =
+        ColorCalibration::new(reader, &wb).ok_or(Error::Library(crate::LibraryError::Argument))?;
 
     let mut image = reader.get_image(&opts)?;
     if image.channels != 3 {
@@ -151,6 +149,14 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
     // `Image::dng_highlight_scale`.
     let highlight_scale = image.dng_highlight_scale;
 
+    // Resolve required identity before opening the output. Quattro stores
+    // Make/Model in JPEG EXIF rather than CAMF, so use the shared fallback.
+    let capture_meta = exif::CaptureMetadata::from_reader(reader);
+    let unique_camera_model = capture_meta
+        .unique_camera_model()
+        .ok_or(Error::Library(crate::LibraryError::Argument))?;
+    let orientation = capture_meta.orientation.unwrap_or(1);
+
     let f = BufWriter::new(File::create(path).map_err(|source| Error::Io {
         path: path.display().to_string(),
         source,
@@ -175,21 +181,15 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
     //    We write the blob ahead of IFD1 so its offsets are known when
     //    we build IFD0.
     let default_idx = profiles::default_profile_index(reader);
-    let (extra_blob, extra_rel_offsets) = build_extra_profiles_blob(reader, &wb, default_idx)
-        .ok_or(Error::Library(crate::LibraryError::Argument))?;
+    let (extra_blob, extra_rel_offsets) =
+        build_extra_profiles_blob(reader, &wb, &calibration, default_idx)
+            .ok_or(Error::Library(crate::LibraryError::Argument))?;
     let extra_offsets_abs: Vec<u32> = if extra_blob.is_empty() {
         Vec::new()
     } else {
         let base = tiff.write_data(&extra_blob).map_err(io_err(path))?;
         extra_rel_offsets.iter().map(|o| base + o).collect()
     };
-
-    // Capture metadata up front — its `orientation` flows into both the
-    // raw IFD and the preview IFD, and the rest goes into the EXIF sub-
-    // IFD. Reading is read-only against the parsed file, so this is
-    // cheap to compute once and use everywhere.
-    let capture_meta = exif::CaptureMetadata::from_reader(reader);
-    let orientation = capture_meta.orientation.unwrap_or(1);
 
     // -- OpcodeList3 lookup (optional, --opcodes-dir) -----------------
     let opcode_blob = opts
@@ -226,7 +226,6 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
         &raw_strip_byte_counts,
         rows_per_strip,
         opts.compress,
-        linear_limit,
     )?;
     if let Some(blob) = opcode_blob {
         ifd1.add(tags::OPCODE_LIST3, Value::Undefined(blob));
@@ -251,12 +250,24 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
         orientation,
     );
     exif::add_top_level_tags(&capture_meta, &mut ifd0);
+    ifd0.add(tags::UNIQUE_CAMERA_MODEL, Value::Ascii(unique_camera_model));
+    let ll = (linear_limit.clamp(0.5, 1.0) * 10_000.0).round() as u32;
+    ifd0.add(
+        tags::LINEAR_RESPONSE_LIMIT,
+        Value::Rational(vec![(ll, 10_000)]),
+    );
     ifd0.add(tags::SUB_IFDS, Value::Long(vec![ifd1_offset]));
     if let Some(off) = exif_subifd_offset {
         ifd0.add(tags::EXIF_IFD_POINTER, Value::Long(vec![off]));
     }
-    add_dng_top_level_tags(reader, &capture_meta, &wb, highlight_scale, &mut ifd0)?;
-    if write_default_profile(reader, &wb, &mut ifd0).is_none() {
+    add_dng_top_level_tags(
+        reader,
+        &capture_meta,
+        &calibration,
+        highlight_scale,
+        &mut ifd0,
+    );
+    if write_default_profile(reader, &wb, &calibration, &mut ifd0).is_none() {
         return Err(Error::Library(crate::LibraryError::Argument));
     }
     if !extra_offsets_abs.is_empty() {
@@ -383,7 +394,6 @@ fn populate_raw_ifd(
     strip_byte_counts: &[u32],
     rows_per_strip: u32,
     compress: bool,
-    linear_limit: f64,
 ) -> Result<(), Error> {
     let (out_rows, out_cols) = out_dims;
     // Orientation lives only in IFD0 (the preview IFD); the legacy C code
@@ -443,22 +453,8 @@ fn populate_raw_ifd(
     // there because removing them caused subtle Lightroom misbehaviour
     // in earlier C-side experiments (per the legacy code's choice list).
     ifd.add(tags::CHROMA_BLUR_RADIUS, Value::Rational(vec![(0, 1)]));
-    ifd.add(tags::CFA_PLANE_COLOR, Value::Byte(vec![0, 1, 2]));
     ifd.add(tags::DEFAULT_SCALE, Value::Rational(vec![(1, 1), (1, 1)]));
-    let ll = (linear_limit.clamp(0.5, 1.0) * 10_000.0).round() as u32;
-    ifd.add(
-        tags::LINEAR_RESPONSE_LIMIT,
-        Value::Rational(vec![(ll, 10_000)]),
-    );
     ifd.add(tags::ANTI_ALIAS_STRENGTH, Value::Rational(vec![(0, 1)]));
-
-    if let (Some(make), Some(model)) = (reader.dng_camf_text("Make"), reader.dng_camf_text("Model"))
-    {
-        let unique = format!("{make} {model}");
-        if let Ok(c) = CString::new(unique) {
-            ifd.add(tags::UNIQUE_CAMERA_MODEL, Value::Ascii(c));
-        }
-    }
 
     if let Some(active) = reader.dng_active_area(image) {
         // The raster we just wrote IS the active area (see the call site
@@ -469,7 +465,7 @@ fn populate_raw_ifd(
         let normalised = [0, 0, out_rows, out_cols];
         ifd.add(tags::ACTIVE_AREA, Value::Long(normalised.to_vec()));
         if let Some(crop) = compute_default_user_crop(reader, &active) {
-            ifd.add(tags::DEFAULT_USER_CROP, Value::Float(crop.to_vec()));
+            ifd.add(tags::DEFAULT_USER_CROP, crop_rationals(crop));
         }
     }
 
@@ -490,23 +486,27 @@ fn active_area_crop(reader: &Reader, image: &Image) -> Option<strip::CropWindow>
     Some((top, left, bottom - top, right - left))
 }
 
-/// BaselineExposure contribution of the per-channel `DigitalISOGain`:
-/// log2 of the geometric mean, exactly 0.0 for the unit gain so the
-/// no-gain DNG stays byte-identical.
-fn digital_iso_gain_be(gain: [f64; 3]) -> f64 {
-    if gain == [1.0; 3] {
-        return 0.0;
-    }
-    (gain[0] * gain[1] * gain[2]).cbrt().log2()
+fn crop_rationals(crop: [f32; 4]) -> Value {
+    const DENOM: u32 = 1_000_000;
+    Value::Rational(
+        crop.iter()
+            .map(|&v| {
+                (
+                    (f64::from(v).clamp(0.0, 1.0) * f64::from(DENOM)).round() as u32,
+                    DENOM,
+                )
+            })
+            .collect(),
+    )
 }
 
 fn add_dng_top_level_tags(
     reader: &Reader,
     capture_meta: &exif::CaptureMetadata,
-    wb: &str,
+    calibration: &ColorCalibration,
     highlight_scale: f64,
     ifd: &mut DirectoryWriter,
-) -> Result<(), Error> {
+) {
     // BaselineExposure = log2(capture_iso/sensor_iso)
     //                  + log2(DigitalISOGain) + log2(highlight_scale).
     // The DigitalISOGain term is the digital part of the camera's ISO
@@ -514,14 +514,15 @@ fn add_dng_top_level_tags(
     // into the raster so genuine raw data just below sensor saturation
     // survives into the DNG (baking it falsely clipped the top
     // log2(gain) of a stop at `il.white`). BE is scalar, so a
-    // per-channel-unequal gain contributes its geometric mean — the
-    // residual per-channel trim is a known limitation. Since the
+    // per-channel-unequal gain contributes its geometric mean; the
+    // residual channel balance is carried by AsShotNeutral and the
+    // profiles' ColorMatrix tags through ColorCalibration. Since the
     // recovery path bakes its highlight shoulder into the raster,
     // `highlight_scale` is always 1.0 today; the `> 1.0` arm is kept
     // for the writer-side contract should a future pipeline publish a
     // scale again. BaselineExposure is an optional-to-honour hint in
     // the DNG spec, so nothing render-critical may depend on it.
-    let gain_be = digital_iso_gain_be(reader.dng_digital_iso_gain());
+    let gain_be = calibration.digital_gain_ev;
     let iso_be = match (
         reader.dng_camf_float("SensorISO"),
         reader.dng_camf_float("CaptureISO"),
@@ -540,52 +541,32 @@ fn add_dng_top_level_tags(
         );
     }
 
-    // AsShotNeutral = 1 / gain at the file's WB.
-    let gain = reader
-        .dng_gain(Some(wb))
-        .ok_or(Error::Library(crate::LibraryError::Argument))?;
-    let neutral = vec3_to_f32(&vec3_invert(&gain));
+    // Include the residual digital gain without clipping the raw samples.
     ifd.add(
         tags::AS_SHOT_NEUTRAL,
         Value::Rational(
-            neutral
+            calibration
+                .neutral
                 .iter()
-                .map(|&v| (((v as f64) * 10_000.0).round().max(0.0) as u32, 10_000_u32))
+                .map(|&v| ((v * 10_000.0).round().max(1.0) as u32, 10_000_u32))
                 .collect(),
         ),
     );
 
-    // CameraCalibration1: diag(1 / gain at D65). Matches C exactly.
-    let gain_d65 = reader
-        .dng_gain(Some(WB_CALIBRATION))
-        .ok_or(Error::Library(crate::LibraryError::Argument))?;
-    let inv_d65 = vec3_invert(&gain_d65);
-    let diag = metadata::mat3_diag(&inv_d65);
-    ifd.add(
-        tags::CAMERA_CALIBRATION1,
-        srational_from_floats(&metadata::mat3_to_f32(&diag), 10_000),
-    );
-    // CalibrationIlluminant1 is per-camera-line. For Merrill and
-    // SD-series bodies we omit it entirely (matches the pre-Rust C
-    // writer; Capture One renders with green cast when CI1 is set on
-    // these matrices because they aren't actually D65-calibrated).
-    // For the Quattro line, we explicitly label as WhiteFluorescent
-    // (15) — Sigma's own native Quattro DNGs ship a ForwardMatrix2
-    // under CalibrationIlluminant2=15 that's byte-equivalent to what
-    // we emit, and Capture One renders Quattro DNGs correctly when
-    // we adopt that label. SD Quattro H groups with the Quattro line
-    // for consistency; renderers with built-in profiles for newer
-    // bodies (Apple, C1's SDQH path) override our label anyway.
+    // CameraCalibration defaults to identity. Its diagonal is folded into
+    // every profile's ColorMatrix so readers that ignore it still agree.
+    // Quattro's ColorMatrix is derived in D65 XYZ coordinates. Label it
+    // accordingly so readers using ColorMatrix apply the correct chromatic
+    // adaptation. Other camera lines retain their existing omitted tag
+    // until their calibration has been validated.
     if let Some(model) = capture_meta.model.as_deref() {
         if model.to_ascii_lowercase().contains("quattro") {
             ifd.add(
                 tags::CALIBRATION_ILLUMINANT1,
-                Value::Short(vec![tags::CALIB_ILLUMINANT_WHITE_FLUORESCENT]),
+                Value::Short(vec![tags::CALIB_ILLUMINANT_D65]),
             );
         }
     }
-
-    Ok(())
 }
 
 /// Replicates the JPEG-thumbnail-aspect-driven `DefaultUserCrop` logic
@@ -732,13 +713,18 @@ mod tests {
     }
 
     #[test]
-    fn digital_iso_gain_be_is_log2_of_geometric_mean() {
-        assert_eq!(digital_iso_gain_be([1.0; 3]), 0.0);
-        assert!((digital_iso_gain_be([2.0; 3]) - 1.0).abs() < 1e-12);
-        // Unequal channels: geometric mean of {1, 2, 4} is 2 → one stop.
-        assert!((digital_iso_gain_be([1.0, 2.0, 4.0]) - 1.0).abs() < 1e-12);
-        // Gain below one (ISO pull) goes negative.
-        assert!((digital_iso_gain_be([0.5; 3]) + 1.0).abs() < 1e-12);
+    fn crop_has_unsigned_rational_encoding_and_subpixel_precision() {
+        let crop = [0.0, 0.125_123_45, 0.875_987_6, 1.0];
+        let value = crop_rationals(crop);
+        assert_eq!(value.tiff_type(), tiff_writer::TIFF_TYPE_RATIONAL);
+        let Value::Rational(values) = value else {
+            unreachable!()
+        };
+        assert_eq!(values.len(), 4);
+        for (source, (n, d)) in crop.into_iter().zip(values) {
+            let round_trip = f64::from(n) / f64::from(d);
+            assert!((round_trip - f64::from(source)).abs() * 6192.0 < 0.01);
+        }
     }
 
     #[test]

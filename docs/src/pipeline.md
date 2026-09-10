@@ -61,11 +61,15 @@ The `convert_data` function is the hot loop. In order:
    H → skip Bottom; Merrill family → skip Right) are preserved
    verbatim.
 2. **white-level normalisation** + per-pixel `out = scale*(raw -
-   black) + bias` clamp. `DigitalISOGain` is deliberately *not* part
-   of `scale`: sensor saturation must land exactly on the published
-   white level, or the top `log2(gain)` of a stop of genuine raw data
-   gets falsely clipped/"recovered" downstream. The gain is applied at
-   stage 7 (and as DNG `BaselineExposure`) instead.
+   black) + bias` clamp. Intermediate encoding ranges are proportional
+   to `WhiteBalanceGains * DigitalISOGain`, normalized so the largest
+   range fits the intermediate buffer. This makes equal intermediate
+   channel values neutral, as required by Quattro's Yis4T detail
+   reconstruction and denoising. Each channel's range is also used in
+   the inverse normalization, so this does not apply digital gain to
+   normalized raw values or discard highlight headroom. Actual digital
+   brightening happens at stage 7, or through DNG color metadata and
+   `BaselineExposure`.
 3. **spatial gain (lens shading) correction** —
    [`crates/x3f-sys/src/spatial_gain.rs`](../../crates/x3f-sys/src/spatial_gain.rs).
    Reads `IncludeBlocks` and the four nearest neighbours in
@@ -112,6 +116,14 @@ divided the whole raster down and compensated via a
 correctly only in readers that honour BE (it is an optional hint in
 the DNG spec), so it was replaced by the baked shoulder.
 
+On Quattro, this pass runs after expansion when recovery is enabled.
+The previous unconditional Quattro bypass made the recovery option
+ineffective. Its recovery-off path retains the expanded sensor samples;
+unequal channel saturation can then produce lime/yellow highlights even
+with correct color metadata. Recovery remains an explicit processing
+choice because it estimates missing color and can change bright scene
+colors.
+
 The DNG's `BaselineExposure` carries the ISO brightening that is
 deliberately kept out of the raster:
 `log2(CaptureISO/SensorISO) + log2(geometric mean of DigitalISOGain)`.
@@ -121,6 +133,28 @@ revision did in `preprocess_data`) falsely clipped the top
 that ignore BE render those files a fraction of a stop darker, which
 matches the existing (much larger) BE reliance for Merrill ISO
 brightness.
+
+`DigitalISOGain` can differ substantially by channel: the sd Quattro H
+samples use `[4, 4, 2]`. Keeping only its geometric mean loses that color
+balance and produces a severe cast. The DNG writer computes
+`h = DigitalISOGain / geometric_mean(DigitalISOGain)` and publishes
+`AsShotNeutral = 1 / (WhiteBalanceGains * h)`. The diagonal
+`1 / (OvercastGains * h)` is folded into every profile's ColorMatrix,
+so CameraCalibration can be omitted (its default is identity).
+ForwardMatrix is unchanged. This preserves the relative gain through
+white-balance editing and readers that ignore CameraCalibration, without
+clipping the normalized samples. Quattro's intermediate encoding must use
+the same relative gain: otherwise adding T-plane detail equally to B, M,
+and T produces lime bright detail and purple dark detail after conversion.
+The working-range correction intentionally changes reconstructed Quattro
+pixels; it is separate from the algebraic metadata correction.
+
+Quattro profiles identify their calibration illuminant as D65, matching
+the basis of their ColorMatrix. Hue/saturation maps use `[21,2,1]` and
+explicit linear encoding. The DNG specification makes the encoding
+inapplicable when there is only one value division; encoding 0 also avoids
+an extra inverse sRGB curve in RawTherapee 5.12 and Adobe SDK 1.7.1, which
+otherwise darken even an identity map.
 
 The writer then equalizes the three channels into one shared
 encoding range (`output::dng::equalize_levels`): the per-channel
@@ -144,9 +178,10 @@ One of:
 
 - **DNG** — pure-Rust IFD writer in
   [`crates/x3f-core/src/output/dng/`](../../crates/x3f-core/src/output/dng/).
-  Emits the standard TIFF + EXIF chrome, the Sigma-private DNG tags
-  (50964 ForwardMatrix1, 51110 DefaultBlackRender, …), all 11
-  in-camera Sigma color modes as `ExtraCameraProfiles`, and embeds
+  Emits standard TIFF, EXIF, and DNG tags, including ForwardMatrix1
+  and DefaultBlackRender. Standard is the default camera profile; the
+  currently enabled extra profiles are five monochrome variants and
+  Unconverted. Additional Sigma picture modes remain disabled. The writer embeds
   Sigma's flat-fielding `OpcodeList3` blobs (lens-correction GainMaps)
   when `-opcodes-dir opcodes` is passed. `-compress` encodes the raw
   plane as lossless JPEG (`Compression = 7`, the pure-Rust LJ92
@@ -158,7 +193,10 @@ One of:
   integer raws wholesale (no Finder/Quick Look previews), while the
   dcraw-lineage decoders stop after the first strip of a multi-strip
   lossless-JPEG plane — single-strip LJ92 is the layout everything
-  decodes.
+  decodes. Required UniqueCameraModel and LinearResponseLimit live in
+  IFD0; DefaultUserCrop is RATIONAL[4] in the raw IFD. Hue/saturation
+  maps use `[21, 2, 1]` dimensions, with saturation varying fastest and
+  identical corrections at both saturation endpoints.
 - **16-bit TIFF** —
   [`crates/x3f-core/src/output/tiff.rs`](../../crates/x3f-core/src/output/tiff.rs)
   via the `tiff` crate.

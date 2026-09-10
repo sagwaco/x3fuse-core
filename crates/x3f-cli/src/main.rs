@@ -149,7 +149,7 @@ fn usage(progname: &str) -> ! {
          \x20                  WhiteLevel with a soft highlight shoulder baked\n\
          \x20                  into the raster (knee tunable via\n\
          \x20                  X3F_DNG_SHOULDER_KNEE, default 0.85), so the\n\
-         \x20                  result renders identically in every DNG reader\n\
+         \x20                  recovered pixels fit the published DNG levels\n\
          \x20                  (Adobe Camera Raw, Lightroom, LibRaw/RawTherapee,\n\
          \x20                  Capture One, Apple RAW Engine).\n\
          \x20                  Default: off (matches the pre-Rust C writer).\n\

@@ -116,18 +116,14 @@ pub struct ProcessOptions {
     /// `None` (default) skips opcode embedding.
     pub opcodes_dir: Option<std::path::PathBuf>,
     /// Enable the DNG-path Foveon highlight-recovery pipeline (chroma
-    /// LUT + L*p reconstruction + matrix-pathology gate, with the
-    /// recovered raster scaled to fit within `u16` and a matching
-    /// `BaselineExposure` nudge so renderers can pull recovered
-    /// highlights back via negative exposure compensation).
+    /// LUT + L*p reconstruction + matrix-pathology gate). Recovered
+    /// overshoot is compressed below WhiteLevel with a soft shoulder
+    /// baked into the raster; it does not depend on a reader undoing
+    /// an exposure scale. This also applies after Quattro expansion.
     ///
-    /// **Renderer compatibility:** Adobe Camera Raw / Lightroom and
-    /// RawTherapee/LibRaw honour the `BaselineExposure` log2 nudge and
-    /// render these DNGs correctly with the recovered highlight chroma
-    /// in place. Capture One and Apple RAW Engine do not — they cast
-    /// green/blue on Merrill files when this is enabled. Default is
-    /// `false` (matches the pre-Rust C writer's output, renders
-    /// correctly across all four).
+    /// Default is `false`. Enable this for clipped Foveon highlights:
+    /// without recovery, unequal channel saturation can produce a
+    /// lime/yellow cast even with correct white balance and matrices.
     pub dng_highlight_recovery: bool,
     /// Cineon-style log TIFF mode. When `true`, the conversion pipeline:
     ///
