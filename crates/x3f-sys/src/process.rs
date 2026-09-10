@@ -91,8 +91,23 @@ fn interpolate_color_temp_row(
         || columns < COLOR_TEMP_TABLE_COLUMNS
         || table.len() < rows.checked_mul(columns)?
         || !kelvin.is_finite()
+        || kelvin <= 0.0
     {
         return None;
+    }
+
+    let mut previous_kelvin = 0.0;
+    for row in table[..rows * columns].chunks_exact(columns) {
+        if row[..COLOR_TEMP_TABLE_COLUMNS]
+            .iter()
+            .any(|v| !v.is_finite())
+            || row[0] <= previous_kelvin
+            || row[1] <= 0.0
+            || row[2] <= 0.0
+        {
+            return None;
+        }
+        previous_kelvin = row[0];
     }
 
     let first = &table[..columns];
@@ -118,6 +133,9 @@ fn interpolate_color_temp_row(
     let mut result = [0.0; COLOR_TEMP_TABLE_COLUMNS];
     for (column, value) in result.iter_mut().enumerate() {
         *value = lower[column] + weight * (upper[column] - lower[column]);
+        if !value.is_finite() {
+            return None;
+        }
     }
     Some(result)
 }
@@ -158,7 +176,8 @@ unsafe fn get_color_temp_row(
 
     let rows = rows as usize;
     let columns = columns as usize;
-    let values = unsafe { std::slice::from_raw_parts(table as *const f64, rows * columns) };
+    let elements = rows.checked_mul(columns)?;
+    let values = unsafe { std::slice::from_raw_parts(table as *const f64, elements) };
     interpolate_color_temp_row(values, rows, columns, kelvin)
 }
 
@@ -3771,7 +3790,9 @@ static _A_X3F_GET_PREVIEW: unsafe extern "C" fn(
 
 #[cfg(test)]
 mod tests {
-    use super::{intermediate_levels, interpolate_color_temp_row, shoulder_compress, INTERMEDIATE_UNIT};
+    use super::{
+        intermediate_levels, interpolate_color_temp_row, shoulder_compress, INTERMEDIATE_UNIT,
+    };
 
     #[test]
     fn uniform_digital_gain_preserves_intermediate_levels() {
@@ -3909,6 +3930,41 @@ mod tests {
         assert!(interpolate_color_temp_row(&[0.0; 11], 1, 11, 5200.0).is_none());
         assert!(interpolate_color_temp_row(&[0.0; 12], 2, 12, 5200.0).is_none());
         assert!(interpolate_color_temp_row(&[0.0; 12], 1, 12, f64::NAN).is_none());
+
+        let valid = [
+            5000.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        assert_eq!(
+            interpolate_color_temp_row(&valid, 1, 12, 5200.0),
+            Some(valid)
+        );
+        for kelvin in [0.0, -1.0, f64::INFINITY] {
+            assert!(interpolate_color_temp_row(&valid, 1, 12, kelvin).is_none());
+        }
+        for column in 0..12 {
+            for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let mut row = valid;
+                row[column] = bad;
+                assert!(interpolate_color_temp_row(&row, 1, 12, 5200.0).is_none());
+            }
+        }
+        for column in 0..3 {
+            for bad in [0.0, -1.0] {
+                let mut row = valid;
+                row[column] = bad;
+                assert!(interpolate_color_temp_row(&row, 1, 12, 5200.0).is_none());
+            }
+        }
+        for kelvin in [4000.0, 5000.0] {
+            let mut table = [valid, valid].concat();
+            table[12] = kelvin;
+            assert!(interpolate_color_temp_row(&table, 2, 12, 5200.0).is_none());
+        }
+        let mut table = [valid, valid].concat();
+        table[12] = 5500.0;
+        table[3] = -f64::MAX;
+        table[15] = f64::MAX;
+        assert!(interpolate_color_temp_row(&table, 2, 12, 5200.0).is_none());
     }
 
     fn s_for(global_max: f64, knee: f64) -> f64 {
