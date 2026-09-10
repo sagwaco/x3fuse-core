@@ -252,12 +252,6 @@ pub(crate) fn mat3_mul(a: &[f64; 9], b: &[f64; 9]) -> [f64; 9] {
     out
 }
 
-pub(crate) fn vec3_invert(a: &[f64; 3]) -> [f64; 3] {
-    let mut out = [0.0_f64; 3];
-    unsafe { sys::x3f_3x1_invert(a.as_ptr() as *mut _, out.as_mut_ptr()) };
-    out
-}
-
 pub(crate) fn mat3_diag(a: &[f64; 3]) -> [f64; 9] {
     let mut out = [0.0_f64; 9];
     unsafe { sys::x3f_3x3_diag(a.as_ptr() as *mut _, out.as_mut_ptr()) };
@@ -296,8 +290,4 @@ pub(crate) fn mat3_to_f32(a: &[f64; 9]) -> [f32; 9] {
         a[7] as f32,
         a[8] as f32,
     ]
-}
-
-pub(crate) fn vec3_to_f32(a: &[f64; 3]) -> [f32; 3] {
-    [a[0] as f32, a[1] as f32, a[2] as f32]
 }

@@ -77,13 +77,25 @@ x3f_extract -tiff -no-denoise <input>   # TIFF column
 
 | Input | DNG | TIFF |
 | ----- | --- | ---- |
-| SD1M (`sigma_sd1_merrill_15.x3f`) | `16f0d954b4cb4aea3f3683a33896da21` | `277cf4b4691652bd57c96b15ba03d47f` |
-| older raw (`_SDI8040.X3F`) | `58b0376f041f69e6076bdc498c5952f9` | `b4cc09aa1c8d127274056660a92ffc0d` |
-| Quattro (`_SDI8284.X3F`) | `7402b517b953dfceceebd569e53d0615` | `661df021b16de5164b03624776fd5507` |
+| SD1M (`sigma_sd1_merrill_15.x3f`) | `a2427c1db46066d7201f7499d46bb02d` | `277cf4b4691652bd57c96b15ba03d47f` |
+| DP2 Merrill (`_SDI8040.X3F`) | `94c64ebc524077d4f51e96df868d9271` | `b4cc09aa1c8d127274056660a92ffc0d` |
+| Quattro (`_SDI8284.X3F`) | `7259dd2e0b4c5cde7e4e5c2531defa9f` | `661df021b16de5164b03624776fd5507` |
 
 These must match across a change unless the change is an _intentional_
 algorithm change — in which case re-pin this table in the same commit
 and call the change out in the commit message.
+
+The September 2026 DNG compatibility correction intentionally changes
+these hashes. Relative `DigitalISOGain` is retained in the color metadata,
+calibration is folded into each profile's ColorMatrix, and invalid or
+misplaced tags are corrected. Quattro's intermediate ranges now include
+relative digital gain so its reconstructed neutral detail stays neutral.
+That processing correction changes pixels in files with unequal digital
+gains, including the supplied sd Quattro H images. Uniform digital gains
+preserve the previous range arithmetic exactly, so all three TIFF hashes
+above remain unchanged. Compare image payloads separately from whole-file
+hashes, and distinguish actual reader color checks from structural DNG
+validation.
 
 (History: the DNG hashes cited by the port-plan milestones —
 `dcaa9929…` / `41a80ce6…` / `c2f70f35…` — are milestone-era values
@@ -161,6 +173,54 @@ When highlight-recovery research lands, expect the tight bounds to
 loosen for affected images. Document the loosening in the commit
 message; don't quietly bump the threshold to the new max.
 
+The highlight mapping tests in
+[`tier3_highlight_recovery.rs`](../../crates/x3f-cli/tests/tier3_highlight_recovery.rs)
+decode the **raw SubIFD**, not the IFD0 preview. They check recovered
+headroom, exposure compensation, shared-scale midtone precision, preserved
+highlight layer ratios, and distinct recovered intensity levels on
+`CLIPPED_IMAGE_MERRILL.X3F` and `DP2M0981.X3F`. Recovery-off output must
+remain byte-identical when the mapping selector changes, including SD1
+Merrill, DP2 Merrill, and Quattro controls. Each child process clears inherited
+`X3F_*` research tunables; corpus discovery happens before that cleanup.
+
+```sh
+cargo test -p x3f-cli --release --test tier3_highlight_recovery -- --nocapture
+```
+
+These are structural and numerical invariants, not proof of improved
+appearance relative to Sigma Photo Pro. For a reference comparison, render
+the DNG raw data with a fixed reader/profile, export at 0 EV and -2 EV,
+align crop/orientation, and convert both that output and the SPP TIFF's
+embedded ICC profile into the same linear color space. Compare fixed
+highlight regions for surviving texture, color continuity, and edge halos;
+also inspect unclipped regions. Neither an embedded-preview comparison nor
+a direct BMT-versus-rendered-RGB error establishes recovery quality.
+Keep the SPP exports outside the repository alongside the private corpus.
+The supplied reference pairs use `CLIPPED_IMAGE_MERRILL_SPP_0EV.tif` /
+`CLIPPED_IMAGE_MERRILL_SPP_-2EV.tif` and `DP2M0981-SPP_0EV.tif` /
+`DP2M0981-SPP_-2EV.tif`.
+
+The local reconstruction and linear headroom mapping intentionally change
+recovery-enabled DNG pixels. Quattro keeps its existing reconstruction;
+its final mapping can still change the encoded pixels. Do not update the
+manual baseline table from guesses or from recovery-enabled runs: measure
+the exact documented recovery-off commands, and record intentional changes
+separately from stale historical file hashes.
+
+Include matrix-pathology cases in highlight validation. Foveon layers can
+retain nominal headroom while their combined color projection is already
+unreliable, so a hard-clipping mask alone is insufficient. Exercise
+near-clipped BMT vectors with severe color-matrix cancellation as well as
+normal consistent vectors. Also check local proposals against the established
+reconstruction in rendered chroma: good donor support must not permit a
+large hue change. When chroma remains uncertain, survivor-derived scalar
+texture can improve brightness structure while retaining established color.
+The safeguard may change all layers of a
+pathological highlight together to preserve coherent color and available
+brightness detail; preserving each nominally unclipped layer is not an
+invariant in that case. Check that normal valid unclipped areas remain
+unchanged, and inspect real sky and cloud crops for green/magenta artifacts.
+
 ## Test corpus
 
 Tier-2 (MD5) and tier-3 (perceptual) tests need an X3F corpus that is
@@ -180,10 +240,11 @@ Minimum viable corpus, by sensor class:
 - **Merrill** (DP\* / SD1) — the tier-2 tests pin
   `sigma_sd1_merrill_10.x3f` and `sigma_sd1_merrill_15.x3f`. Fully
   exercised.
-- **Older raw** (SD9 / SD10 / SD14 / SD15 / DP1 / DP2) — `_SDI8040.X3F`
-  is in the tier-2 expectations. SD9 / SD10 entropy paths are ported
-  but not sensor-validated; adding even one SD9/SD10 file would
-  extend the M5b differential test to cover them.
+- **Older raw** (SD9 / SD10 / SD14 / SD15 / DP1 / DP2) — not covered by
+  the three manual reference files above: the supplied `_SDI8040.X3F`
+  identifies as DP2 Merrill. SD9 / SD10 entropy paths are ported but not
+  sensor-validated; adding even one SD9/SD10 file would extend the M5b
+  differential test to cover them.
 - **Quattro** (DP\* / SDQ / SDQH) — `_SDI8284.X3F` covers the SDQH
   path; DP0Q files cover the DP-class Quattro.
 
@@ -202,6 +263,73 @@ post-port. Suspected cause: subtle structural difference in our
 hand-rolled MMCR mini-TIFFs vs libtiff's output. Marked **not
 critical** by the user, but should land before the M9 crates.io
 publish.
+
+## DNG reader compatibility checks
+
+The September 2026 writer correction preserves per-channel digital ISO
+gain in AsShotNeutral and ColorMatrix, folds CameraCalibration into all
+enabled profiles, and fixes hue/saturation map dimensions and encoding,
+crop types, camera identity, and IFD placement. The accompanying Quattro
+working-range correction changes reconstructed pixels to remove false
+color in bright and dark detail. The public Rust API, C ABI, and
+single-dash CLI flags are unchanged. Applications bundling `x3f_extract`
+or linking this library must rebuild with the corrected core.
+
+Use an independent decoder in addition to the Rust tests. With the Adobe
+SDK available locally, validate both uncompressed and lossless-JPEG output:
+
+```sh
+_local/dng_sdk_1_7_1/dng_sdk/targets/mac/debug64/dng_validate -d 5 output.dng
+```
+
+For clipped Foveon highlights, generate a recovery-enabled comparison:
+
+```sh
+target/release/x3f_extract -dng -compress -dng-highlight-recovery \
+  -dng-highlight-mapping linear input.X3F
+```
+
+`linear` is the default mapping when recovery is enabled. Compare against
+`-dng-highlight-mapping shoulder` in a separate output directory so both
+artifacts remain available. Linear output preserves recovered contrast by
+adding its shared encoding scale to `BaselineExposure`; verify exposure
+edits and metadata handling in each reader. Readers that ignore this tag
+need the corresponding positive exposure adjustment. Shoulder output bakes
+the compression into its raster and is the compatibility alternative.
+Recovery remains opt-in, with the existing Quattro reconstruction running
+after expansion. Turning recovery off can retain lime/yellow clipped
+highlights even when the color matrices and reconstructed detail are correct.
+
+Inspect warnings and assertion messages as well as the exit status: the
+old malformed DNGs could exit successfully. Exercise the default and each
+enabled profile with the validator's `-profile` and `-tif` options. Compare
+raw and preview strip payloads before and after any application metadata
+transfer, such as X3Fuse's ExifTool `-tagsFromFile INPUT.X3F -all:all` step.
+
+On macOS, the included Core Image check renders actual RAW pixels and
+writes JPEG previews and a JSON report with decoder versions and dimensions:
+
+```sh
+swift scripts/validate_apple_dng.swift --output target/apple-validation \
+  --scale 1 --edits output.dng
+```
+
+Use `--scale 0.125` for a batch smoke test. To test a particular decoder,
+pass an exact supported raw value such as `--decoder 8.dng`; an unsupported
+request fails without falling back. A successful RAW 8 render does not
+establish RAW 9 support.
+
+SDK success alone does not establish Lightroom compatibility. Verify the
+rebuilt output in Lightroom's Local browser, including metadata display,
+full-resolution rendering, exposure/white-balance edits, and export.
+For RawTherapee, check both its default input profile and the explicitly
+embedded profile with Camera white balance. Check darktable separately:
+its ColorMatrix path does not exercise Adobe's ForwardMatrix transform.
+Use scenes with blown white highlights, neutral shadow detail, and
+saturated colors; successful decoding or an acceptable midtone average
+does not establish correct color throughout the image. Default exposure
+and tone can differ between readers; these checks do not establish
+calibrated color accuracy or identical JPEG appearance.
 
 ## Filing a PR
 

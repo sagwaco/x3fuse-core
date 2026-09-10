@@ -200,6 +200,7 @@ fn read_dng_raw_ifd(path: &Path) -> RgbImage {
     let ifd0_off = read_u32(&bytes, 4) as usize;
     let raw_ifd_off = read_subifd0_offset(&bytes, ifd0_off);
     let raw_ifd = parse_ifd(&bytes, raw_ifd_off);
+    assert_dng_metadata(&bytes, ifd0_off, &raw_ifd);
 
     let width = first_long_or_short(&bytes, &raw_ifd, 256);
     let height = first_long_or_short(&bytes, &raw_ifd, 257);
@@ -231,6 +232,102 @@ fn read_dng_raw_ifd(path: &Path) -> RgbImage {
 
 fn read_u16(b: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([b[off], b[off + 1]])
+}
+
+/// Check the actual serialized file, including tags readers ignore when
+/// misplaced even though they successfully decode the raw pixel payload.
+fn assert_dng_metadata(bytes: &[u8], ifd0_off: usize, raw_ifd: &[IfdEntry]) {
+    let ifd0 = parse_ifd(bytes, ifd0_off);
+    let unique = ifd0
+        .iter()
+        .find(|e| e.tag == 50708)
+        .expect("missing IFD0 UniqueCameraModel");
+    assert_eq!(unique.typ, 2, "UniqueCameraModel must be ASCII");
+    assert!(unique.count > 1, "UniqueCameraModel must be nonempty");
+    let identity = read_ascii_tag(bytes, &ifd0, 50708);
+    let model = read_ascii_tag(bytes, &ifd0, 272);
+    if model.to_ascii_lowercase().contains("quattro") {
+        let illuminant = ifd0
+            .iter()
+            .find(|e| e.tag == 50778)
+            .expect("missing Quattro CalibrationIlluminant1");
+        assert_eq!((illuminant.typ, illuminant.count), (3, 1));
+        assert_eq!(
+            first_long_or_short(bytes, &ifd0, 50778),
+            21,
+            "Quattro ColorMatrix must be calibrated to D65"
+        );
+    }
+    assert!(!identity.trim().is_empty());
+    assert!(
+        identity.ends_with(&model),
+        "DNG identity disagrees with Model"
+    );
+    if ifd0.iter().any(|e| e.tag == 271) {
+        let make = read_ascii_tag(bytes, &ifd0, 271);
+        assert!(
+            identity
+                .to_ascii_lowercase()
+                .starts_with(&make.to_ascii_lowercase()),
+            "DNG identity disagrees with Make"
+        );
+    }
+    let linear = ifd0
+        .iter()
+        .find(|e| e.tag == 50734)
+        .expect("missing IFD0 LinearResponseLimit");
+    assert_eq!((linear.typ, linear.count), (5, 1));
+    assert!(
+        !ifd0.iter().any(|e| e.tag == 50723),
+        "calibration must be folded into ColorMatrix"
+    );
+    for tag in [50708, 50734, 50710] {
+        assert!(
+            !raw_ifd.iter().any(|e| e.tag == tag),
+            "inapplicable raw-IFD tag {tag}"
+        );
+    }
+    if let Some(crop) = raw_ifd.iter().find(|e| e.tag == 51125) {
+        assert_eq!(
+            (crop.typ, crop.count),
+            (5, 4),
+            "DefaultUserCrop must be RATIONAL[4]"
+        );
+        let offset = u32::from_le_bytes(crop.raw_value) as usize;
+        for i in 0..4 {
+            let n = read_u32(bytes, offset + i * 8);
+            let d = read_u32(bytes, offset + i * 8 + 4);
+            assert!(d > 0 && n <= d, "crop coordinate outside [0,1]");
+        }
+    }
+    if ifd0.iter().any(|e| e.tag == 50937) {
+        assert_eq!(read_long_or_short_vec(bytes, &ifd0, 50937), vec![21, 2, 1]);
+        // Encoding affects only V and is inapplicable for V=1. Explicit
+        // linear encoding avoids RawTherapee 5.12 applying an unpaired
+        // inverse sRGB curve that darkens even an identity hue/sat map.
+        let encoding = ifd0
+            .iter()
+            .find(|e| e.tag == 51107)
+            .expect("missing hue/saturation encoding");
+        assert_eq!((encoding.typ, encoding.count), (4, 1));
+        assert_eq!(u32::from_le_bytes(encoding.raw_value), 0);
+        let data = ifd0
+            .iter()
+            .find(|e| e.tag == 50938)
+            .expect("missing hue/saturation data");
+        assert_eq!((data.typ, data.count), (11, 126));
+    }
+}
+
+#[test]
+fn compressed_quattro_dng_metadata_is_conformant() {
+    let input = skip_if_missing!("_SDI8284.X3F");
+    let path = run_extract(&input, &["-dng", "-no-denoise", "-compress"], ".dng");
+    let bytes = fs::read(path).unwrap();
+    let ifd0_off = read_u32(&bytes, 4) as usize;
+    let raw = parse_ifd(&bytes, read_subifd0_offset(&bytes, ifd0_off));
+    assert_dng_metadata(&bytes, ifd0_off, &raw);
+    assert_eq!(first_long_or_short(&bytes, &raw, 259), 7);
 }
 fn read_u32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
@@ -278,6 +375,26 @@ fn read_subifd0_offset(bytes: &[u8], ifd0_off: usize) -> usize {
 
 fn first_long_or_short(bytes: &[u8], ifd: &[IfdEntry], tag: u16) -> u32 {
     read_long_or_short_vec(bytes, ifd, tag)[0]
+}
+
+fn read_ascii_tag(bytes: &[u8], ifd: &[IfdEntry], tag: u16) -> String {
+    let entry = ifd
+        .iter()
+        .find(|e| e.tag == tag)
+        .expect("missing ASCII tag");
+    assert_eq!(entry.typ, 2);
+    let size = entry.count as usize;
+    let payload = if size <= 4 {
+        &entry.raw_value[..size]
+    } else {
+        let offset = u32::from_le_bytes(entry.raw_value) as usize;
+        &bytes[offset..offset + size]
+    };
+    std::ffi::CStr::from_bytes_with_nul(payload)
+        .expect("ASCII tag must have exactly one trailing NUL")
+        .to_str()
+        .expect("invalid camera identity text")
+        .to_owned()
 }
 
 fn read_long_or_short_vec(bytes: &[u8], ifd: &[IfdEntry], tag: u16) -> Vec<u32> {

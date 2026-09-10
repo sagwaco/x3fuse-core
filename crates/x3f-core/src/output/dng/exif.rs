@@ -14,9 +14,8 @@
 //!   an ASCII string we parse out.
 //! - **Quattro / SDQH**: no `PROP` table; we fall back to the `Capture*`
 //!   CAMF matrices (`CaptureAperture`, `CaptureExpTime` in µs, etc) and
-//!   the `CameraSerialNumber` CAMF text. Make / Model / DateTime aren't
-//!   recoverable from CAMF on the files we've seen, so those slots stay
-//!   empty for Quattro until we add JPEG-EXIF parsing as a fallback.
+//!   the `CameraSerialNumber` CAMF text. The embedded JPEG's EXIF supplies
+//!   missing fields, including Make / Model / DateTime on Quattro.
 
 use std::ffi::CString;
 
@@ -60,6 +59,45 @@ pub(crate) struct CaptureMetadata {
 }
 
 impl CaptureMetadata {
+    /// Required DNG identity, using the same PROP/CAMF/JPEG fallback as Make
+    /// and Model. Avoid repeating the maker when Model already includes it.
+    pub(super) fn unique_camera_model(&self) -> Option<CString> {
+        let model = clean_identity(self.model.as_deref()?)?;
+        let make = self
+            .make
+            .as_deref()
+            .and_then(clean_identity)
+            .unwrap_or_default();
+        let already_prefixed = model.eq_ignore_ascii_case(&make)
+            || model
+                .get(..make.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&make))
+                && model
+                    .get(make.len()..)
+                    .is_some_and(|rest| rest.starts_with(char::is_whitespace));
+        let unique = if make.is_empty() || already_prefixed {
+            model
+        } else {
+            format!("{make} {model}")
+        };
+        CString::new(unique).ok()
+    }
+
+    /// Fill each identity field from the next source in priority order.
+    /// Normalize before selection so blank or NUL-only values fall through.
+    fn fill_identity(&mut self, make: Option<&str>, model: Option<&str>) {
+        self.make = self
+            .make
+            .as_deref()
+            .and_then(clean_identity)
+            .or_else(|| make.and_then(clean_identity));
+        self.model = self
+            .model
+            .as_deref()
+            .and_then(clean_identity)
+            .or_else(|| model.and_then(clean_identity));
+    }
+
     pub(crate) fn from_reader(reader: &Reader) -> Self {
         let mut m = Self {
             orientation: reader.prop_orientation(),
@@ -67,12 +105,10 @@ impl CaptureMetadata {
         };
 
         // ---- Merrill: PROP table ---------------------------------------
-        if let Some(s) = reader.dng_prop("CAMMANUF") {
-            m.make = Some(trim_owned(s));
-        }
-        if let Some(s) = reader.dng_prop("CAMMODEL") {
-            m.model = Some(trim_owned(s));
-        }
+        m.fill_identity(
+            reader.dng_prop("CAMMANUF").as_deref(),
+            reader.dng_prop("CAMMODEL").as_deref(),
+        );
         if let Some(s) = reader.dng_prop("FIRMVERS") {
             m.software = Some(format!("Sigma firmware {}", trim_owned(s)));
         }
@@ -152,7 +188,13 @@ impl CaptureMetadata {
             }
         }
 
-        // ---- Quattro: CAMF Capture* + CameraSerialNumber ---------------
+        // ---- CAMF: identity + Capture* + CameraSerialNumber ------------
+        // Keep the CAMF identity fallback used by the original DNG writer;
+        // some files lack a PROP identity or an EXIF-bearing JPEG.
+        m.fill_identity(
+            reader.dng_camf_text("Make").as_deref(),
+            reader.dng_camf_text("Model").as_deref(),
+        );
         if m.f_number.is_none() {
             if let Some(v) = reader.dng_camf_float("CaptureAperture") {
                 m.f_number = float_to_rational(v);
@@ -201,12 +243,7 @@ impl CaptureMetadata {
         if self.orientation.is_none() {
             self.orientation = j.orientation;
         }
-        if self.make.is_none() {
-            self.make = j.make.clone();
-        }
-        if self.model.is_none() {
-            self.model = j.model.clone();
-        }
+        self.fill_identity(j.make.as_deref(), j.model.as_deref());
         if self.software.is_none() {
             self.software = j.software.clone();
         }
@@ -319,16 +356,17 @@ fn trim_owned(s: String) -> String {
     s.trim().to_string()
 }
 
+fn clean_identity(s: &str) -> Option<String> {
+    let cleaned = s.replace('\0', "").trim().to_owned();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
 fn ascii_value(s: &Option<String>) -> Option<Value> {
-    let s = s.as_deref()?.trim();
-    if s.is_empty() {
-        return None;
-    }
+    let s = clean_identity(s.as_deref()?)?;
     // Drop interior NULs defensively — Sigma's PROP entries have been
     // observed to contain a stray space-only value (" ") which is fine,
     // but a NUL would corrupt the tag.
-    let cleaned: String = s.chars().filter(|&c| c != '\0').collect();
-    let c = CString::new(cleaned).ok()?;
+    let c = CString::new(s).ok()?;
     Some(Value::Ascii(c))
 }
 
@@ -679,6 +717,91 @@ fn unix_to_ymd_hms(unix: i64) -> (i32, u32, u32, u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camera_identity_preserves_prop_then_camf_precedence_per_field() {
+        let jpeg = JpegExif {
+            make: Some("JPEG maker".into()),
+            model: Some("JPEG model".into()),
+            ..JpegExif::default()
+        };
+        for (prop_make, prop_model, expected_make, expected_model) in [
+            (
+                Some("PROP maker"),
+                Some("PROP model"),
+                "PROP maker",
+                "PROP model",
+            ),
+            (Some("PROP maker"), None, "PROP maker", "CAMF model"),
+            (None, Some("PROP model"), "CAMF maker", "PROP model"),
+        ] {
+            let mut meta = CaptureMetadata::default();
+            meta.fill_identity(prop_make, prop_model);
+            meta.fill_identity(Some("CAMF maker"), Some("CAMF model"));
+            meta.fill_from_jpeg(&jpeg);
+            assert_eq!(meta.make.as_deref(), Some(expected_make));
+            assert_eq!(meta.model.as_deref(), Some(expected_model));
+        }
+    }
+
+    #[test]
+    fn camera_identity_accepts_camf_without_prop_or_jpeg() {
+        let mut meta = CaptureMetadata::default();
+        meta.fill_identity(None, None);
+        meta.fill_identity(Some(" SIGMA\0 "), Some(" DP2 Merrill\0 "));
+        assert_eq!(meta.make.as_deref(), Some("SIGMA"));
+        assert_eq!(meta.model.as_deref(), Some("DP2 Merrill"));
+        assert_eq!(
+            meta.unique_camera_model().unwrap().to_str().unwrap(),
+            "SIGMA DP2 Merrill"
+        );
+    }
+
+    #[test]
+    fn blank_identity_values_fall_back_to_sanitized_jpeg_fields() {
+        let jpeg = JpegExif {
+            make: Some(" SIG\0MA\0 ".into()),
+            model: Some(" sd Quat\0tro H\0 ".into()),
+            ..JpegExif::default()
+        };
+        for blank in ["", " \t\r\n", "\0", " \0 \0 "] {
+            let mut meta = CaptureMetadata::default();
+            meta.fill_identity(Some(blank), Some(blank));
+            meta.fill_identity(Some(blank), Some(blank));
+            assert!(meta.make.is_none() && meta.model.is_none());
+            meta.fill_from_jpeg(&jpeg);
+            assert_eq!(meta.make.as_deref(), Some("SIGMA"));
+            assert_eq!(meta.model.as_deref(), Some("sd Quattro H"));
+            assert_eq!(
+                meta.unique_camera_model().unwrap().to_str().unwrap(),
+                "SIGMA sd Quattro H"
+            );
+        }
+    }
+
+    #[test]
+    fn camera_identity_uses_jpeg_fallback_and_avoids_duplicate_make() {
+        let jpeg = parse_jpeg_exif(&synth_jpeg_with_exif()).unwrap();
+        let mut meta = CaptureMetadata::default();
+        meta.fill_from_jpeg(&jpeg);
+        assert!(meta.unique_camera_model().is_some());
+        for model in ["sd Quattro H", "SIGMA sd Quattro H", "sigma sd Quattro H"] {
+            meta.make = Some(" SIGMA\0 ".into());
+            meta.model = Some(format!(" {model} "));
+            let value = meta.unique_camera_model().unwrap();
+            assert_eq!(
+                value.to_str().unwrap().to_ascii_lowercase(),
+                "sigma sd quattro h"
+            );
+        }
+        meta.make = None;
+        assert_eq!(
+            meta.unique_camera_model().unwrap().to_str().unwrap(),
+            "sigma sd Quattro H"
+        );
+        meta.model = Some(" \0 ".into());
+        assert!(meta.unique_camera_model().is_none());
+    }
 
     #[test]
     fn parse_shutter_fraction() {

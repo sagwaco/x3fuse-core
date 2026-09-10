@@ -32,6 +32,7 @@ use std::ptr;
 
 use crate::*;
 // libc compat — see `sysabi.rs`.
+use crate::highlight_recovery::{channel_reliability, LocalRecovery, SensorReliability};
 use crate::sysabi as libc;
 
 // ----------------------------------------------------------------------
@@ -552,6 +553,49 @@ pub unsafe extern "C" fn get_max_intermediate(
         return 0;
     }
 
+    let mut digital_gain = [1.0; 3];
+    unsafe { x3f_get_digital_iso_gain(x3f, digital_gain.as_mut_ptr()) };
+    let levels = intermediate_levels(gain, digital_gain, intermediate_bias);
+    if levels == [0; 3] {
+        unsafe {
+            x3f_printf(
+                x3f_verbosity_t_ERR,
+                c"Invalid DigitalISOGain value(s); expected finite positive channel gains\n"
+                    .as_ptr(),
+            );
+        }
+        return 0;
+    }
+
+    unsafe { std::slice::from_raw_parts_mut(max_intermediate, 3) }.copy_from_slice(&levels);
+    1
+}
+
+fn intermediate_levels(
+    mut gain: [f64; 3],
+    digital_gain: [f64; 3],
+    intermediate_bias: f64,
+) -> [u32; 3] {
+    if !digital_gain
+        .iter()
+        .all(|&gain| gain.is_finite() && gain > 0.0)
+    {
+        return [0; 3];
+    }
+
+    // Quattro's Yis4T upsampler adds the same high-frequency T detail to
+    // all three intermediate channels. Those counts must therefore have
+    // a neutral white-balanced basis, including relative DigitalISOGain.
+    // This changes the encoding ranges, not normalized raw values: the
+    // same range is used by preprocessing and its later inverse.
+    // Uniform digital gain cancels from the normalization; skip it to
+    // preserve the existing arithmetic exactly for those cameras.
+    if digital_gain[0] != digital_gain[1] || digital_gain[1] != digital_gain[2] {
+        for color in 0..3 {
+            gain[color] *= digital_gain[color];
+        }
+    }
+
     // Cap the gains to 1.0 to avoid clipping (i.e. divide by max).
     let mut maxgain = 0.0_f64;
     for &g in &gain {
@@ -559,13 +603,11 @@ pub unsafe extern "C" fn get_max_intermediate(
             maxgain = g;
         }
     }
-    let max_slice = unsafe { std::slice::from_raw_parts_mut(max_intermediate, 3) };
-    for i in 0..3 {
+    std::array::from_fn(|i| {
         let v =
             gain[i] * (INTERMEDIATE_UNIT as f64 - intermediate_bias) / maxgain + intermediate_bias;
-        max_slice[i] = v.round() as i32 as u32;
-    }
-    1
+        v.round() as i32 as u32
+    })
 }
 
 #[no_mangle]
@@ -1300,6 +1342,18 @@ pub unsafe extern "C" fn preprocess_data(
     wb: *mut libc::c_char,
     ilevels: *mut x3f_image_levels_t,
 ) -> libc::c_int {
+    unsafe { preprocess_data_impl(x3f, fix_bad, wb, ilevels, None) }
+}
+
+// Provenance belongs to one conversion, never to the C image layout or a
+// thread-local slot that nested Rayon work could overwrite.
+unsafe fn preprocess_data_impl(
+    x3f: *mut x3f_t,
+    fix_bad: libc::c_int,
+    wb: *mut libc::c_char,
+    ilevels: *mut x3f_image_levels_t,
+    provenance: Option<&mut Option<SensorReliability>>,
+) -> libc::c_int {
     let mut image: x3f_area16_t = unsafe { std::mem::zeroed() };
     let mut qtop: x3f_area16_t = unsafe { std::mem::zeroed() };
 
@@ -1432,12 +1486,12 @@ pub unsafe extern "C" fn preprocess_data(
         );
     }
 
-    // No DigitalISOGain here: baking it into `scale` pushed genuine
-    // unsaturated raw values above `il.white` (sensor saturation must
-    // map exactly to the published white level, or the top log2(gain)
-    // of a stop gets falsely clipped/recovered downstream). The gain
-    // is applied where brightness belongs instead: get_conv folds it
-    // into the conversion matrix, the DNG writer into BaselineExposure.
+    // Intermediate ranges are proportional to WhiteBalanceGains × DigitalISOGain,
+    // with the same relative gain used by the inverse normalization in
+    // preprocess_data so the final normalized sample domain stays unchanged.
+    // The geometric-mean component goes to BaselineExposure; only the relative
+    // gain is visible in per-channel pre-scaling and therefore in both
+    // recovered highlights and raw sample ratios.
     let mut scale = [0.0_f64; 3];
     for color in 0..3 {
         scale[color] = (il.white[color] as f64 - il.black[color])
@@ -1450,30 +1504,63 @@ pub unsafe extern "C" fn preprocess_data(
     let img_channels = image.channels as usize;
     let img_cols = image.columns as usize;
     let il_black = il.black;
+    if image.rows == 0 || img_cols == 0 || img_row_stride == 0 {
+        return 0;
+    }
+    let mut reliability = if provenance.is_some() && !quattro {
+        let noise = std::array::from_fn(|c| {
+            black_dev[c].abs() / (max_raw[c] as f64 - black_level[c]).max(1.0)
+        });
+        // Provenance is optional: allocation failure falls back to the
+        // established recovery instead of aborting an otherwise valid image.
+        SensorReliability::new(image.rows as usize, img_cols, noise)
+    } else {
+        None
+    };
     {
         use rayon::prelude::*;
         let total = image.rows as usize * img_row_stride;
         let img_data = unsafe { std::slice::from_raw_parts_mut(image.data, total) };
         let colors = colors_in as usize;
-        img_data
-            .par_chunks_mut(img_row_stride)
-            .for_each(|row_data| {
-                for col in 0..img_cols {
-                    let off = img_channels * col;
-                    for color in 0..colors {
-                        let v = row_data[off + color] as f64;
-                        let out = (scale[color] * (v - black_level[color]) + il_black[color])
-                            .round() as i32;
-                        row_data[off + color] = if out < 0 {
-                            0
-                        } else if out > 65535 {
-                            65535
-                        } else {
-                            out as u16
-                        };
+        let normalize_row = |row_data: &mut [u16], mut mask: Option<&mut [[u8; 3]]>| {
+            for col in 0..img_cols {
+                let off = img_channels * col;
+                for color in 0..colors {
+                    let v = row_data[off + color] as f64;
+                    if let Some(mask) = mask.as_deref_mut() {
+                        let normalized =
+                            (v - black_level[color]) / (max_raw[color] as f64 - black_level[color]);
+                        mask[col][color] = channel_reliability(normalized, 0.0, 0.99, 0.04);
                     }
+                    let out =
+                        (scale[color] * (v - black_level[color]) + il_black[color]).round() as i32;
+                    row_data[off + color] = if out < 0 {
+                        0
+                    } else if out > 65535 {
+                        65535
+                    } else {
+                        out as u16
+                    };
                 }
-            });
+            }
+        };
+        if let Some(mask) = reliability.as_mut() {
+            img_data
+                .par_chunks_mut(img_row_stride)
+                .zip(mask.data.par_chunks_mut(img_cols))
+                .for_each(|(row_data, row_mask)| normalize_row(row_data, Some(row_mask)));
+        } else {
+            img_data
+                .par_chunks_mut(img_row_stride)
+                .for_each(|row_data| normalize_row(row_data, None));
+        }
+    }
+
+    if let Some(mask) = reliability.as_mut() {
+        // Decode against full stored-raster coordinates while the original
+        // clipping evidence still precedes WBCS, denoise, and crop. This
+        // changes only optional DNG recovery provenance, never the pixels.
+        unsafe { mask.merge_merrill_camera_clipping(x3f) };
     }
 
     if quattro {
@@ -1541,8 +1628,33 @@ pub unsafe extern "C" fn preprocess_data(
     // returns 0 for non-Merrill bodies, and the caller ignores that).
     unsafe { apply_wb_color_shading(x3f, wb, &mut image) };
 
+    // Shading can reach the storage rail even when the sensor did not clip.
+    // Denoise or bad-pixel interpolation must not turn that lost measurement
+    // back into a supposedly reliable source sample.
+    if let Some(mask) = reliability.as_mut() {
+        use rayon::prelude::*;
+        let data =
+            unsafe { std::slice::from_raw_parts(image.data, image.rows as usize * img_row_stride) };
+        mask.data
+            .par_chunks_mut(img_cols)
+            .zip(data.par_chunks(img_row_stride))
+            .for_each(|(mask_row, row)| {
+                for col in 0..img_cols {
+                    for c in 0..3 {
+                        if row[col * img_channels + c] == u16::MAX {
+                            mask_row[col][c] = 0;
+                        }
+                    }
+                }
+            });
+    }
+
     if fix_bad != 0 {
         unsafe { interpolate_bad_pixels(x3f, &mut image, 3) };
+    }
+
+    if let Some(output) = provenance {
+        *output = reliability;
     }
 
     1
@@ -2341,69 +2453,26 @@ pub unsafe extern "C" fn expand_quattro(
 }
 
 // ----------------------------------------------------------------------
-// M6e9 — apply_highlight_clip_dng + g_dng_highlight_scale
+// DNG recovery: immutable source evidence, floating-point evaluation, and
+// one final integer encoding. The legacy exported entry points stay stable.
 // ----------------------------------------------------------------------
-//
-// DNG path replacement for convert_data's highlight reconstruction.
-// Runs AFTER denoise on the post-preprocess raw plane: per-pixel
-// CLUT/RepairPix/L*p/matrix-pathology gate → bake-sg-into-raw →
-// scan for the global sat_ratio max → uniformly scale every raw
-// value by 1/global_max so channels fit within WhiteLevel; publish
-// the scale via `g_dng_highlight_scale` so the DNG writer can add
-// log2(scale) to BaselineExposure (Lightroom restores brightness
-// on import).
 
-// `dng_highlight_scale` is per-image but flowed across an FFI boundary
-// (Rust `apply_highlight_clip_dng` writes; x3f-core's DNG writer reads
-// in `output::dng::tags`). We use a thread-local Cell so the M7d batch
-// CLI parallel-iter can process multiple files concurrently without a
-// race — each top-level rayon task runs to completion on a single
-// worker thread, so the apply-then-read pair is consistent per-thread.
-//
-// The inner per-file rayon (M7a's `par_chunks_mut`) runs nested inside
-// the outer task and rejoins before the post-loop scalar write below,
-// so it never touches this cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DngMapping {
+    Linear,
+    Shoulder,
+}
+
+// Bound outlier-driven exposure and quantization loss without reinstating the
+// legacy 1.75 reconstruction cap. Four stops retain at least 12 bits across
+// the nominal white range; brighter outliers clip locally during encoding.
+const DNG_MAX_HEADROOM: f64 = 16.0;
+
 thread_local! {
     static DNG_HIGHLIGHT_SCALE: std::cell::Cell<f64> = const { std::cell::Cell::new(1.0) };
-    /// The pre-shoulder global max sat_ratio of the last
-    /// `apply_highlight_clip_dng` on this thread (1.0 when no pixel
-    /// overshot WhiteLevel, i.e. Pass 3 baked no shoulder and the
-    /// raster is scene-linear all the way to white). Same publication
-    /// discipline as `DNG_HIGHLIGHT_SCALE` above: written last, and
-    /// snapshotted by `x3f-core`'s `Reader::get_image` immediately
-    /// after return (`Image::dng_shoulder_ceiling`) so the DNG writer
-    /// can publish `LinearResponseLimit = knee` only when the top of
-    /// the encoding range is actually non-linear.
     static DNG_SHOULDER_CEILING: std::cell::Cell<f64> = const { std::cell::Cell::new(1.0) };
-    /// Controls the DNG-path highlight-recovery pipeline. When `false`
-    /// (default), `apply_highlight_clip_dng` skips the chroma LUT, L*p
-    /// reconstruction, repair_pix, and matrix-pathology gate, and ships
-    /// the raster within sensor-native `WhiteLevel` via a per-pixel
-    /// uniform cap (matches the pre-Rust C writer's output). When
-    /// `true`, the recovery pipeline runs (generalized per-channel
-    /// chroma-LUT reconstruction + L*p fallback + matrix-pathology
-    /// gate) and the recovered overshoot is folded back under
-    /// WhiteLevel by a baked soft highlight shoulder (see Pass 3 in
-    /// `apply_highlight_clip_dng`) — no BaselineExposure compensation,
-    /// so the result renders identically in every DNG reader (ACR,
-    /// LibRaw, Capture One, Apple RAW Engine).
     static DNG_HIGHLIGHT_RECOVERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-
-    /// Per-conversion Cineon-log TIFF toggle. Set by callers immediately
-    /// before `x3f_get_image` and read by `convert_data` / `get_conv` /
-    /// `x3f_get_image` to:
-    ///   - replace the encoding-specific gamma LUT with a Cineon-style
-    ///     log curve (`y = log(scale·x + 1) / log(scale + 1)`) so the
-    ///     TIFF carries lifted shadows / pulled highlights / a flat
-    ///     midtone slope, ready for grading;
-    ///   - force the chroma-LUT and RepairPix highlight-recovery
-    ///     passes off (they're creative interpretation, not science);
-    ///   - skip `apply_highlight_clip_dng` when encoding is `NONE`
-    ///     (that path is a DNG tone curve, not relevant for cineon).
-    /// The matrix-pathology gate stays on regardless — it's a sanity
-    /// rail against truly broken Foveon highlights, not a creative pass.
-    /// Defaults to false so external C callers (which never set the
-    /// hook) get the unchanged pre-cineon behaviour.
+    static DNG_HIGHLIGHT_MAPPING: std::cell::Cell<DngMapping> = const { std::cell::Cell::new(DngMapping::Linear) };
     static CINEON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -2412,44 +2481,24 @@ pub unsafe extern "C" fn x3f_get_dng_highlight_scale() -> f64 {
     DNG_HIGHLIGHT_SCALE.with(|c| c.get())
 }
 
-/// FFI accessor for `DNG_SHOULDER_CEILING` — see the cell's doc comment
-/// for the read-immediately-after-`x3f_get_image` contract.
 #[no_mangle]
 pub unsafe extern "C" fn x3f_get_dng_shoulder_ceiling() -> f64 {
     DNG_SHOULDER_CEILING.with(|c| c.get())
 }
 
-/// The luminance (as a fraction of WhiteLevel) where the DNG recovery
-/// path's baked highlight shoulder starts — below it the raster is
-/// strictly linear. Tunable via `X3F_DNG_SHOULDER_KNEE`, clamped to
-/// [0.5, 0.99]. Stateless: reads the env on every call so the writer
-/// (x3f-core) and the shoulder pass here can't disagree.
 fn dng_shoulder_knee() -> f64 {
-    let mut knee = 0.85_f64;
-    if let Some(v) = env_atof("X3F_DNG_SHOULDER_KNEE") {
-        knee = v;
-    }
-    knee.clamp(0.5, 0.99)
+    env_atof("X3F_DNG_SHOULDER_KNEE")
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.85)
+        .clamp(0.5, 0.99)
 }
 
-/// FFI accessor for [`dng_shoulder_knee`] — the DNG writer publishes it
-/// as `LinearResponseLimit` when highlight recovery ran, telling DNG
-/// readers the top of the encoding range is no longer scene-linear.
 #[no_mangle]
 pub unsafe extern "C" fn x3f_get_dng_shoulder_knee() -> f64 {
     dng_shoulder_knee()
 }
 
-/// The baked highlight shoulder: maps a luminance `lum` in
-/// `(knee, global_max]` into `(knee, 1.0]` with the power soft clip
-/// `g(t) = 1 - (1 - t/s)^s` on the normalized overshoot
-/// `t = (lum - knee)/(1 - knee)`, where
-/// `s = (global_max - knee)/(1 - knee)` is the normalized overshoot
-/// ceiling. Properties (see the unit tests): identity when
-/// `global_max == 1` (`s == 1` ⇒ `g(t) = t`), slope 1 at the knee
-/// (`g'(0) = 1`, so the curve is C1 against the linear segment below),
-/// monotone, and `g(s) = 1` (the brightest recovered pixel lands
-/// exactly on WhiteLevel).
+/// C1 soft compression used only by the explicitly selected shoulder mode.
 #[inline]
 fn shoulder_compress(lum: f64, knee: f64, shoulder_s: f64) -> f64 {
     let t = (lum - knee) / (1.0 - knee);
@@ -2457,27 +2506,28 @@ fn shoulder_compress(lum: f64, knee: f64, shoulder_s: f64) -> f64 {
     knee + (1.0 - knee) * compressed
 }
 
-/// Toggle the DNG-path highlight-recovery pipeline. See
-/// `DNG_HIGHLIGHT_RECOVERY` for the on/off behaviour.
 #[no_mangle]
 pub unsafe extern "C" fn x3f_set_dng_highlight_recovery(enabled: libc::c_int) {
     DNG_HIGHLIGHT_RECOVERY.with(|c| c.set(enabled != 0));
 }
 
-/// Toggle the Cineon-log TIFF processing mode. See `CINEON` for the on/off
-/// behaviour.
+/// Additive ABI: 0 selects linear headroom, 1 selects a baked shoulder.
+#[no_mangle]
+pub unsafe extern "C" fn x3f_set_dng_highlight_mapping(mapping: libc::c_int) {
+    DNG_HIGHLIGHT_MAPPING.with(|c| {
+        c.set(if mapping == 1 {
+            DngMapping::Shoulder
+        } else {
+            DngMapping::Linear
+        })
+    });
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn x3f_set_cineon(enabled: libc::c_int) {
     CINEON.with(|c| c.set(enabled != 0));
 }
 
-const DNG_LUTSIZE: libc::c_int = LUTSIZE; // mirrors the C #define LUTSIZE 1024
-
-// M7a — per-row context for the parallel DNG-path body. Same
-// Send + Sync contract as ConvCtx; differs in that the DNG path
-// always applies sgain (no `apply_sgain` toggle) and bakes sg
-// into raw rather than going through the gamma LUT, so it has no
-// `lut`/`ev_scale` fields.
 #[derive(Copy, Clone)]
 struct DngCtx {
     sgain: *mut x3f_spatial_gain_corr_t,
@@ -2497,169 +2547,293 @@ struct DngCtx {
     rows: i32,
     cols: i32,
     channels: usize,
-    /// Per-conversion DNG highlight-recovery toggle (snapshot of the
-    /// `DNG_HIGHLIGHT_RECOVERY` thread-local taken at the entry to
-    /// `apply_highlight_clip_dng`).
     recovery: bool,
 }
 
+// All pointed-to tables are immutable for the lifetime of both row passes.
 unsafe impl Send for DngCtx {}
 unsafe impl Sync for DngCtx {}
 
-#[inline(always)]
-unsafe fn dng_clip_row(
+/// Both encoding passes evaluate the same original pixel against the same
+/// frozen model. No neighboring raster access, environment reads, or model
+/// updates are allowed here, so the second pass can write rows in place.
+#[inline]
+unsafe fn dng_evaluate_pixel(
     ctx: &DngCtx,
-    row: i32,
-    row_data: &mut [u16],
+    local: Option<&LocalRecovery>,
+    row: usize,
+    col: usize,
+    pixel: &[u16],
     stats: *mut chroma_lut_apply_stats_t,
-) {
-    // M7d — see convert_row above. The conv_matrix view is hoisted out
-    // of the per-pixel loop so the matrix-pathology preview becomes an
-    // inlinable native FMA chain instead of an extern "C" call.
-    let m: &[f64; 9] = unsafe { &*(ctx.conv_matrix as *const [f64; 9]) };
-
-    for col in 0..ctx.cols {
-        let off = col as usize * ctx.channels;
-
-        let mut sat_ratio = [0.0_f64; 3];
-        let mut sg = [0.0_f64; 3];
-        for color in 0..3 {
-            let v = row_data[off + color] as f64;
-            sat_ratio[color] =
-                (v - ctx.black[color]) / (ctx.white[color] as f64 - ctx.black[color]);
-            sg[color] = unsafe {
-                x3f_calc_spatial_gain(
-                    ctx.sgain,
-                    ctx.sgain_num,
-                    row,
-                    col,
-                    color as i32,
-                    ctx.rows,
-                    ctx.cols,
-                )
-            };
-        }
-
-        // CLUT or L*p fallback. (DNG path uses bare sat_ratio in
-        // the chroma gate — no per-pixel sg — because sg gets
-        // baked into the raw output further down. The matrix-
-        // pathology preview below DOES include sg.)
-        // Recovery is per-pixel gated on `ctx.recovery` so the cost
-        // of dispatching is paid once per row when off, and the
-        // matrix-pathology preview block below matches the same gate.
-        // M8 — the DNG path uses the generalized BMT apply (T repair
-        // first, then the B-/M-clipped identities) so single-clipped-
-        // channel pixels keep scene chroma instead of neutral-snapping.
-        // The TIFF/PPM path (convert_row) keeps the original T-only
-        // `chroma_lut_apply_pixel` — its output is MD5-pinned.
-        let clut_applied = if ctx.recovery && ctx.use_clut {
-            unsafe { chroma_lut_apply_pixel_bmt(sat_ratio.as_mut_ptr(), ctx.clut, stats) }
+) -> [f64; 3] {
+    let m = unsafe { &*(ctx.conv_matrix as *const [f64; 9]) };
+    let prior = unsafe { &*(ctx.prior as *const [f64; 3]) };
+    let original: [f64; 3] = std::array::from_fn(|c| {
+        (pixel[c] as f64 - ctx.black[c]) / (ctx.white[c] as f64 - ctx.black[c])
+    });
+    let sg: [f64; 3] = std::array::from_fn(|c| unsafe {
+        x3f_calc_spatial_gain(
+            ctx.sgain,
+            ctx.sgain_num,
+            row as i32,
+            col as i32,
+            c as i32,
+            ctx.rows,
+            ctx.cols,
+        )
+    });
+    let mut samples = original;
+    let mut confident = false;
+    let mut damaged = true;
+    let mut mask = [0; 3];
+    let local_prior = std::array::from_fn(|c| {
+        if sg[c].is_finite() && sg[c] > 0.0 {
+            prior[c] / sg[c]
         } else {
-            0
-        };
-        if ctx.recovery && (!ctx.use_clut || clut_applied == 0) {
-            unsafe {
-                reconstruct_highlights(sat_ratio.as_mut_ptr(), ctx.prior, ctx.hp);
-            }
+            prior[c]
         }
-
-        if ctx.recovery && ctx.use_repair {
-            unsafe {
-                repair_pix_apply_pixel(
-                    sat_ratio.as_mut_ptr(),
-                    ctx.prior,
-                    ctx.repair,
-                    ctx.sat_map,
-                    row,
-                    col,
-                    ctx.rows,
-                    ctx.cols,
-                );
-            }
-        }
-
-        // Matrix-pathology preview (with sg) — same as convert_data.
-        // Gated together with the rest of the recovery pipeline.
-        if ctx.recovery {
-            let mp_in = [
-                sg[0] * sat_ratio[0],
-                sg[1] * sat_ratio[1],
-                sg[2] * sat_ratio[2],
-            ];
-            let mp = mat3x1_mul_native(m, mp_in);
-            let margin_g = mp[1] - if mp[0] > mp[2] { mp[0] } else { mp[2] };
-            let margin_y = if mp[0] < mp[1] { mp[0] } else { mp[1] } - mp[2];
-            let margin = if margin_g > margin_y {
-                margin_g
+    });
+    if ctx.recovery {
+        if let Some(model) = local {
+            let result = model.recover(row, col, samples, local_prior);
+            samples = result.samples;
+            confident = result.recovered;
+            damaged = result.damaged;
+            mask = model.mask(row, col);
+        } else {
+            // Quattro retains its existing reconstruction. Expanded B/M
+            // samples are not independent sensor measurements.
+            let applied = if ctx.use_clut {
+                unsafe { chroma_lut_apply_pixel_bmt(samples.as_mut_ptr(), ctx.clut, stats) }
             } else {
-                margin_y
+                0
             };
-            let mut strength = (margin - ctx.gate_thr) / ctx.gate_width;
-            if strength > 0.0 {
-                if strength > 1.0 {
-                    strength = 1.0;
+            if applied == 0 {
+                unsafe { reconstruct_highlights(samples.as_mut_ptr(), ctx.prior, ctx.hp) };
+            }
+        }
+        if !confident && damaged && (local.is_none() || mask.contains(&0)) {
+            let p = if local.is_some() { &local_prior } else { prior };
+            if ctx.use_repair {
+                unsafe {
+                    repair_pix_apply_pixel(
+                        samples.as_mut_ptr(),
+                        p.as_ptr(),
+                        ctx.repair,
+                        ctx.sat_map,
+                        row as i32,
+                        col as i32,
+                        ctx.rows,
+                        ctx.cols,
+                    );
                 }
-                let prior = unsafe { std::slice::from_raw_parts(ctx.prior, 3) };
-                let mut u_max = 0.0_f64;
-                for color in 0..3 {
-                    let pc = if prior[color] > 1e-12 {
-                        prior[color]
-                    } else {
-                        1e-12
-                    };
-                    let u = sat_ratio[color] / pc;
-                    if u > u_max {
-                        u_max = u;
+            }
+            let mp = mat3x1_mul_native(m, std::array::from_fn(|c| sg[c] * samples[c]));
+            let margin_g = mp[1] - mp[0].max(mp[2]);
+            let margin_y = mp[0].min(mp[1]) - mp[2];
+            let strength =
+                ((margin_g.max(margin_y) - ctx.gate_thr) / ctx.gate_width).clamp(0.0, 1.0);
+            if strength > 0.0 {
+                // Native recovery cannot let a clipped maximum replace the
+                // amplitude of a measured surviving layer.
+                let best = mask.into_iter().max().unwrap_or(0);
+                let has_survivor = local.is_some() && best > 0;
+                let mut amplitude = 0.0_f64;
+                for c in 0..3 {
+                    if !has_survivor || mask[c] == best {
+                        let measured = if has_survivor {
+                            original[c]
+                        } else {
+                            samples[c]
+                        };
+                        amplitude = amplitude.max(measured / p[c].max(1e-12));
                     }
                 }
-                for color in 0..3 {
-                    sat_ratio[color] =
-                        (1.0 - strength) * sat_ratio[color] + strength * (u_max * prior[color]);
+                for c in 0..3 {
+                    samples[c] = (1.0 - strength) * samples[c] + strength * amplitude * p[c];
                 }
             }
         }
+        if local.is_some() {
+            let best = mask.into_iter().max().unwrap_or(0);
+            for c in 0..3 {
+                if mask[c] == 255 || (best > 0 && mask[c] == best) {
+                    samples[c] = original[c];
+                } else {
+                    // A missing channel cannot be reconstructed below the
+                    // observed sample that established its lower bound.
+                    samples[c] = samples[c].max(original[c]);
+                }
+            }
+        }
+    }
+    let output = std::array::from_fn(|c| {
+        let value = sg[c] * samples[c];
+        if value.is_finite() {
+            value
+        } else {
+            let measured = sg[c] * original[c];
+            if measured.is_finite() {
+                measured
+            } else {
+                original[c]
+            }
+        }
+    });
+    if ctx.recovery && local.is_some() {
+        let measured = std::array::from_fn(|c| sg[c] * original[c]);
+        // Match the stabilizer's healthy-color passthrough without evaluating
+        // the legacy reference (and spatial gain) a second time. A healthy
+        // mask alone is insufficient: matrix-pathological colors still need
+        // the safeguard below, including apparently unclipped highlights.
+        if mask == [255; 3]
+            && mat3x1_mul_native(m, measured)
+                .into_iter()
+                .all(|value| value.is_finite() && value >= 0.0)
+        {
+            return measured;
+        }
+        // A small BMT ratio error can become a large visible hue error. Use
+        // the established recovery as a conservative color reference, while
+        // the original surviving layers supply intensity and fine detail.
+        let mut stable_ctx = *ctx;
+        stable_ctx.prior = local_prior.as_ptr();
+        let camera_model = local.filter(|model| model.has_camera_maps() && mask.contains(&0));
+        let camera_reference = camera_model.and_then(|model| {
+            let lut = if ctx.use_clut {
+                Some(unsafe { &*ctx.clut })
+            } else {
+                None
+            };
+            model.camera_reference(row, col, original, local_prior, lut)
+        });
+        // If there is no trustworthy survivor, retain the established
+        // fallback, but never let its numeric-only LUT treat a camera-flagged
+        // layer below the numeric rail as a healthy amplitude donor.
+        if camera_model.is_some() {
+            stable_ctx.use_clut = false;
+        }
+        let stable = if let Some(reference) = camera_reference {
+            std::array::from_fn(|c| sg[c] * reference[c])
+        } else {
+            unsafe { dng_evaluate_pixel(&stable_ctx, None, row, col, pixel, ptr::null_mut()) }
+        };
+        let color_mask = local.map_or(mask, |model| model.color_mask(row, col));
+        let stable = crate::highlight_recovery::protect_highlight_color(
+            stable,
+            measured,
+            color_mask,
+            *prior,
+            m,
+            ctx.gate_thr,
+            ctx.gate_width,
+        );
+        crate::highlight_recovery::stabilize_highlight_color(
+            output, stable, measured, color_mask, m,
+        )
+    } else {
+        output
+    }
+}
 
-        // Bake sg into the raw value written to DNG. Lightroom
-        // does not honour our GainMap opcode in practice, so
-        // baking sg into raw makes LR render the DNG identically
-        // to our TIFF (with the GainMap opcode then suppressed
-        // in the DNG writer to avoid double-application).
-        //
-        // When recovery is OFF we additionally apply a per-pixel
-        // uniform cap at `sat_ratio_after_sg = 1.0`: if any channel
-        // of `sg * sat_ratio` exceeds 1, scale all three by `1/max`
-        // so the pixel sits exactly on the sensor-native WhiteLevel
-        // cap. Chromaticity is preserved per-pixel; the raster is
-        // strictly within WhiteLevel; downstream renderers see a
-        // self-consistent DNG with no overshoot. When recovery is
-        // ON we let values overshoot here — the global_max scan +
-        // scale-down loop below pulls them back uniformly so the
-        // BE-compensated render preserves recovered highlights.
-        let v0 = sg[0] * sat_ratio[0];
-        let v1 = sg[1] * sat_ratio[1];
-        let v2 = sg[2] * sat_ratio[2];
-        let cap_scale = if !ctx.recovery {
-            let pixel_max = v0.max(v1).max(v2);
-            if pixel_max > 1.0 {
-                1.0 / pixel_max
+#[inline]
+fn encode_dng_recovered(
+    samples: [f64; 3],
+    maximum: f64,
+    mapping: DngMapping,
+    knee: f64,
+) -> [u16; 3] {
+    let scale = match mapping {
+        DngMapping::Linear => 1.0 / maximum,
+        DngMapping::Shoulder => {
+            let lum = samples.into_iter().fold(0.0_f64, f64::max);
+            if maximum > 1.0 && lum > knee {
+                shoulder_compress(lum, knee, (maximum - knee) / (1.0 - knee)) / lum
             } else {
                 1.0
             }
+        }
+    };
+    samples.map(|v| (v * scale * 65535.0).round().clamp(0.0, 65535.0) as u16)
+}
+
+/// Recovery-off encoding deliberately retains the original arithmetic and
+/// per-channel intermediate quantization for the byte-parity contract.
+unsafe fn dng_encode_off_row(ctx: &DngCtx, row: usize, data: &mut [u16]) {
+    for col in 0..ctx.cols as usize {
+        let off = col * ctx.channels;
+        let values = unsafe {
+            dng_evaluate_pixel(ctx, None, row, col, &data[off..off + 3], ptr::null_mut())
+        };
+        let pixel_max = values[0].max(values[1]).max(values[2]);
+        let scale = if pixel_max > 1.0 {
+            1.0 / pixel_max
         } else {
             1.0
         };
-        for (color, vc) in [v0, v1, v2].into_iter().enumerate() {
-            let range = ctx.white[color] as f64 - ctx.black[color];
-            let v = vc * cap_scale * range + ctx.black[color];
-            let out = v.round() as i32;
-            row_data[off + color] = if out < 0 {
-                0
-            } else if out > 65535 {
-                65535
-            } else {
-                out as u16
-            };
+        for c in 0..3 {
+            let range = ctx.white[c] as f64 - ctx.black[c];
+            let v = values[c] * scale * range + ctx.black[c];
+            data[off + c] = (v.round() as i32).clamp(0, 65535) as u16;
         }
+    }
+}
+
+unsafe fn dng_active_bounds(x3f: *mut x3f_t, image: &x3f_area16_t) -> [usize; 4] {
+    let all = [0, 0, image.rows as usize, image.columns as usize];
+    let stride = image.row_stride as usize;
+    let channels = image.channels as usize;
+    if image.data.is_null() || stride == 0 || channels == 0 {
+        return all;
+    }
+    let mut top: x3f_area16_t = unsafe { std::mem::zeroed() };
+    let quattro = unsafe { x3f_image_area_qtop(x3f, &mut top) } != 0;
+    let mut source = *image;
+    let mut active: x3f_area16_t = unsafe { std::mem::zeroed() };
+    if unsafe {
+        x3f_crop_area_camf(
+            x3f,
+            c"ActiveImageArea".as_ptr() as *mut _,
+            &mut source,
+            (!quattro) as i32,
+            &mut active,
+        )
+    } == 0
+    {
+        return all;
+    }
+    // The CAMF wrapper can report success after an unsuccessful inner crop.
+    // Validate the returned view before any pointer or stride arithmetic.
+    if active.data.is_null()
+        || active.row_stride != image.row_stride
+        || active.channels != image.channels
+    {
+        return all;
+    }
+    let Some(byte_offset) = (active.data as usize).checked_sub(image.data as usize) else {
+        return all;
+    };
+    let sample_size = std::mem::size_of::<u16>();
+    if byte_offset % sample_size != 0 {
+        return all;
+    }
+    let offset = byte_offset / sample_size;
+    let row = offset / stride;
+    let col_offset = offset % stride;
+    if col_offset % channels != 0 {
+        return all;
+    }
+    let col = col_offset / channels;
+    let Some(bottom) = row.checked_add(active.rows as usize) else {
+        return all;
+    };
+    let Some(right) = col.checked_add(active.columns as usize) else {
+        return all;
+    };
+    if bottom > all[2] || right > all[3] || bottom <= row || right <= col {
+        all
+    } else {
+        [row, col, bottom, right]
     }
 }
 
@@ -2670,23 +2844,64 @@ pub unsafe extern "C" fn apply_highlight_clip_dng(
     ilevels: *mut x3f_image_levels_t,
     wb: *mut libc::c_char,
 ) {
-    let img = unsafe { &mut *image };
-    if img.channels < 3 {
+    let recovery = DNG_HIGHLIGHT_RECOVERY.with(|c| c.get());
+    let mapping = DNG_HIGHLIGHT_MAPPING.with(|c| c.get());
+    unsafe {
+        apply_highlight_clip_dng_impl(x3f, image, ilevels, wb, None, recovery, mapping, false)
+    };
+}
+
+unsafe fn apply_highlight_clip_dng_impl(
+    x3f: *mut x3f_t,
+    image: *mut x3f_area16_t,
+    ilevels: *mut x3f_image_levels_t,
+    wb: *mut libc::c_char,
+    provenance: Option<SensorReliability>,
+    recovery: bool,
+    mapping: DngMapping,
+    already_cropped: bool,
+) {
+    DNG_HIGHLIGHT_SCALE.with(|c| c.set(1.0));
+    DNG_SHOULDER_CEILING.with(|c| c.set(1.0));
+    if image.is_null() || ilevels.is_null() {
         return;
     }
-
-    // Matrix-derived prior + matrix-pathology preview both need
-    // conv_matrix; build it via the sRGB path. The prior direction
-    // is independent of the output xyz_to_rgb as long as the white
-    // point matches (sRGB and raw_to_xyz are both D65).
+    let img = unsafe { &mut *image };
+    let il = unsafe { &mut *ilevels };
+    if img.data.is_null()
+        || img.channels < 3
+        || img.rows == 0
+        || img.columns == 0
+        || (0..3).any(|c| !il.black[c].is_finite() || il.white[c] as f64 <= il.black[c])
+    {
+        return;
+    }
+    let stride = img.row_stride as usize;
+    let channels = img.channels as usize;
+    let cols = img.columns as usize;
+    let rows = img.rows as usize;
+    let Some(row_len) = cols.checked_mul(channels) else {
+        return;
+    };
+    if stride < row_len {
+        return;
+    }
+    // Cropped views need not own padding after their final visible row.
+    let Some(total) = (rows - 1)
+        .checked_mul(stride)
+        .and_then(|length| length.checked_add(row_len))
+        .filter(|length| *length <= isize::MAX as usize / std::mem::size_of::<u16>())
+    else {
+        return;
+    };
     let mut conv_matrix = [0.0_f64; 9];
-    let mut lut_dummy = [0.0_f64; DNG_LUTSIZE as usize];
+    let mut lut_dummy = [0.0_f64; LUTSIZE as usize];
     if unsafe {
         get_conv(
             x3f,
             x3f_color_encoding_e_SRGB,
             wb,
-            DNG_LUTSIZE,
+            LUTSIZE,
             65535,
             lut_dummy.as_mut_ptr(),
             conv_matrix.as_mut_ptr(),
@@ -2696,63 +2911,71 @@ pub unsafe extern "C" fn apply_highlight_clip_dng(
         return;
     }
 
-    // Spatial gain — same as convert_data uses. We don't bake sg
-    // into DNG raw values (Adobe applies via OpcodeList2 GainMap;
-    // disabled in our writer per the comment block below). But sg
-    // IS applied to the matrix-pathology preview so the gate
-    // predicts the same chromaticity Adobe will see post-shading.
     let mut sgain: [x3f_spatial_gain_corr_t; MAX_CORR] = unsafe { std::mem::zeroed() };
     let sgain_num = unsafe { x3f_get_spatial_gain(x3f, wb, sgain.as_mut_ptr()) };
-
     let mut hp: highlight_params_t = unsafe { std::mem::zeroed() };
-    let mut prior = [0.0_f64; 3];
+    let mut prior = [0.0; 3];
     unsafe {
         get_highlight_params(x3f, &mut hp);
         compute_chroma_prior(conv_matrix.as_ptr(), prior.as_mut_ptr());
     }
+    let no_chroma = env_present("X3F_NO_CHROMA_LUT");
+    let cap = env_atof("X3F_CHROMA_LUT_CAP").filter(|v| v.is_finite() && *v > 0.0);
+    let mut local = provenance.and_then(|mask| {
+        if mask.rows != rows || mask.cols != cols {
+            return None;
+        }
+        let source = unsafe { std::slice::from_raw_parts(img.data, total) };
+        LocalRecovery::build(
+            mask,
+            |row, col| {
+                let off = row * stride + col * channels;
+                std::array::from_fn(|c| {
+                    (source[off + c] as f64 - il.black[c]) / (il.white[c] as f64 - il.black[c])
+                })
+            },
+            cap,
+        )
+    });
+    if let Some(model) = local.as_mut() {
+        model.set_chroma_enabled(!no_chroma);
+    }
 
     let mut clut: chroma_lut_t = unsafe { std::mem::zeroed() };
-    let mut use_clut = !env_present("X3F_NO_CHROMA_LUT");
+    let mut use_clut = recovery && !no_chroma;
     if use_clut {
         unsafe { chroma_lut_init_defaults(&mut clut) };
-        if unsafe { chroma_lut_build_from_image(&mut clut, img, ilevels, prior.as_ptr()) } == 0 {
-            use_clut = false;
-        }
+        let source_mask = local.as_ref().filter(|model| model.has_camera_maps());
+        use_clut = unsafe {
+            crate::highlight::chroma_lut_build_from_image_masked(
+                &mut clut,
+                img,
+                il,
+                prior.as_ptr(),
+                source_mask,
+            )
+        } != 0;
     }
-    let mut clut_stats: chroma_lut_apply_stats_t = unsafe { std::mem::zeroed() };
-    let trace_clut = env_present("X3F_CHROMA_LUT_TRACE");
-
+    let mut stats: chroma_lut_apply_stats_t = unsafe { std::mem::zeroed() };
+    let trace = env_present("X3F_CHROMA_LUT_TRACE");
     let mut repair: repair_pix_t = unsafe { std::mem::zeroed() };
-    let mut sat_map: *mut u8 = ptr::null_mut();
-    let mut use_repair = env_present("X3F_REPAIR_PIX");
+    let mut sat_map = ptr::null_mut();
+    let mut use_repair = recovery && env_present("X3F_REPAIR_PIX");
     if use_repair {
         unsafe { repair_pix_init_defaults(&mut repair) };
-        sat_map = unsafe { build_sat_map(img, ilevels, repair.sat_threshold) };
-        if sat_map.is_null() {
-            use_repair = false;
-        } else {
-            repair.valid = 1;
-        }
+        sat_map = unsafe { build_sat_map(img, il, repair.sat_threshold) };
+        use_repair = !sat_map.is_null();
+        repair.valid = use_repair as i32;
     }
-
-    let mut gate_thr = 0.20_f64;
-    let mut gate_width = 0.30_f64;
-    if let Some(v) = env_atof("X3F_GATE_THR") {
-        gate_thr = v;
-    }
-    if let Some(v) = env_atof("X3F_GATE_WIDTH") {
-        gate_width = v;
-    }
-    if gate_width < 1e-6 {
-        gate_width = 1e-6;
-    }
-
-    let row_stride = img.row_stride as usize;
-    let channels = img.channels as usize;
-    let il = unsafe { &mut *ilevels };
-
-    let recovery = DNG_HIGHLIGHT_RECOVERY.with(|c| c.get());
-    let dctx = DngCtx {
+    let gate_thr = env_atof("X3F_GATE_THR")
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.20);
+    let gate_width = env_atof("X3F_GATE_WIDTH")
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.30)
+        .max(1e-6);
+    let knee = dng_shoulder_knee();
+    let ctx = DngCtx {
         sgain: sgain.as_mut_ptr(),
         sgain_num,
         conv_matrix: conv_matrix.as_mut_ptr(),
@@ -2767,152 +2990,236 @@ pub unsafe extern "C" fn apply_highlight_clip_dng(
         gate_width,
         black: il.black,
         white: il.white,
-        rows: img.rows as i32,
-        cols: img.columns as i32,
+        rows: rows as i32,
+        cols: cols as i32,
         channels,
         recovery,
     };
-
-    let total_u16 = (img.rows as usize) * row_stride;
-    let data = unsafe { std::slice::from_raw_parts_mut(img.data, total_u16) };
-
-    // Pass 1: per-pixel highlight recovery + bake sg into raw.
-    if trace_clut {
-        let stats_ptr = &mut clut_stats as *mut _;
-        for (row, row_data) in data.chunks_mut(row_stride).enumerate() {
-            unsafe { dng_clip_row(&dctx, row as i32, row_data, stats_ptr) };
-        }
+    let bounds = if already_cropped {
+        [0, 0, rows, cols]
     } else {
-        use rayon::prelude::*;
-        data.par_chunks_mut(row_stride)
-            .enumerate()
-            .for_each(|(row, row_data)| {
-                unsafe { dng_clip_row(&dctx, row as i32, row_data, ptr::null_mut()) };
+        unsafe { dng_active_bounds(x3f, img) }
+    };
+    let data = unsafe { std::slice::from_raw_parts_mut(img.data, total) };
+    if trace && recovery {
+        for (row, col) in [
+            (rows / 20, cols / 2),
+            (rows / 3, cols / 2),
+            (rows / 2, cols * 9 / 10),
+        ] {
+            let off = row * stride + col * channels;
+            let source: [f64; 3] = std::array::from_fn(|c| {
+                (data[off + c] as f64 - ctx.black[c]) / (ctx.white[c] as f64 - ctx.black[c])
             });
+            let gain: [f64; 3] = std::array::from_fn(|c| unsafe {
+                x3f_calc_spatial_gain(
+                    ctx.sgain,
+                    ctx.sgain_num,
+                    row as i32,
+                    col as i32,
+                    c as i32,
+                    ctx.rows,
+                    ctx.cols,
+                )
+            });
+            let native = local.as_ref().map(|model| {
+                model.recover(
+                    row,
+                    col,
+                    source,
+                    std::array::from_fn(|c| prior[c] / gain[c]),
+                )
+            });
+            let output = unsafe {
+                dng_evaluate_pixel(
+                    &ctx,
+                    local.as_ref(),
+                    row,
+                    col,
+                    &data[off..off + 3],
+                    ptr::null_mut(),
+                )
+            };
+            eprintln!("DNG sample ({row},{col}): source={source:?} mask={:?} gain={gain:?} native={native:?} rgb_before={:?} rgb_after={:?}",
+                local.as_ref().map(|m| m.mask(row, col)),
+                mat3x1_mul_native(&conv_matrix, std::array::from_fn(|c| source[c] * gain[c])),
+                mat3x1_mul_native(&conv_matrix, output));
+        }
     }
-
-    // Pass 2 + Pass 3 only run when recovery is ON. With recovery OFF,
-    // Pass 1 already capped each pixel at sat_ratio ≤ 1 via the
-    // per-pixel uniform cap, so the raster is strictly within
-    // sensor-native WhiteLevel.
-    //
-    // With recovery ON, recovered pixels overshoot WhiteLevel. An
-    // earlier design divided the whole raster down by the global max
-    // and published `log2(global_max)` as a BaselineExposure nudge for
-    // the renderer to undo — but BaselineExposure is an *optional* hint
-    // in the DNG spec (readers "should" vary their zero point, not
-    // "must"), and renderers that ignore it (Capture One among them)
-    // rendered the file several stops dark. Instead, Pass 3 now bakes a
-    // soft highlight shoulder into the raster itself: pixel luminance
-    // (max-channel sat_ratio) below the knee is untouched; the
-    // [knee, global_max] range is compressed into [knee, 1.0] with the
-    // C1-continuous soft clip
-    //
-    //   L' = knee + (1-knee) * (1 - (1 - t/s)^s),
-    //   t  = (L - knee)/(1 - knee),  s = (global_max - knee)/(1 - knee)
-    //
-    // (slope 1 at the knee; identity when global_max == 1). All three
-    // channels scale by L'/L, so per-pixel chromaticity — including the
-    // recovered chroma — survives the renderer's white balance and
-    // matrix exactly. The result is self-consistent for *every* DNG
-    // reader: nothing exceeds WhiteLevel and no optional tag needs to
-    // be honoured. This mirrors what Sigma Photo Pro itself does —
-    // recovered highlights are tone-mapped into display range, not
-    // shipped as scene-linear overrange.
-    let mut global_max = 1.0_f64;
+    let mut maximum = 1.0_f64;
+    use rayon::prelude::*;
     if recovery {
-        global_max = {
-            use rayon::prelude::*;
-            let black = il.black;
-            let white = il.white;
-            let cols = img.columns as usize;
-            data.par_chunks(row_stride)
-                .map(|row_data| {
-                    let mut m = 1.0_f64;
-                    for col in 0..cols {
-                        let off = col * channels;
-                        for color in 0..3 {
-                            let v = row_data[off + color] as f64;
-                            let range = white[color] as f64 - black[color];
-                            let sr = (v - black[color]) / range;
-                            if sr > m {
-                                m = sr;
-                            }
-                        }
-                    }
-                    m
-                })
-                .reduce(|| 1.0_f64, f64::max)
-        };
-        if global_max > 1.0 {
-            use rayon::prelude::*;
-            let knee = dng_shoulder_knee();
-            let shoulder_s = (global_max - knee) / (1.0 - knee);
-            let black = il.black;
-            let white = il.white;
-            let cols = img.columns as usize;
-            data.par_chunks_mut(row_stride).for_each(|row_data| {
-                for col in 0..cols {
-                    let off = col * channels;
-                    let mut sr = [0.0_f64; 3];
-                    let mut lum = 0.0_f64;
-                    for color in 0..3 {
-                        let v = row_data[off + color] as f64;
-                        let range = white[color] as f64 - black[color];
-                        sr[color] = (v - black[color]) / range;
-                        if sr[color] > lum {
-                            lum = sr[color];
-                        }
-                    }
-                    if lum <= knee {
-                        continue;
-                    }
-                    let scale = shoulder_compress(lum, knee, shoulder_s) / lum;
-                    for color in 0..3 {
-                        let range = white[color] as f64 - black[color];
-                        let out = (sr[color] * scale * range + black[color]).round() as i32;
-                        row_data[off + color] = if out < 0 {
-                            0
-                        } else if out > 65535 {
-                            65535
-                        } else {
-                            out as u16
-                        };
+        let evaluate_row = |row: usize, data: &[u16], stats: *mut chroma_lut_apply_stats_t| {
+            let mut maximum = 1.0_f64;
+            if row < bounds[0] || row >= bounds[2] {
+                return maximum;
+            }
+            for col in bounds[1]..bounds[3] {
+                let off = col * channels;
+                let values = unsafe {
+                    dng_evaluate_pixel(&ctx, local.as_ref(), row, col, &data[off..off + 3], stats)
+                };
+                for value in values {
+                    if value.is_finite() {
+                        maximum = maximum.max(value);
                     }
                 }
+            }
+            maximum
+        };
+        maximum = if trace {
+            data.chunks(stride)
+                .enumerate()
+                .fold(1.0_f64, |m, (row, data)| {
+                    m.max(evaluate_row(row, data, &mut stats))
+                })
+        } else {
+            data.par_chunks(stride)
+                .enumerate()
+                .map(|(row, data)| evaluate_row(row, data, ptr::null_mut()))
+                .reduce(|| 1.0, f64::max)
+        };
+        maximum = maximum.clamp(1.0, DNG_MAX_HEADROOM);
+        data.par_chunks_mut(stride)
+            .enumerate()
+            .for_each(|(row, data)| {
+                for col in 0..cols {
+                    let off = col * channels;
+                    if row < bounds[0] || row >= bounds[2] || col < bounds[1] || col >= bounds[3] {
+                        // Masked borders do not participate in recovery or
+                        // exposure selection. Encode them explicitly as black
+                        // rather than silently clipping unscanned values.
+                        data[off..off + channels].fill(0);
+                        continue;
+                    }
+                    let values = unsafe {
+                        dng_evaluate_pixel(
+                            &ctx,
+                            local.as_ref(),
+                            row,
+                            col,
+                            &data[off..off + 3],
+                            ptr::null_mut(),
+                        )
+                    };
+                    let encoded = encode_dng_recovered(values, maximum, mapping, knee);
+                    data[off..off + 3].copy_from_slice(&encoded);
+                }
             });
-        }
+        il.black = [0.0; 3];
+        il.white = [65535; 3];
+    } else {
+        data.par_chunks_mut(stride)
+            .enumerate()
+            .for_each(|(row, data)| {
+                unsafe { dng_encode_off_row(&ctx, row, data) };
+            });
     }
-
     unsafe { x3f_cleanup_spatial_gain(sgain.as_mut_ptr(), sgain_num) };
     if !sat_map.is_null() {
         unsafe { libc::free(sat_map as *mut libc::c_void) };
     }
-    if trace_clut {
-        unsafe { chroma_lut_apply_stats_print(&clut_stats, c"dng".as_ptr()) };
+    if trace {
+        if local.is_none() {
+            unsafe { chroma_lut_apply_stats_print(&stats, c"dng".as_ptr()) };
+        }
+        eprintln!(
+            "DNG recovery: local={}, mapping={mapping:?}, headroom={maximum:.6}",
+            local.is_some()
+        );
+    }
+    // Publish last, after all nested Rayon joins, and snapshot immediately in
+    // x3f-core. A different file can run on this thread while a pass is joined.
+    DNG_HIGHLIGHT_SCALE.with(|c| {
+        c.set(if recovery && mapping == DngMapping::Linear {
+            maximum
+        } else {
+            1.0
+        })
+    });
+    DNG_SHOULDER_CEILING.with(|c| {
+        c.set(if recovery && mapping == DngMapping::Shoulder {
+            maximum
+        } else {
+            1.0
+        })
+    });
+}
+
+fn crop_reliability(
+    mask: SensorReliability,
+    source: &x3f_area16_t,
+    image: &x3f_area16_t,
+) -> Option<SensorReliability> {
+    let camera_map_channels = mask.camera_map_channels;
+    let mut cropped = crop_reliability_view(mask, source, image)?;
+    cropped.camera_map_channels = camera_map_channels;
+    Some(cropped)
+}
+
+fn crop_reliability_view(
+    mask: SensorReliability,
+    source: &x3f_area16_t,
+    image: &x3f_area16_t,
+) -> Option<SensorReliability> {
+    if source.data == image.data
+        && mask.rows == image.rows as usize
+        && mask.cols == image.columns as usize
+    {
+        return Some(mask);
+    }
+    let offset = unsafe { image.data.offset_from(source.data) };
+    if offset < 0 || source.row_stride == 0 || source.channels == 0 {
+        return None;
+    }
+    let row = offset as usize / source.row_stride as usize;
+    let col = (offset as usize % source.row_stride as usize) / source.channels as usize;
+    let rows = image.rows as usize;
+    let cols = image.columns as usize;
+    if row + rows > mask.rows || col + cols > mask.cols {
+        return None;
+    }
+    let mut cropped = SensorReliability::new(rows, cols, mask.noise)?;
+    for r in 0..rows {
+        cropped.data[r * cols..(r + 1) * cols].copy_from_slice(
+            &mask.data[(row + r) * mask.cols + col..(row + r) * mask.cols + col + cols],
+        );
+    }
+    Some(cropped)
+}
+
+#[cfg(test)]
+mod dng_recovery_encoding_tests {
+    use super::{encode_dng_recovered, DngMapping};
+
+    #[test]
+    fn linear_encoding_retains_detail_above_legacy_caps() {
+        let levels = [1.5, 1.75, 2.0, 4.0, 8.0, 12.0];
+        let mut previous = 0;
+        for value in levels {
+            let pixel = encode_dng_recovered(
+                [value, value * 0.5, value * 0.25],
+                12.0,
+                DngMapping::Linear,
+                0.85,
+            );
+            assert!(pixel[0] > previous);
+            for (encoded, expected) in pixel.into_iter().zip([value, value * 0.5, value * 0.25]) {
+                assert!(
+                    (encoded as f64 * 12.0 / 65535.0 - expected).abs() <= 6.0 / 65535.0 + 1e-12
+                );
+            }
+            previous = pixel[0];
+        }
     }
 
-    // Publish the highlight scale on this thread *last*. Any nested
-    // rayon (the par_chunks_mut above) could have work-stolen another
-    // file's apply_highlight_clip_dng onto this thread, clobbering the
-    // cell mid-stream — so we set after Pass 3 (and after every other
-    // op that could re-enter rayon) to guarantee that the last write
-    // on T's cell from this stack frame is *this* file's value. See
-    // x3f-core::image::Reader::get_image which snapshots the cell
-    // immediately after this returns.
-    //
-    // Since the shoulder bake (Pass 3) the raster always fits within
-    // sensor-native WhiteLevel, so this is always 1.0 — the writer
-    // emits BE = log2(captureISO/sensorISO) only, with no renderer-
-    // dependent compensation. The cell + plumbing are kept so the
-    // writer-side contract (`Image::dng_highlight_scale`) is unchanged.
-    DNG_HIGHLIGHT_SCALE.with(|c| c.set(1.0));
-    // The shoulder ceiling tells the writer whether Pass 3 actually
-    // bent the top of the range (global_max > 1.0): only then does
-    // LinearResponseLimit drop from 1.0 to the knee. `recovery` off
-    // never bakes a shoulder, so publish 1.0 there regardless of what
-    // the (skipped) Pass 2 scan would have found.
-    DNG_SHOULDER_CEILING.with(|c| c.set(if recovery { global_max } else { 1.0 }));
+    #[test]
+    fn shoulder_preserves_uncompressed_midtones_and_ratios() {
+        let low = encode_dng_recovered([0.4, 0.2, 0.1], 4.0, DngMapping::Shoulder, 0.85);
+        assert_eq!(low, [26214, 13107, 6554]);
+        let high = encode_dng_recovered([4.0, 2.0, 1.0], 4.0, DngMapping::Shoulder, 0.85);
+        assert_eq!(high, [65535, 32768, 16384]);
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -2931,6 +3238,13 @@ pub unsafe extern "C" fn x3f_get_image(
     apply_sgain: libc::c_int,
     mut wb: *mut libc::c_char,
 ) -> libc::c_int {
+    // Snapshot options before preprocessing or denoise can yield this Rayon
+    // worker to another conversion with different thread-local settings.
+    let dng_recovery = DNG_HIGHLIGHT_RECOVERY.with(|c| c.get());
+    let dng_mapping = DNG_HIGHLIGHT_MAPPING.with(|c| c.get());
+    let cineon = CINEON.with(|c| c.get());
+    DNG_HIGHLIGHT_SCALE.with(|c| c.set(1.0));
+    DNG_SHOULDER_CEILING.with(|c| c.set(1.0));
     if wb.is_null() {
         wb = unsafe { x3f_get_wb(x3f) };
     }
@@ -2979,7 +3293,18 @@ pub unsafe extern "C" fn x3f_get_image(
     }
 
     let mut il: x3f_image_levels_t = unsafe { std::mem::zeroed() };
-    if unsafe { preprocess_data(x3f, fix_bad, wb, &mut il) } == 0 {
+    let mut provenance = None;
+    let capture = dng_recovery && encoding == x3f_color_encoding_e_NONE && !cineon;
+    if unsafe {
+        preprocess_data_impl(
+            x3f,
+            fix_bad,
+            wb,
+            &mut il,
+            if capture { Some(&mut provenance) } else { None },
+        )
+    } == 0
+    {
         return 0;
     }
 
@@ -3007,13 +3332,32 @@ pub unsafe extern "C" fn x3f_get_image(
     }
 
     // `apply_highlight_clip_dng` is the DNG path's clip-curve renderer.
-    // Cineon-log callers using `-color none` (camera-native log) want
-    // the log curve baked into raw BMT samples without the DNG tone
-    // curve fighting it — skip it for them, just like the Quattro
-    // branch already does.
-    let cineon = CINEON.with(|c| c.get());
-    if encoding == x3f_color_encoding_e_NONE && !is_quattro && !cineon {
-        unsafe { apply_highlight_clip_dng(x3f, image, &mut il, wb) };
+    // Quattro must also run this pass when recovery is requested; its
+    // expanded BMT raster uses the same normalized camera coordinates.
+    // Keep its recovery-off path unchanged, including spatial gain.
+    // Cineon-log callers using `-color none` need the log curve without
+    // the DNG highlight pass.
+    let applied_dng =
+        encoding == x3f_color_encoding_e_NONE && !cineon && (!is_quattro || dng_recovery);
+    if applied_dng {
+        let current = unsafe { &*image };
+        let already_cropped = current.data != original_image.data
+            || current.rows != original_image.rows
+            || current.columns != original_image.columns;
+        let provenance =
+            provenance.and_then(|mask| crop_reliability(mask, &original_image, unsafe { &*image }));
+        unsafe {
+            apply_highlight_clip_dng_impl(
+                x3f,
+                image,
+                &mut il,
+                wb,
+                provenance,
+                dng_recovery,
+                dng_mapping,
+                already_cropped,
+            )
+        };
     }
 
     if encoding != x3f_color_encoding_e_NONE
@@ -3026,6 +3370,12 @@ pub unsafe extern "C" fn x3f_get_image(
 
     if !ilevels.is_null() {
         unsafe { *ilevels = il };
+    }
+    if !applied_dng {
+        // Nested conversions can publish another image's metadata while this
+        // worker joins. Outputs without DNG recovery have no encoding scale.
+        DNG_HIGHLIGHT_SCALE.with(|c| c.set(1.0));
+        DNG_SHOULDER_CEILING.with(|c| c.set(1.0));
     }
     1
 }
@@ -3040,6 +3390,34 @@ pub unsafe extern "C" fn x3f_get_preview(
     wb: *mut libc::c_char,
     max_width: u32,
     preview: *mut x3f_area8_t,
+) -> libc::c_int {
+    unsafe {
+        x3f_get_preview_with_scale(
+            x3f,
+            image,
+            ilevels,
+            encoding,
+            apply_sgain,
+            wb,
+            max_width,
+            preview,
+            1.0,
+        )
+    }
+}
+
+/// Rust-only preview extension. Restore the image's linear encoding scale in
+/// floating point, before the display transform, without changing the C ABI.
+pub unsafe fn x3f_get_preview_with_scale(
+    x3f: *mut x3f_t,
+    image: *mut x3f_area16_t,
+    ilevels: *mut x3f_image_levels_t,
+    encoding: x3f_color_encoding_t,
+    apply_sgain: libc::c_int,
+    wb: *mut libc::c_char,
+    max_width: u32,
+    preview: *mut x3f_area8_t,
+    exposure_scale: f64,
 ) -> libc::c_int {
     let max_out: u16 = 255;
     let img = unsafe { &mut *image };
@@ -3124,7 +3502,8 @@ pub unsafe extern "C" fn x3f_get_preview(
                     )
                 };
                 input[color] = sg * ((acc as f64) / reduction2 - il.black[color])
-                    / (il.white[color] as f64 - il.black[color]);
+                    / (il.white[color] as f64 - il.black[color])
+                    * exposure_scale;
             }
 
             let mut output = [0.0_f64; 3];
@@ -3286,7 +3665,100 @@ static _A_X3F_GET_PREVIEW: unsafe extern "C" fn(
 
 #[cfg(test)]
 mod tests {
-    use super::shoulder_compress;
+    use super::{intermediate_levels, shoulder_compress, INTERMEDIATE_UNIT};
+
+    #[test]
+    fn uniform_digital_gain_preserves_intermediate_levels() {
+        let gain = [1.13, 1.05, 0.98];
+        let unit = intermediate_levels(gain, [1.0; 3], 13.137854439984503);
+        assert_eq!(
+            unit,
+            intermediate_levels(gain, [4.0; 3], 13.137854439984503)
+        );
+        assert_eq!(unit[0], INTERMEDIATE_UNIT);
+    }
+
+    #[test]
+    fn quattro_top_detail_preserves_neutral_color_with_unequal_digital_gain() {
+        use crate::quattro::{x3f_expand_quattro, Area16};
+        use std::ptr::null_mut;
+
+        let gain = [1.1, 1.05, 0.99];
+        let digital_gain = [4.0, 4.0, 2.0];
+        let black = 100.0;
+        let white = intermediate_levels(gain, digital_gain, black);
+        let ranges: [f64; 3] = std::array::from_fn(|c| white[c] as f64 - black);
+        let total_gain: [f64; 3] = std::array::from_fn(|c| gain[c] * digital_gain[c]);
+        let encode = |luminance: f64, c: usize| {
+            (black + ranges[c] * luminance / total_gain[c]).round() as u16
+        };
+
+        // A neutral high-frequency pattern whose 2x2 average is constant.
+        // B/M record only that average; the full-resolution T plane records
+        // alternating brighter and darker samples. Neither is clipped.
+        let mut low = Vec::new();
+        for _ in 0..16 {
+            low.extend((0..3).map(|c| encode(0.1, c)));
+        }
+        let luminance = |row: usize, col: usize| {
+            if (row + col).is_multiple_of(2) {
+                0.14
+            } else {
+                0.06
+            }
+        };
+        let mut top: Vec<u16> = (0..8)
+            .flat_map(|row| (0..8).map(move |col| encode(luminance(row, col), 2)))
+            .collect();
+        let mut output = vec![0u16; 8 * 8 * 3];
+        let mut image = Area16 {
+            data: low.as_mut_ptr(),
+            buf: null_mut(),
+            rows: 4,
+            columns: 4,
+            channels: 3,
+            row_stride: 12,
+        };
+        let mut qtop = Area16 {
+            data: top.as_mut_ptr(),
+            buf: null_mut(),
+            rows: 8,
+            columns: 8,
+            channels: 1,
+            row_stride: 8,
+        };
+        let mut expanded = Area16 {
+            data: output.as_mut_ptr(),
+            buf: null_mut(),
+            rows: 8,
+            columns: 8,
+            channels: 3,
+            row_stride: 24,
+        };
+        unsafe {
+            x3f_expand_quattro(
+                &mut image,
+                null_mut(),
+                &mut qtop,
+                &mut expanded,
+                null_mut(),
+                0.0,
+            );
+        }
+        for row in 0..8 {
+            for col in 0..8 {
+                for c in 0..3 {
+                    let count = output[(row * 8 + col) * 3 + c] as f64;
+                    let balanced = (count - black) / ranges[c] * total_gain[c];
+                    assert!(
+                        (balanced - luminance(row, col)).abs() < 1e-3,
+                        "pixel ({row},{col}) channel {c}: {balanced} is not neutral detail {}",
+                        luminance(row, col),
+                    );
+                }
+            }
+        }
+    }
 
     fn s_for(global_max: f64, knee: f64) -> f64 {
         (global_max - knee) / (1.0 - knee)

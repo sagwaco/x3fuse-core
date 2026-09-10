@@ -112,6 +112,9 @@ impl Reader {
         // a prior conversion on this thread can't bleed into ours.
         // SAFETY: setter is a plain Cell write, no aliasing concerns.
         unsafe { sys::x3f_set_dng_highlight_recovery(opts.dng_highlight_recovery as libc::c_int) };
+        // Always set the mapping as well, including recovery-disabled
+        // conversions, so each call replaces the previous thread-local choice.
+        unsafe { sys::x3f_set_dng_highlight_mapping(opts.dng_highlight_mapping.to_raw()) };
         // Same pattern for the Cineon-log TIFF mode toggle. Always
         // written (true *or* false) so a stale `true` from a previous
         // cineon conversion on this rayon worker can't leak into a
@@ -161,10 +164,10 @@ impl Reader {
         let dng_highlight_scale = unsafe { sys::x3f_get_dng_highlight_scale() };
         let dng_shoulder_ceiling = unsafe { sys::x3f_get_dng_shoulder_ceiling() };
 
-        let len = (area.rows as usize) * (area.row_stride as usize);
-        // SAFETY: x3f_get_image returns a buffer the C accessor pattern reads
-        // as data[0..rows*row_stride]; the same range is in-bounds for us.
-        let data = unsafe { std::slice::from_raw_parts(area.data, len).to_vec() };
+        // SAFETY: each logical row returned by x3f_get_image is valid. A
+        // cropped view may start inside its backing allocation, so the
+        // final row's trailing stride padding need not be readable.
+        let data = unsafe { copy_image_rows(&area) };
 
         // SAFETY: area.buf was malloc'd by the C library and is non-null on
         // a successful return; we are the unique owner now.
@@ -218,7 +221,7 @@ impl Reader {
         // SAFETY: every pointer is non-null and outlives the call. The C
         // function reads from area+ilevels and populates preview.
         let ok = unsafe {
-            sys::x3f_get_preview(
+            sys::x3f_get_preview_with_scale(
                 self.x3f.as_ptr(),
                 &mut area,
                 &mut ilevels,
@@ -227,6 +230,7 @@ impl Reader {
                 cwb_ptr(&cwb),
                 max_width,
                 &mut preview,
+                image.dng_highlight_scale,
             )
         };
         if ok == 0 {
@@ -246,5 +250,50 @@ impl Reader {
             channels: preview.channels,
             row_stride: preview.row_stride,
         })
+    }
+}
+
+/// Copy the logical samples of a possibly cropped view without reading
+/// source padding. The owned result retains the original row stride.
+///
+/// # Safety
+///
+/// Each row must contain `columns * channels` readable samples starting
+/// at `data + row * row_stride`, with that width no larger than the stride.
+unsafe fn copy_image_rows(area: &sys::x3f_area16_t) -> Vec<u16> {
+    let stride = area.row_stride as usize;
+    let width = area.columns as usize * area.channels as usize;
+    let mut data = vec![0; area.rows as usize * stride];
+    for row in 0..area.rows as usize {
+        let start = row * stride;
+        // SAFETY: the caller guarantees the logical row is readable.
+        let source = unsafe { std::slice::from_raw_parts(area.data.add(start), width) };
+        data[start..start + width].copy_from_slice(source);
+    }
+    data
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cropped_view_copies_last_row_without_reading_trailing_padding() {
+        let mut backing: Vec<u16> = (0..24).collect();
+        let area = sys::x3f_area16_t {
+            // The second logical row ends exactly at backing.len().
+            data: unsafe { backing.as_mut_ptr().add(3) },
+            buf: ptr::null_mut(),
+            rows: 2,
+            columns: 3,
+            channels: 3,
+            row_stride: 12,
+        };
+        let data = unsafe { copy_image_rows(&area) };
+        assert_eq!(data.len(), 24);
+        assert_eq!(&data[..9], &backing[3..12]);
+        assert_eq!(&data[12..21], &backing[15..24]);
+        assert_eq!(&data[9..12], &[0; 3]);
+        assert_eq!(&data[21..], &[0; 3]);
     }
 }

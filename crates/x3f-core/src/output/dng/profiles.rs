@@ -16,6 +16,7 @@ use std::ffi::CString;
 
 use crate::Reader;
 
+use super::color::ColorCalibration;
 use super::metadata::{
     adobe_rgb_to_xyz, bradford_d65_to_d50, mat3_diag, mat3_inverse, mat3_mul, mat3_ones,
     mat3_to_f32,
@@ -76,7 +77,7 @@ pub(crate) struct CameraProfile {
     /// `ProfileHueSatMapData1` for this profile. `None` = no hue/sat
     /// map (grayscale / unconverted). The CAMF value is a `float[2][5][21]`
     /// table that `hue_sat_map::build_hue_sat_map` collapses to a
-    /// 21×1×1 DNG hue/sat map.
+    /// 21×2×1 DNG hue/sat map.
     multi_axis_camf: Option<&'static str>,
 }
 
@@ -265,6 +266,7 @@ const D50_XYZ: [f64; 3] = [0.96422, 1.00000, 0.82521];
 fn compute_matrices(
     reader: &Reader,
     wb: &str,
+    calibration: &ColorCalibration,
     profile: &CameraProfile,
 ) -> Option<([f32; 9], [f32; 9])> {
     // Body-cal-gating: skip profiles whose required CAMF entry isn't in
@@ -299,7 +301,11 @@ fn compute_matrices(
         base_bmt_to_xyz
     };
 
-    let color_matrix1 = mat3_to_f32(&mat3_inverse(&bmt_to_xyz));
+    // Fold the individual-camera and relative digital-gain calibration
+    // into every profile's mandatory ColorMatrix. A separate diagonal
+    // CameraCalibration is ignored by some readers; it cancels from the
+    // ForwardMatrix transform, so that matrix remains unchanged.
+    let color_matrix1 = mat3_to_f32(&calibration.fold_color_matrix(&mat3_inverse(&bmt_to_xyz)));
 
     let bmt_to_d50 = if let Some(mix) = profile.grayscale_mix {
         // (D50 × ones) × diag(mix) — see x3f_output_dng.c:206-213
@@ -346,14 +352,15 @@ fn add_profile_tags(ifd: &mut DirectoryWriter, name: &str, color: [f32; 9], forw
 
 /// Write the default profile's tags onto the parent DNG IFD0 and append
 /// the AsShotProfileName tag. Returns the index of the default profile.
-pub(crate) fn write_default_profile(
+pub(super) fn write_default_profile(
     reader: &Reader,
     wb: &str,
+    calibration: &ColorCalibration,
     ifd0: &mut DirectoryWriter,
 ) -> Option<usize> {
     let idx = default_profile_index(reader);
     let profile = &PROFILES[idx];
-    let (color, forward) = compute_matrices(reader, wb, profile)?;
+    let (color, forward) = compute_matrices(reader, wb, calibration, profile)?;
     add_profile_tags(ifd0, profile.name, color, forward);
 
     // Tone curve + hue/sat map for the default profile, mirroring what
@@ -396,9 +403,10 @@ pub(crate) fn write_default_profile(
 /// Returns `(blob, per_profile_relative_offsets)`. The parent writer
 /// appends `blob` at some absolute file position `base`, then writes the
 /// LONG[] tag value as `[base + off for off in offsets]`.
-pub(crate) fn build_extra_profiles_blob(
+pub(super) fn build_extra_profiles_blob(
     reader: &Reader,
     wb: &str,
+    calibration: &ColorCalibration,
     default_idx: usize,
 ) -> Option<(Vec<u8>, Vec<u32>)> {
     let mut blob: Vec<u8> = Vec::new();
@@ -412,7 +420,7 @@ pub(crate) fn build_extra_profiles_blob(
         // isn't in the file (e.g. Merrill cameras don't ship FCYellow /
         // Cinema / etc.). Only the *default* profile is allowed to fail
         // the conversion — that lookup happens in `write_default_profile`.
-        let Some((color, forward)) = compute_matrices(reader, wb, profile) else {
+        let Some((color, forward)) = compute_matrices(reader, wb, calibration, profile) else {
             continue;
         };
 
@@ -489,7 +497,7 @@ fn build_mmcr_profile(
     //   50940  ProfileToneCurve           (FLOAT[N], external) — optional, only
     //                                      when the profile's CMCC_<mode> ≠ 0
     //   50964  ForwardMatrix1             (SRATIONAL[9], external)
-    //   51107  ProfileHueSatMapEncoding   (LONG inline, value 1 = sRGB) — optional
+    //   51107  ProfileHueSatMapEncoding   (LONG inline, value 0 = linear) — optional
     //   51110  DefaultBlackRender         (LONG inline, value 1)
     //
     // CalibrationIlluminant1 is intentionally omitted: CPP's MMCR blobs
@@ -821,12 +829,15 @@ mod tests {
 
     #[test]
     fn mmcr_with_hue_sat_map_has_three_extra_tags_in_order() {
-        // Synth a 21×1×1 hue/sat map.
-        let mut hsm: Vec<f32> = Vec::with_capacity(21 * 3);
+        // Saturation is the fastest varying dimension: the neutral and
+        // saturated correction records for each hue are adjacent.
+        let mut hsm: Vec<f32> = Vec::with_capacity(21 * 2 * 3);
         for h in 0..21 {
-            hsm.push(h as f32 * 0.5); // hue shift
-            hsm.push(1.0 + h as f32 * 0.01); // sat scale
-            hsm.push(1.0); // value scale
+            for _ in 0..2 {
+                hsm.push(h as f32 * 0.5); // hue shift
+                hsm.push(1.0 + h as f32 * 0.01); // sat scale
+                hsm.push(1.0); // value scale
+            }
         }
         let blob = build_mmcr_profile(
             "Vivid",
@@ -855,11 +866,25 @@ mod tests {
         ] {
             assert!(tags.contains(&expect), "missing tag {expect}");
         }
+        let index = tags
+            .iter()
+            .position(|&tag| tag == t::PROFILE_HUE_SAT_MAP_DATA1)
+            .unwrap();
+        let entry = off + 2 + index * 12;
+        let count = u32::from_be_bytes(blob[entry + 4..entry + 8].try_into().unwrap());
+        let data_offset =
+            u32::from_be_bytes(blob[entry + 8..entry + 12].try_into().unwrap()) as usize;
+        assert_eq!(count, 126);
+        let decoded: Vec<f32> = blob[data_offset..data_offset + count as usize * 4]
+            .chunks_exact(4)
+            .map(|bytes| f32::from_be_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert_eq!(decoded, hsm, "MMCR must preserve saturation-fastest order");
     }
 
     #[test]
-    fn mmcr_hue_sat_map_encoding_is_inline_srgb() {
-        let hsm = vec![0.0_f32; 21 * 3];
+    fn mmcr_hue_sat_map_encoding_is_inline_linear() {
+        let hsm: Vec<f32> = [0.0, 1.0, 1.0].repeat(21 * 2);
         let blob = build_mmcr_profile("X", [0.0_f32; 9], [0.0_f32; 9], None, Some(hsm.as_slice()));
         let off = u32::from_be_bytes([blob[4], blob[5], blob[6], blob[7]]) as usize;
         let entry_count = u16::from_be_bytes([blob[off], blob[off + 1]]);
@@ -868,9 +893,16 @@ mod tests {
             let p = off + 2 + i * 12;
             let tag = u16::from_be_bytes([blob[p], blob[p + 1]]);
             if tag == t::PROFILE_HUE_SAT_MAP_ENCODING {
+                assert_eq!(u16::from_be_bytes([blob[p + 2], blob[p + 3]]), 4);
+                assert_eq!(
+                    u32::from_be_bytes(blob[p + 4..p + 8].try_into().unwrap()),
+                    1
+                );
                 let val =
                     u32::from_be_bytes([blob[p + 8], blob[p + 9], blob[p + 10], blob[p + 11]]);
-                assert_eq!(val, 1, "Encoding must be sRGB (=1)");
+                // V=1 must not acquire a gamma transform: RawTherapee
+                // 5.12 darkens even this identity table with encoding 1.
+                assert_eq!(val, 0, "V=1 maps require explicit linear encoding");
                 found = true;
             }
         }
@@ -878,8 +910,8 @@ mod tests {
     }
 
     #[test]
-    fn mmcr_hue_sat_map_dims_payload_is_21_1_1() {
-        let hsm = vec![0.0_f32; 21 * 3];
+    fn mmcr_hue_sat_map_dims_payload_is_21_2_1() {
+        let hsm: Vec<f32> = [0.0, 1.0, 1.0].repeat(21 * 2);
         let blob = build_mmcr_profile("X", [0.0_f32; 9], [0.0_f32; 9], None, Some(hsm.as_slice()));
         let off = u32::from_be_bytes([blob[4], blob[5], blob[6], blob[7]]) as usize;
         let entry_count = u16::from_be_bytes([blob[off], blob[off + 1]]);
@@ -914,7 +946,7 @@ mod tests {
             blob[dims_off + 10],
             blob[dims_off + 11],
         ]);
-        assert_eq!([h, s, v], [21, 1, 1]);
+        assert_eq!([h, s, v], [21, 2, 1]);
     }
 
     #[test]

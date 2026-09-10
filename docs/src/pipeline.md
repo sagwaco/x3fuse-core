@@ -61,11 +61,15 @@ The `convert_data` function is the hot loop. In order:
    H → skip Bottom; Merrill family → skip Right) are preserved
    verbatim.
 2. **white-level normalisation** + per-pixel `out = scale*(raw -
-   black) + bias` clamp. `DigitalISOGain` is deliberately *not* part
-   of `scale`: sensor saturation must land exactly on the published
-   white level, or the top `log2(gain)` of a stop of genuine raw data
-   gets falsely clipped/"recovered" downstream. The gain is applied at
-   stage 7 (and as DNG `BaselineExposure`) instead.
+   black) + bias` clamp. Intermediate encoding ranges are proportional
+   to `WhiteBalanceGains * DigitalISOGain`, normalized so the largest
+   range fits the intermediate buffer. This makes equal intermediate
+   channel values neutral, as required by Quattro's Yis4T detail
+   reconstruction and denoising. Each channel's range is also used in
+   the inverse normalization, so this does not apply digital gain to
+   normalized raw values or discard highlight headroom. Actual digital
+   brightening happens at stage 7, or through DNG color metadata and
+   `BaselineExposure`.
 3. **spatial gain (lens shading) correction** —
    [`crates/x3f-sys/src/spatial_gain.rs`](../../crates/x3f-sys/src/spatial_gain.rs).
    Reads `IncludeBlocks` and the four nearest neighbours in
@@ -93,34 +97,98 @@ The `convert_data` function is the hot loop. In order:
 9. **gamma LUT application** — sRGB / AdobeRGB-2.2 / ProPhoto-1.8 (D65
    → D50 Bradford for ProPhoto).
 
-The DNG path replaces stages 7–9 with `apply_highlight_clip_dng`
-(M6e9): per-pixel CLUT/RepairPix/`L*p`/matrix-pathology gate
-(sg-amplified preview) → bake-sg-into-raw → baked soft highlight
-shoulder. With `-dng-highlight-recovery` the CLUT step uses the
-generalized BMT apply (`chroma_lut_apply_pixel_bmt`): three
-scene-derived tables reconstruct whichever single channel clipped
-(T from B,M; B from M,T; M from B,T) so recovered highlights keep
-scene chroma, and only multi-channel clips fall back to the neutral
-`L*p` snap. Recovered values overshoot the sensor white point, so a
-global-max scan drives a per-pixel soft shoulder (`L' = knee +
-(1-knee)·(1-(1-t/s)^s)`, knee 0.85 via `X3F_DNG_SHOULDER_KNEE`,
-slope-1/C1 at the knee, chroma-preserving uniform per-pixel scale)
-that compresses `[knee, global_max]` into `[knee, WhiteLevel]`. The
-knee is published as `LinearResponseLimit`. An earlier design
-divided the whole raster down and compensated via a
-`BaselineExposure = log2(scale)` nudge instead — that rendered
-correctly only in readers that honour BE (it is an optional hint in
-the DNG spec), so it was replaced by the baked shoulder.
+The DNG path replaces stages 7–9 with highlight handling in sensor BMT
+space. Recovery is opt-in through `-dng-highlight-recovery`. On Merrill
+and older sensors, reliable nearby layer ratios propose reconstruction of
+one or two clipped layers. Local proposals must also agree with the
+established reconstruction's rendered chroma after both BMT vectors pass
+through the color matrix. Donor confidence alone cannot justify a large
+color change. When local color is uncertain, retain the established chroma
+and recover scalar brightness variation from surviving layers, applying it
+to the coherent BMT vector. This conservative separation retains measured
+texture without introducing unrelated highlight colors. Fully clipped
+pixels cannot supply missing texture themselves.
+
+Nominal channel headroom alone does not guarantee trustworthy Foveon color:
+the overlapping BMT responses are not independent display RGB channels.
+Even a near-clipped sample below its saturation threshold can produce
+severe opposing channel contributions in the color matrix. A matrix-aware
+highlight safeguard therefore checks the coherent BMT vector after local
+reconstruction, including near-clipped samples. Pathological vectors are
+projected onto a neutral ray, with amplitude estimated from smoothly
+weighted surviving layers rather than the clipped maximum. This preserves
+available brightness variation while suppressing green/magenta highlight
+artifacts. It can change nominally unclipped layers inside those
+pathological highlights; normal valid unclipped areas retain their samples.
+
+Recovered values and spatial gain stay in floating point until the final
+shared 16-bit encoding. The new `-dng-highlight-mapping linear|shoulder`
+selector controls how their headroom is stored; it does not enable recovery.
+The Rust API exposes the same choice as `DngHighlightMapping`.
+
+- **`linear` (default):** divide every recovered sample by one image-wide
+  factor `S >= 1`, measured from the active image area, and encode once
+  into `[0, 65535]`. Add `log2(S)` to the existing `BaselineExposure` and
+  publish `LinearResponseLimit = 1`. This preserves proportional highlight
+  differences for later exposure edits. Readers that ignore
+  `BaselineExposure` display the image darker by `log2(S)` stops; applying
+  that exposure restores its brightness. Preview generation compensates
+  for `S` and applies spatial gain only once.
+- **`shoulder`:** use the same recovered samples, then apply the existing
+  smooth per-pixel highlight shoulder. Its default knee is `0.85`, adjusted
+  by `X3F_DNG_SHOULDER_KNEE`. Uniform scaling within each pixel preserves
+  layer ratios while compressing the range above the knee below white.
+  `LinearResponseLimit` records the knee when compression is needed and
+  otherwise stays `1`; there is no headroom exposure adjustment. The tag
+  describes the nonlinear range and does not undo the baked compression.
+
+Both mappings retain uniform `BlackLevel = 0` and `WhiteLevel = 65535`.
+With recovery disabled, selecting either mapping leaves the existing
+recovery-off conversion unchanged. TIFF/PPM recovery is unchanged.
+
+On Quattro, recovery runs after expansion and retains the existing
+CLUT/RepairPix/neutral-fallback reconstruction. The new local BMT method
+does not treat the interpolated lower layers as independent full-resolution
+measurements. Both final headroom mappings are available on this path.
+The previous unconditional Quattro bypass made the recovery option
+ineffective. Its recovery-off path retains the expanded sensor samples;
+unequal channel saturation can then produce lime/yellow highlights even
+with correct color metadata. Recovery remains an explicit processing
+choice because it estimates missing color and can change bright scene
+colors.
 
 The DNG's `BaselineExposure` carries the ISO brightening that is
 deliberately kept out of the raster:
-`log2(CaptureISO/SensorISO) + log2(geometric mean of DigitalISOGain)`.
+`log2(CaptureISO/SensorISO) + log2(geometric mean of DigitalISOGain)`,
+plus `log2(S)` for linear highlight recovery.
 Baking `DigitalISOGain` into the raw samples instead (as an earlier
 revision did in `preprocess_data`) falsely clipped the top
 `log2(gain)` of a stop of real highlight data at `WhiteLevel`; readers
 that ignore BE render those files a fraction of a stop darker, which
 matches the existing (much larger) BE reliance for Merrill ISO
 brightness.
+
+`DigitalISOGain` can differ substantially by channel: the sd Quattro H
+samples use `[4, 4, 2]`. Keeping only its geometric mean loses that color
+balance and produces a severe cast. The DNG writer computes
+`h = DigitalISOGain / geometric_mean(DigitalISOGain)` and publishes
+`AsShotNeutral = 1 / (WhiteBalanceGains * h)`. The diagonal
+`1 / (OvercastGains * h)` is folded into every profile's ColorMatrix,
+so CameraCalibration can be omitted (its default is identity).
+ForwardMatrix is unchanged. This preserves the relative gain through
+white-balance editing and readers that ignore CameraCalibration, without
+clipping the normalized samples. Quattro's intermediate encoding must use
+the same relative gain: otherwise adding T-plane detail equally to B, M,
+and T produces lime bright detail and purple dark detail after conversion.
+The working-range correction intentionally changes reconstructed Quattro
+pixels; it is separate from the algebraic metadata correction.
+
+Quattro profiles identify their calibration illuminant as D65, matching
+the basis of their ColorMatrix. Hue/saturation maps use `[21,2,1]` and
+explicit linear encoding. The DNG specification makes the encoding
+inapplicable when there is only one value division; encoding 0 also avoids
+an extra inverse sRGB curve in RawTherapee 5.12 and Adobe SDK 1.7.1, which
+otherwise darken even an identity map.
 
 The writer then equalizes the three channels into one shared
 encoding range (`output::dng::equalize_levels`): the per-channel
@@ -144,9 +212,10 @@ One of:
 
 - **DNG** — pure-Rust IFD writer in
   [`crates/x3f-core/src/output/dng/`](../../crates/x3f-core/src/output/dng/).
-  Emits the standard TIFF + EXIF chrome, the Sigma-private DNG tags
-  (50964 ForwardMatrix1, 51110 DefaultBlackRender, …), all 11
-  in-camera Sigma color modes as `ExtraCameraProfiles`, and embeds
+  Emits standard TIFF, EXIF, and DNG tags, including ForwardMatrix1
+  and DefaultBlackRender. Standard is the default camera profile; the
+  currently enabled extra profiles are five monochrome variants and
+  Unconverted. Additional Sigma picture modes remain disabled. The writer embeds
   Sigma's flat-fielding `OpcodeList3` blobs (lens-correction GainMaps)
   when `-opcodes-dir opcodes` is passed. `-compress` encodes the raw
   plane as lossless JPEG (`Compression = 7`, the pure-Rust LJ92
@@ -158,7 +227,10 @@ One of:
   integer raws wholesale (no Finder/Quick Look previews), while the
   dcraw-lineage decoders stop after the first strip of a multi-strip
   lossless-JPEG plane — single-strip LJ92 is the layout everything
-  decodes.
+  decodes. Required UniqueCameraModel and LinearResponseLimit live in
+  IFD0; DefaultUserCrop is RATIONAL[4] in the raw IFD. Hue/saturation
+  maps use `[21, 2, 1]` dimensions, with saturation varying fastest and
+  identical corrections at both saturation endpoints.
 - **16-bit TIFF** —
   [`crates/x3f-core/src/output/tiff.rs`](../../crates/x3f-core/src/output/tiff.rs)
   via the `tiff` crate.
