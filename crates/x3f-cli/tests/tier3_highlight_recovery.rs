@@ -81,8 +81,10 @@ fn check_recovered_mapping(input: &Path) {
     let mut maximum_chroma_error = 0.0_f64;
     for (lp, sp) in linear
         .pixels
-        .chunks_exact(3)
-        .zip(shoulder.pixels.chunks_exact(3))
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(shoulder.pixels.as_chunks::<3>().0.iter())
     {
         let lmax = f64::from(*lp.iter().max().unwrap());
         let smax = f64::from(*sp.iter().max().unwrap());
@@ -218,7 +220,9 @@ fn read_raw(path: &Path) -> RawDng {
         assert_eq!(count % 2, 0);
         pixels.extend(
             bytes[offset..offset + count]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]])),
         );
     }

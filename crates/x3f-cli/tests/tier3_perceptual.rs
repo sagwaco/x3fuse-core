@@ -219,7 +219,7 @@ fn read_dng_raw_ifd(path: &Path) -> RgbImage {
         Vec::with_capacity((width as usize) * (height as usize) * (samples_per_pixel as usize));
     for (off, len) in strip_offsets.iter().zip(strip_byte_counts.iter()) {
         let strip = &bytes[*off as usize..(*off as usize) + (*len as usize)];
-        for chunk in strip.chunks_exact(2) {
+        for chunk in strip.as_chunks::<2>().0 {
             pixels.push(u16::from_le_bytes([chunk[0], chunk[1]]));
         }
     }
@@ -416,11 +416,15 @@ fn read_long_or_short_vec(bytes: &[u8], ifd: &[IfdEntry], tag: u16) -> Vec<u32> 
     };
     match entry.typ {
         3 => payload
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]) as u32)
             .collect(),
         4 => payload
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
         _ => unreachable!(),

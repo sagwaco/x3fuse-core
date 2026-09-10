@@ -128,7 +128,7 @@ mod tests {
         let map = synthesize_hue_sat_map(&raw).unwrap();
         assert_eq!(HUE_SAT_MAP_DIMS, [21, 2, 1]);
         assert_eq!(map.len(), 126);
-        for (h, endpoints) in map.chunks_exact(6).enumerate() {
+        for (h, endpoints) in map.as_chunks::<6>().0.iter().enumerate() {
             let correction = [h as f32 - 10.0, 0.5 + h as f32 / 32.0, 1.0];
             assert_eq!(&endpoints[..3], &correction);
             assert_eq!(&endpoints[3..], &correction);

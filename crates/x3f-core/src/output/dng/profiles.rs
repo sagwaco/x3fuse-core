@@ -876,8 +876,10 @@ mod tests {
             u32::from_be_bytes(blob[entry + 8..entry + 12].try_into().unwrap()) as usize;
         assert_eq!(count, 126);
         let decoded: Vec<f32> = blob[data_offset..data_offset + count as usize * 4]
-            .chunks_exact(4)
-            .map(|bytes| f32::from_be_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_be_bytes(*bytes))
             .collect();
         assert_eq!(decoded, hsm, "MMCR must preserve saturation-fastest order");
     }
