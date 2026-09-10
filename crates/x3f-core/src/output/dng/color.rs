@@ -4,8 +4,8 @@
 //! component. The latter belongs in the color metadata: baking it into the
 //! raster would clip otherwise usable samples at the published white level.
 
-use crate::Reader;
 use super::metadata::{mat3_diag, mat3_mul};
+use crate::Reader;
 
 const WB_CALIBRATION: &str = "Overcast";
 

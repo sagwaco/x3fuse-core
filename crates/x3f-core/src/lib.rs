@@ -83,6 +83,28 @@ impl ColorEncoding {
     }
 }
 
+/// How recovered DNG highlights are fitted into the stored sample range.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum DngHighlightMapping {
+    /// Preserve linear highlight headroom with one image-wide exposure scale.
+    /// The DNG records the corresponding brightness compensation in
+    /// `BaselineExposure`; readers that ignore that tag show a darker image.
+    #[default]
+    Linear,
+    /// Bake the legacy soft highlight shoulder into the raw samples.
+    /// `X3F_DNG_SHOULDER_KNEE` controls where the shoulder starts.
+    Shoulder,
+}
+
+impl DngHighlightMapping {
+    fn to_raw(self) -> libc::c_int {
+        match self {
+            Self::Linear => 0,
+            Self::Shoulder => 1,
+        }
+    }
+}
+
 /// Per-conversion processing options. Mirrors the parameters of the legacy
 /// `x3f_dump_*` C entry points.
 #[derive(Debug, Clone)]
@@ -115,16 +137,18 @@ pub struct ProcessOptions {
     /// expected in the x3fuse layout: `<MODEL>[_<LENSID>]_FF_DNG_Opcodelist3_<APERTURE>`.
     /// `None` (default) skips opcode embedding.
     pub opcodes_dir: Option<std::path::PathBuf>,
-    /// Enable the DNG-path Foveon highlight-recovery pipeline (chroma
-    /// LUT + L*p reconstruction + matrix-pathology gate). Recovered
-    /// overshoot is compressed below WhiteLevel with a soft shoulder
-    /// baked into the raster; it does not depend on a reader undoing
-    /// an exposure scale. This also applies after Quattro expansion.
+    /// Enable the DNG-path Foveon highlight-recovery pipeline. Recovered
+    /// headroom is preserved linearly by default; `dng_highlight_mapping`
+    /// can select the legacy baked shoulder. This also applies after
+    /// Quattro expansion.
     ///
     /// Default is `false`. Enable this for clipped Foveon highlights:
     /// without recovery, unequal channel saturation can produce a
     /// lime/yellow cast even with correct white balance and matrices.
     pub dng_highlight_recovery: bool,
+    /// Mapping applied to recovered DNG highlights (default: `Linear`).
+    /// Ignored unless `dng_highlight_recovery` is enabled.
+    pub dng_highlight_mapping: DngHighlightMapping,
     /// Cineon-style log TIFF mode. When `true`, the conversion pipeline:
     ///
     ///   - replaces the encoding-specific gamma LUT with a Cineon-style log
@@ -163,6 +187,7 @@ impl Default for ProcessOptions {
             denoise_intensity: 10,
             opcodes_dir: None,
             dng_highlight_recovery: false,
+            dng_highlight_mapping: DngHighlightMapping::default(),
             cineon: false,
         }
     }
@@ -585,6 +610,15 @@ pub(crate) fn cwb_ptr(cwb: &Option<CString>) -> *mut std::os::raw::c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dng_highlight_mapping_defaults_to_linear_without_enabling_recovery() {
+        let opts = ProcessOptions::default();
+        assert!(!opts.dng_highlight_recovery);
+        assert_eq!(opts.dng_highlight_mapping, DngHighlightMapping::Linear);
+        assert_eq!(DngHighlightMapping::Linear.to_raw(), 0);
+        assert_eq!(DngHighlightMapping::Shoulder.to_raw(), 1);
+    }
 
     #[test]
     fn library_error_ok_maps_to_ok() {

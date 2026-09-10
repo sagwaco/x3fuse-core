@@ -119,7 +119,13 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
         .map(|(_, _, r, c)| (r, c))
         .unwrap_or((image.rows, image.columns));
 
-    let preview = reader.get_preview(&image, &opts, PREVIEW_MAX_WIDTH)?;
+    let mut preview_opts = opts.clone();
+    if opts.dng_highlight_recovery {
+        // Recovery has already baked the requested spatial gain into the
+        // raw samples. Preview rendering only restores the exposure scale.
+        preview_opts.apply_sgain = Some(false);
+    }
+    let preview = reader.get_preview(&image, &preview_opts, PREVIEW_MAX_WIDTH)?;
     let preview_bytes = strip::encode_preview_strip(&preview);
     // Lossless JPEG must go out as ONE full-height strip: the dcraw-
     // lineage decoders (LibRaw, and Apple's engine behaves the same)
@@ -516,12 +522,10 @@ fn add_dng_top_level_tags(
     // log2(gain) of a stop at `il.white`). BE is scalar, so a
     // per-channel-unequal gain contributes its geometric mean; the
     // residual channel balance is carried by AsShotNeutral and the
-    // profiles' ColorMatrix tags through ColorCalibration. Since the
-    // recovery path bakes its highlight shoulder into the raster,
-    // `highlight_scale` is always 1.0 today; the `> 1.0` arm is kept
-    // for the writer-side contract should a future pipeline publish a
-    // scale again. BaselineExposure is an optional-to-honour hint in
-    // the DNG spec, so nothing render-critical may depend on it.
+    // profiles' ColorMatrix tags through ColorCalibration. Linear recovery
+    // scales the raster down uniformly to retain recovered headroom;
+    // BaselineExposure restores the default viewing brightness. A reader
+    // that ignores this optional tag retains the detail but renders darker.
     let gain_be = calibration.digital_gain_ev;
     let iso_be = match (
         reader.dng_camf_float("SensorISO"),
@@ -530,11 +534,7 @@ fn add_dng_top_level_tags(
         (Some(sensor), Some(capture)) => Some((capture / sensor).log2()),
         _ => None,
     };
-    if iso_be.is_some() || gain_be != 0.0 {
-        let mut be = iso_be.unwrap_or(0.0) + gain_be;
-        if highlight_scale > 1.0 {
-            be += highlight_scale.log2();
-        }
+    if let Some(be) = baseline_exposure(iso_be, gain_be, highlight_scale) {
         ifd.add(
             tags::BASELINE_EXPOSURE,
             srational_from_floats(&[be as f32], 10_000),
@@ -658,10 +658,35 @@ impl Reader {
     }
 }
 
+fn baseline_exposure(iso_be: Option<f64>, gain_be: f64, highlight_scale: f64) -> Option<f64> {
+    if iso_be.is_none() && gain_be == 0.0 && highlight_scale <= 1.0 {
+        return None;
+    }
+    let highlight_ev = if highlight_scale > 1.0 {
+        highlight_scale.log2()
+    } else {
+        0.0
+    };
+    Some(iso_be.unwrap_or(0.0) + gain_be + highlight_ev)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ImageLevels;
+
+    #[test]
+    fn baseline_exposure_restores_headroom_without_iso_metadata() {
+        assert_eq!(baseline_exposure(None, 0.0, 4.0), Some(2.0));
+        assert_eq!(baseline_exposure(Some(1.0), 0.5, 4.0), Some(3.5));
+    }
+
+    #[test]
+    fn baseline_exposure_preserves_unscaled_metadata_behavior() {
+        assert_eq!(baseline_exposure(None, 0.0, 1.0), None);
+        assert_eq!(baseline_exposure(Some(0.0), 0.0, 1.0), Some(0.0));
+        assert_eq!(baseline_exposure(None, 1.0, 1.0), Some(1.0));
+    }
 
     fn image_with_levels(black: [f64; 3], white: [u32; 3], px: [u16; 3]) -> Image {
         Image {

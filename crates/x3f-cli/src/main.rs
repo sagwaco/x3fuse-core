@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use x3f_core::{set_max_printed_matrix_elements, set_offset_legacy, set_verbosity};
-use x3f_core::{ColorEncoding, ProcessOptions, Reader, Verbosity};
+use x3f_core::{ColorEncoding, DngHighlightMapping, ProcessOptions, Reader, Verbosity};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum FileType {
@@ -64,6 +64,7 @@ struct Args {
     legacy_offset: Option<i32>,
     matrix_max: Option<u32>,
     dng_highlight_recovery: bool,
+    dng_highlight_mapping: DngHighlightMapping,
     cineon: bool,
     /// Set when the user explicitly passed `-color <space>`. Used to
     /// resolve `-cineon` alone → ProPhotoRGB without overriding an
@@ -94,6 +95,7 @@ impl Default for Args {
             legacy_offset: None,
             matrix_max: None,
             dng_highlight_recovery: false,
+            dng_highlight_mapping: DngHighlightMapping::Linear,
             cineon: false,
             color_explicit: false,
         }
@@ -142,17 +144,17 @@ fn usage(progname: &str) -> ! {
          \x20                  into the DNG raw IFD's OpcodeList3 tag. Files\n\
          \x20                  follow the x3fuse layout: <MODEL>[_<LENS>]_FF_DNG_Opcodelist3_<APERTURE>.\n\
          \x20  -dng-highlight-recovery\n\
-         \x20                  Apply Foveon highlight recovery (per-channel\n\
-         \x20                  chroma-LUT reconstruction, L*p fallback,\n\
-         \x20                  matrix-pathology gate) when writing DNG.\n\
-         \x20                  Recovered overshoot is folded back under\n\
-         \x20                  WhiteLevel with a soft highlight shoulder baked\n\
-         \x20                  into the raster (knee tunable via\n\
-         \x20                  X3F_DNG_SHOULDER_KNEE, default 0.85), so the\n\
-         \x20                  recovered pixels fit the published DNG levels\n\
-         \x20                  (Adobe Camera Raw, Lightroom, LibRaw/RawTherapee,\n\
-         \x20                  Capture One, Apple RAW Engine).\n\
+         \x20                  Recover clipped Foveon highlights when writing\n\
+         \x20                  DNG, preserving linear highlight headroom.\n\
+         \x20                  BaselineExposure restores default brightness;\n\
+         \x20                  readers that ignore it show a darker image.\n\
          \x20                  Default: off (matches the pre-Rust C writer).\n\
+         \x20  -dng-highlight-mapping <linear|shoulder>\n\
+         \x20                  Choose recovered highlight mapping (default:\n\
+         \x20                  linear). Requires -dng-highlight-recovery to\n\
+         \x20                  have an effect. shoulder bakes the legacy soft\n\
+         \x20                  shoulder into the raster; its knee is controlled\n\
+         \x20                  by X3F_DNG_SHOULDER_KNEE (default 0.85).\n\
          \x20  -cineon         Write a 16-bit TIFF with a Cineon-style log tone\n\
          \x20                  curve (lifted shadows, pulled highlights, flat\n\
          \x20                  midtones) baked into the pixels and the Foveon\n\
@@ -306,6 +308,21 @@ fn parse_args(argv: &[String]) -> Args {
                 args.opcodes_dir = Some(PathBuf::from(v));
             }
             "-dng-highlight-recovery" => args.dng_highlight_recovery = true,
+            "-dng-highlight-mapping" => {
+                i += 1;
+                let v = argv
+                    .get(i)
+                    .map(String::as_str)
+                    .unwrap_or_else(|| usage(progname));
+                args.dng_highlight_mapping = match v {
+                    "linear" => DngHighlightMapping::Linear,
+                    "shoulder" => DngHighlightMapping::Shoulder,
+                    _ => {
+                        eprintln!("Unknown DNG highlight mapping: {v}");
+                        usage(progname);
+                    }
+                };
+            }
             "-ocl" => args.use_opencl = true,
             "-offset" => {
                 i += 1;
@@ -458,6 +475,7 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
         compress: args.compress,
         opcodes_dir: args.opcodes_dir.clone(),
         dng_highlight_recovery: args.dng_highlight_recovery,
+        dng_highlight_mapping: args.dng_highlight_mapping,
         cineon: args.cineon,
     };
 
@@ -560,7 +578,57 @@ mod tests {
         assert!(a.crop && a.fix_bad);
         assert_eq!(a.denoise_intensity, 10);
         assert!(!a.compress);
+        assert!(!a.dng_highlight_recovery);
+        assert_eq!(a.dng_highlight_mapping, DngHighlightMapping::Linear);
         assert_eq!(a.files, vec![PathBuf::from("in.X3F")]);
+    }
+
+    #[test]
+    fn dng_recovery_defaults_to_linear_headroom() {
+        let args = parse(&["-dng-highlight-recovery", "in.X3F"]);
+        assert!(args.dng_highlight_recovery);
+        assert_eq!(args.dng_highlight_mapping, DngHighlightMapping::Linear);
+    }
+
+    #[test]
+    fn dng_shoulder_mapping_is_independent_of_recovery_flag_order() {
+        for flags in [
+            vec![
+                "-dng-highlight-recovery",
+                "-dng-highlight-mapping",
+                "shoulder",
+                "in.X3F",
+            ],
+            vec![
+                "-dng-highlight-mapping",
+                "shoulder",
+                "-dng-highlight-recovery",
+                "in.X3F",
+            ],
+        ] {
+            let args = parse(&flags);
+            assert!(args.dng_highlight_recovery);
+            assert_eq!(args.dng_highlight_mapping, DngHighlightMapping::Shoulder);
+        }
+    }
+
+    #[test]
+    fn dng_mapping_alone_does_not_enable_recovery() {
+        let args = parse(&["-dng-highlight-mapping", "shoulder", "in.X3F"]);
+        assert!(!args.dng_highlight_recovery);
+        assert_eq!(args.dng_highlight_mapping, DngHighlightMapping::Shoulder);
+    }
+
+    #[test]
+    fn dng_mapping_last_selection_wins() {
+        let args = parse(&[
+            "-dng-highlight-mapping",
+            "shoulder",
+            "-dng-highlight-mapping",
+            "linear",
+            "in.X3F",
+        ]);
+        assert_eq!(args.dng_highlight_mapping, DngHighlightMapping::Linear);
     }
 
     #[test]
