@@ -4,6 +4,10 @@
 //! reconstruction nor fallback reads neighboring image pixels, so callers can
 //! evaluate once for headroom and again while encoding the image in place.
 
+use crate::sysabi as libc;
+use std::ffi::CStr;
+use std::ptr;
+
 const TILE_SIZE: usize = 16;
 const PYRAMID_LEVELS: usize = 5;
 const MIN_DONORS: f64 = 8.0;
@@ -20,6 +24,9 @@ pub struct SensorReliability {
     pub data: Vec<[u8; 3]>,
     /// Per-channel black-noise standard deviation in normalized sensor units.
     pub noise: [f64; 3],
+    /// Nonempty, validated Merrill SatMaps, in bottom/middle/top bit order.
+    /// Preserve this status when cropping the accompanying reliability data.
+    pub camera_map_channels: u8,
 }
 
 impl SensorReliability {
@@ -36,7 +43,113 @@ impl SensorReliability {
             cols,
             data,
             noise: noise.map(|n| if n.is_finite() { n.max(0.0) } else { 0.0 }),
+            camera_map_channels: 0,
         })
+    }
+
+    /// Merge camera clipping before crop, denoise, or layer reconstruction.
+    /// Clear or missing map entries never upgrade inferred reliability.
+    /// `X3F_NO_CAMERA_CLIP_MAPS` disables this addition for A/B comparisons.
+    ///
+    /// # Safety
+    /// `x3f` must point to a loaded X3F whose full stored raster has this
+    /// mask's dimensions. CAMF matrix storage must remain alive during use.
+    pub unsafe fn merge_merrill_camera_clipping(&mut self, x3f: *mut crate::x3f_t) {
+        if x3f.is_null()
+            || std::env::var_os("X3F_NO_CAMERA_CLIP_MAPS").is_some()
+            // Experimental: camera maps can introduce false-color clipping boundaries.
+            || !matches!(std::env::var("X3F_CAMERA_CLIP_MAPS").as_deref(), Ok("1"))
+            || self.rows.checked_mul(self.cols) != Some(self.data.len())
+        {
+            return;
+        }
+        let mut sensor = ptr::null_mut();
+        if unsafe { crate::x3f_get_prop_entry(x3f, c"SENSORID".as_ptr() as *mut _, &mut sensor) }
+            == 0
+            || sensor.is_null()
+            || unsafe { CStr::from_ptr(sensor) }.to_bytes() != b"F20"
+        {
+            return;
+        }
+
+        let mut flagged = [0_usize; 3];
+        // These names identify stored sensor planes, not rendered RGB:
+        // R/G/B correspond to bottom/middle/top in the co-sited raster.
+        for (channel, name) in [c"SatMapR", c"SatMapG", c"SatMapB"].into_iter().enumerate() {
+            let mut count: libc::c_int = 0;
+            let mut encoded: *mut libc::c_void = ptr::null_mut();
+            if unsafe {
+                crate::x3f_get_camf_matrix_var(
+                    x3f,
+                    name.as_ptr() as *mut _,
+                    &mut count,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    crate::matrix_type_t_M_UINT,
+                    &mut encoded,
+                )
+            } == 0
+                || count <= 0
+                || encoded.is_null()
+                || count as usize > isize::MAX as usize / std::mem::size_of::<u32>()
+                || (encoded as usize) & (std::mem::align_of::<u32>() - 1) != 0
+            {
+                continue;
+            }
+            // The matrix getter requires a one-dimensional M_UINT vector
+            // and returns borrowed decoded storage. Do not free it.
+            let runs = unsafe { std::slice::from_raw_parts(encoded as *const u32, count as usize) };
+            if let Some(count) = self.merge_camera_runs(runs, channel) {
+                flagged[channel] = count;
+            }
+        }
+        if std::env::var_os("X3F_CHROMA_LUT_TRACE").is_some() {
+            eprintln!(
+                "Merrill camera clipping: map_channels={:#05b}, flagged={flagged:?}",
+                self.camera_map_channels
+            );
+        }
+    }
+
+    fn merge_camera_runs(&mut self, runs: &[u32], channel: usize) -> Option<usize> {
+        if channel >= 3 {
+            return None;
+        }
+        // Validate the entire channel before modifying any evidence. Runs
+        // encode (delta from previous end, length) over the full raster;
+        // an optional final word describes a trailing clear span, not a
+        // clipped run. Malformed metadata must not leave a partial mask.
+        let mut previous_end = 0_usize;
+        let mut flagged = 0_usize;
+        for pair in runs.chunks_exact(2) {
+            let start = previous_end.checked_add(pair[0] as usize)?;
+            let end = start.checked_add(pair[1] as usize)?;
+            if end > self.data.len() {
+                return None;
+            }
+            flagged = flagged.checked_add(pair[1] as usize)?;
+            previous_end = end;
+        }
+        if let [trailing_clear] = runs.chunks_exact(2).remainder() {
+            if previous_end.checked_add(*trailing_clear as usize)? > self.data.len() {
+                return None;
+            }
+        }
+        previous_end = 0;
+        for pair in runs.chunks_exact(2) {
+            let start = previous_end + pair[0] as usize;
+            let end = start + pair[1] as usize;
+            for reliability in &mut self.data[start..end] {
+                // Retain isolated camera flags: an isolation filter is a
+                // repair heuristic, not proof that this sample is intact.
+                reliability[channel] = 0;
+            }
+            previous_end = end;
+        }
+        if flagged != 0 {
+            self.camera_map_channels |= 1 << channel;
+        }
+        Some(flagged)
     }
 }
 
@@ -156,6 +269,10 @@ pub struct LocalRecovery {
     levels: Vec<Level>,
     recovery_cap: Option<f64>,
     chroma_enabled: bool,
+    // Reference-only distance to each layer's clipping boundary. Never use
+    // this feathered confidence to admit donors or revive clipped samples.
+    camera_color_support: Option<Vec<[u8; 3]>>,
+    camera_color_reference_enabled: bool,
 }
 
 impl LocalRecovery {
@@ -215,11 +332,19 @@ impl LocalRecovery {
             }
             levels.push(next);
         }
+        let camera_color_support = if reliability.camera_map_channels != 0 {
+            build_camera_color_support(&reliability)
+        } else {
+            None
+        };
         Some(Self {
             reliability,
             levels,
             recovery_cap: recovery_cap.filter(|v| v.is_finite() && *v > 0.0),
             chroma_enabled: true,
+            camera_color_support,
+            camera_color_reference_enabled: std::env::var_os("X3F_NO_CAMERA_COLOR_REFERENCE")
+                .is_none(),
         })
     }
 
@@ -234,6 +359,214 @@ impl LocalRecovery {
             return [0; 3];
         }
         self.reliability.data[row * self.reliability.cols + col]
+    }
+
+    pub fn has_camera_maps(&self) -> bool {
+        self.reliability.camera_map_channels != 0
+    }
+
+    /// Feather only reference selection and final color/amplitude fitting
+    /// inside already-clipped regions. Hard masks still govern all donors
+    /// and reconstruction, and entirely healthy pixels remain untouched.
+    pub fn color_mask(&self, row: usize, col: usize) -> [u8; 3] {
+        let mask = self.mask(row, col);
+        if !self.has_camera_maps()
+            || !mask.contains(&0)
+            || row >= self.reliability.rows
+            || col >= self.reliability.cols
+        {
+            return mask;
+        }
+        let Some(support) = self.camera_color_support.as_ref() else {
+            return mask;
+        };
+        let distance = support[row * self.reliability.cols + col];
+        std::array::from_fn(|c| {
+            let confidence = camera_smoothstep((distance[c] as f64 - 1.0) / 3.0);
+            (mask[c] as f64 * confidence).round() as u8
+        })
+    }
+
+    /// Use the same intact, above-noise measurements for the global color
+    /// reference as for the local model. Camera-marked samples below the
+    /// numeric clipping threshold must not contaminate either donor set.
+    pub fn accepts_camera_donor(&self, row: usize, col: usize, s: [f64; 3]) -> bool {
+        self.mask(row, col) == [255; 3]
+            && s.iter().enumerate().all(|(c, &value)| {
+                value.is_finite() && value > signal_floor(self.reliability.noise[c])
+            })
+    }
+
+    /// Camera-aware color reference, not a second repair of the source.
+    /// Reuse the native ratio estimator through the existing B/M/T tables
+    /// when exactly one layer clipped. Fade uncertain color continuously
+    /// toward a common neutral direction, without blending image texture.
+    pub fn camera_reference(
+        &self,
+        row: usize,
+        col: usize,
+        s: [f64; 3],
+        prior: [f64; 3],
+        lut: Option<&crate::chroma_lut_t>,
+    ) -> Option<[f64; 3]> {
+        // Diagnostic ablation: keep clipping evidence and reconstruction unchanged.
+        if !self.camera_color_reference_enabled {
+            return None;
+        }
+
+        let hard_mask = self.mask(row, col);
+        if !self.has_camera_maps()
+            || !hard_mask.contains(&0)
+            || s.iter().any(|value| !value.is_finite())
+        {
+            return None;
+        }
+        if prior
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 1e-9)
+        {
+            return None;
+        }
+        let mask = self.color_mask(row, col);
+        let mut numerator = 0.0;
+        let mut denominator = 0.0;
+        let mut survivor_support = 0.0;
+        let mut fallback_amplitude = 0.0_f64;
+        for c in 0..3 {
+            // With no surviving measurement this is only a conservative
+            // neutral lower bound, not a claim of reconstructed detail.
+            fallback_amplitude = fallback_amplitude.max(s[c].max(0.0) / prior[c]);
+            let floor = signal_floor(self.reliability.noise[c]);
+            if mask[c] == 0 || s[c] <= floor {
+                continue;
+            }
+            let trust = mask[c] as f64 / 255.0;
+            let support = trust * trust * camera_smoothstep((s[c] - floor) / floor);
+            let noise = self.reliability.noise[c].max(0.001);
+            let weight = support / (noise * noise);
+            numerator += weight * prior[c] * s[c];
+            denominator += weight * prior[c] * prior[c];
+            survivor_support += support;
+        }
+        if !fallback_amplitude.is_finite() {
+            return None;
+        }
+        let measured = numerator / denominator;
+        let amplitude = if measured.is_finite() && measured > 0.0 && denominator > 0.0 {
+            let trust = camera_smoothstep(survivor_support);
+            (1.0 - trust) * fallback_amplitude + trust * measured
+        } else {
+            fallback_amplitude
+        };
+        let reference = prior.map(|value| value * amplitude);
+        if amplitude <= 0.0 || reference.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        if self.chroma_enabled {
+            if let Some(lut) = lut {
+                if let Some((color, confidence)) =
+                    self.camera_lut_reference(s, hard_mask, mask, lut)
+                {
+                    // Normalize before mixing color so a confidence ramp
+                    // cannot itself imprint a donor-brightness gradient.
+                    let reference_sum = reference.iter().sum::<f64>();
+                    let color_sum = color.iter().sum::<f64>();
+                    if reference_sum.is_finite() && color_sum.is_finite() && color_sum > 1e-9 {
+                        let mixed = std::array::from_fn(|c| {
+                            (1.0 - confidence) * reference[c]
+                                + confidence * color[c] / color_sum * reference_sum
+                        });
+                        if mixed.iter().all(|value| value.is_finite()) {
+                            return Some(mixed);
+                        }
+                    }
+                }
+            }
+        }
+        Some(reference)
+    }
+
+    fn camera_lut_reference(
+        &self,
+        s: [f64; 3],
+        hard_mask: [u8; 3],
+        mask: [u8; 3],
+        lut: &crate::chroma_lut_t,
+    ) -> Option<([f64; 3], f64)> {
+        let target = hard_mask.iter().position(|&value| value == 0)?;
+        let (a, b, amplitude_channel, table, neutral, valid) = match target {
+            0 => (1, 2, 1, &lut.lut_b, lut.neutral_bm, lut.valid_b),
+            1 => (0, 2, 2, &lut.lut_m, lut.neutral_mt, lut.valid_m),
+            2 => (0, 1, 1, &lut.lut, lut.neutral_tm, lut.valid),
+            _ => return None,
+        };
+        if valid == 0
+            || mask[a] == 0
+            || mask[b] == 0
+            || s[a] <= signal_floor(self.reliability.noise[a])
+            || s[b] <= signal_floor(self.reliability.noise[b])
+            || !neutral.is_finite()
+            || neutral <= 1e-9
+        {
+            return None;
+        }
+        let position =
+            (s[a] / (s[a] + s[b]) * (table.len() - 1) as f64).clamp(0.0, (table.len() - 1) as f64);
+        let lo = position.floor() as usize;
+        let hi = (lo + 1).min(table.len() - 1);
+        let left = table[lo] as f64;
+        let right = table[hi] as f64;
+        if !left.is_finite() || !right.is_finite() || left <= 0.0 || right <= 0.0 {
+            return None;
+        }
+        // Interpolate confidence at bin vertices as well as the ratio:
+        // changing adjacent bins must not cause another confidence jump.
+        let bin_confidence = |index: usize| {
+            let center = table[index] as f64;
+            if !center.is_finite() || center <= 0.0 {
+                return 0.0;
+            }
+            let mut variation = 0.0_f64;
+            for neighbor in [index.saturating_sub(1), (index + 1).min(table.len() - 1)] {
+                let value = table[neighbor] as f64;
+                if !value.is_finite() || value <= 0.0 {
+                    return 0.0;
+                }
+                variation = variation.max((value - center).abs() / (0.5 * (value + center)));
+            }
+            1.0 - camera_smoothstep((variation - 0.10) / (MAX_VARIATION - 0.10))
+        };
+        let fraction = position - lo as f64;
+        let variation_confidence =
+            (1.0 - fraction) * bin_confidence(lo) + fraction * bin_confidence(hi);
+        let ratio = left + (position - lo as f64) * (right - left);
+        let neutral_confidence =
+            camera_smoothstep((((ratio - neutral) / neutral).abs() - 0.025) / 0.025);
+        let mut predicted = s[amplitude_channel] * ratio;
+        if let Some(cap) = self.recovery_cap {
+            predicted = predicted.min(cap);
+        }
+        if !predicted.is_finite() || predicted < 0.0 || predicted < s[target] {
+            return None;
+        }
+        let margin = (5.0 * self.reliability.noise[target])
+            .max(0.02 * s[target].abs())
+            .max(1e-6);
+        let bound_confidence = camera_smoothstep((predicted - s[target]) / margin);
+        let mut anchor_confidence = 1.0;
+        for channel in [a, b] {
+            let trust = mask[channel] as f64 / 255.0;
+            let floor = signal_floor(self.reliability.noise[channel]);
+            anchor_confidence *= trust * trust * camera_smoothstep((s[channel] - floor) / floor);
+        }
+        let confidence =
+            anchor_confidence * variation_confidence * neutral_confidence * bound_confidence;
+        if !confidence.is_finite() || confidence <= 0.0 {
+            return None;
+        }
+        let mut reference = s;
+        reference[target] = predicted;
+        Some((reference, confidence.clamp(0.0, 1.0)))
     }
 
     pub fn recover(&self, row: usize, col: usize, s: [f64; 3], prior: [f64; 3]) -> RecoveryResult {
@@ -452,6 +785,58 @@ impl LocalRecovery {
         }
         None
     }
+}
+
+/// A short distance ramp for reference confidence only. Allocation failure
+/// retains the unfeathered mask instead of failing the conversion.
+fn build_camera_color_support(reliability: &SensorReliability) -> Option<Vec<[u8; 3]>> {
+    let rows = reliability.rows;
+    let cols = reliability.cols;
+    let count = rows.checked_mul(cols)?;
+    if rows == 0 || cols == 0 || count != reliability.data.len() {
+        return None;
+    }
+    let mut support = Vec::new();
+    support.try_reserve_exact(count).ok()?;
+    for mask in &reliability.data {
+        support.push(std::array::from_fn(|c| if mask[c] == 0 { 0_u8 } else { 4 }));
+    }
+    for row in 0..rows {
+        for col in 0..cols {
+            let index = row * cols + col;
+            for c in 0..3 {
+                if row > 0 {
+                    support[index][c] =
+                        support[index][c].min(support[index - cols][c].saturating_add(1));
+                }
+                if col > 0 {
+                    support[index][c] =
+                        support[index][c].min(support[index - 1][c].saturating_add(1));
+                }
+            }
+        }
+    }
+    for row in (0..rows).rev() {
+        for col in (0..cols).rev() {
+            let index = row * cols + col;
+            for c in 0..3 {
+                if row + 1 < rows {
+                    support[index][c] =
+                        support[index][c].min(support[index + cols][c].saturating_add(1));
+                }
+                if col + 1 < cols {
+                    support[index][c] =
+                        support[index][c].min(support[index + 1][c].saturating_add(1));
+                }
+            }
+        }
+    }
+    Some(support)
+}
+
+fn camera_smoothstep(value: f64) -> f64 {
+    let t = value.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 fn signal_floor(noise: f64) -> f64 {
@@ -1167,5 +1552,61 @@ mod tests {
             .collect();
         assert!(values.windows(2).all(|pair| pair[0] >= pair[1]));
         assert!(values.windows(2).all(|pair| pair[0] - pair[1] <= 10));
+    }
+
+    #[test]
+    fn camera_map_accepts_odd_terminal_clear_span() {
+        let mut mask = SensorReliability::new(1, 7, [0.0; 3]).unwrap();
+        assert_eq!(mask.merge_camera_runs(&[2, 2, 3], 2), Some(2));
+        assert_eq!(mask.camera_map_channels, 0b100);
+        for (index, reliability) in mask.data.iter().enumerate() {
+            assert_eq!(
+                *reliability,
+                if (2..4).contains(&index) {
+                    [255, 255, 0]
+                } else {
+                    [255; 3]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn camera_map_clear_span_never_upgrades_existing_clipping() {
+        let mut mask = SensorReliability::new(1, 7, [0.0; 3]).unwrap();
+        mask.data[1] = [0, 127, 255];
+        let original = mask.data.clone();
+        assert_eq!(mask.merge_camera_runs(&[7], 0), Some(0));
+        assert_eq!(mask.data, original);
+        assert_eq!(mask.camera_map_channels, 0);
+    }
+
+    #[test]
+    fn camera_map_retains_even_length_run_support() {
+        let mut mask = SensorReliability::new(1, 8, [0.0; 3]).unwrap();
+        assert_eq!(mask.merge_camera_runs(&[1, 2, 1, 1], 0), Some(3));
+        assert_eq!(mask.camera_map_channels, 0b001);
+        for (index, reliability) in mask.data.iter().enumerate() {
+            assert_eq!(
+                *reliability,
+                if [1, 2, 4].contains(&index) {
+                    [0, 255, 255]
+                } else {
+                    [255; 3]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn camera_map_rejects_invalid_runs_and_trailer_atomically() {
+        let mut mask = SensorReliability::new(1, 6, [0.0; 3]).unwrap();
+        let original = mask.data.clone();
+        assert_eq!(mask.merge_camera_runs(&[1, 2, 7], 1), None);
+        assert_eq!(mask.data, original);
+        assert_eq!(mask.camera_map_channels, 0);
+        assert_eq!(mask.merge_camera_runs(&[1, 2, 7, 1, 0], 1), None);
+        assert_eq!(mask.data, original);
+        assert_eq!(mask.camera_map_channels, 0);
     }
 }

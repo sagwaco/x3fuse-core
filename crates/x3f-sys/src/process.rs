@@ -1556,6 +1556,13 @@ unsafe fn preprocess_data_impl(
         }
     }
 
+    if let Some(mask) = reliability.as_mut() {
+        // Decode against full stored-raster coordinates while the original
+        // clipping evidence still precedes WBCS, denoise, and crop. This
+        // changes only optional DNG recovery provenance, never the pixels.
+        unsafe { mask.merge_merrill_camera_clipping(x3f) };
+    }
+
     if quattro {
         // Downsample top16 4-pixel sums into image[2]. The qtop read
         // is shared / read-only; only image.data is written. Wrap the
@@ -2691,18 +2698,39 @@ unsafe fn dng_evaluate_pixel(
         // the original surviving layers supply intensity and fine detail.
         let mut stable_ctx = *ctx;
         stable_ctx.prior = local_prior.as_ptr();
-        let stable =
-            unsafe { dng_evaluate_pixel(&stable_ctx, None, row, col, pixel, ptr::null_mut()) };
+        let camera_model = local.filter(|model| model.has_camera_maps() && mask.contains(&0));
+        let camera_reference = camera_model.and_then(|model| {
+            let lut = if ctx.use_clut {
+                Some(unsafe { &*ctx.clut })
+            } else {
+                None
+            };
+            model.camera_reference(row, col, original, local_prior, lut)
+        });
+        // If there is no trustworthy survivor, retain the established
+        // fallback, but never let its numeric-only LUT treat a camera-flagged
+        // layer below the numeric rail as a healthy amplitude donor.
+        if camera_model.is_some() {
+            stable_ctx.use_clut = false;
+        }
+        let stable = if let Some(reference) = camera_reference {
+            std::array::from_fn(|c| sg[c] * reference[c])
+        } else {
+            unsafe { dng_evaluate_pixel(&stable_ctx, None, row, col, pixel, ptr::null_mut()) }
+        };
+        let color_mask = local.map_or(mask, |model| model.color_mask(row, col));
         let stable = crate::highlight_recovery::protect_highlight_color(
             stable,
             measured,
-            mask,
+            color_mask,
             *prior,
             m,
             ctx.gate_thr,
             ctx.gate_width,
         );
-        crate::highlight_recovery::stabilize_highlight_color(output, stable, measured, mask, m)
+        crate::highlight_recovery::stabilize_highlight_color(
+            output, stable, measured, color_mask, m,
+        )
     } else {
         output
     }
@@ -2917,7 +2945,16 @@ unsafe fn apply_highlight_clip_dng_impl(
     let mut use_clut = recovery && !no_chroma;
     if use_clut {
         unsafe { chroma_lut_init_defaults(&mut clut) };
-        use_clut = unsafe { chroma_lut_build_from_image(&mut clut, img, il, prior.as_ptr()) } != 0;
+        let source_mask = local.as_ref().filter(|model| model.has_camera_maps());
+        use_clut = unsafe {
+            crate::highlight::chroma_lut_build_from_image_masked(
+                &mut clut,
+                img,
+                il,
+                prior.as_ptr(),
+                source_mask,
+            )
+        } != 0;
     }
     let mut stats: chroma_lut_apply_stats_t = unsafe { std::mem::zeroed() };
     let trace = env_present("X3F_CHROMA_LUT_TRACE");
@@ -3048,11 +3085,7 @@ unsafe fn apply_highlight_clip_dng_impl(
             .for_each(|(row, data)| {
                 for col in 0..cols {
                     let off = col * channels;
-                    if row < bounds[0]
-                        || row >= bounds[2]
-                        || col < bounds[1]
-                        || col >= bounds[3]
-                    {
+                    if row < bounds[0] || row >= bounds[2] || col < bounds[1] || col >= bounds[3] {
                         // Masked borders do not participate in recovery or
                         // exposure selection. Encode them explicitly as black
                         // rather than silently clipping unscanned values.
@@ -3114,6 +3147,17 @@ unsafe fn apply_highlight_clip_dng_impl(
 }
 
 fn crop_reliability(
+    mask: SensorReliability,
+    source: &x3f_area16_t,
+    image: &x3f_area16_t,
+) -> Option<SensorReliability> {
+    let camera_map_channels = mask.camera_map_channels;
+    let mut cropped = crop_reliability_view(mask, source, image)?;
+    cropped.camera_map_channels = camera_map_channels;
+    Some(cropped)
+}
+
+fn crop_reliability_view(
     mask: SensorReliability,
     source: &x3f_area16_t,
     image: &x3f_area16_t,

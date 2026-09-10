@@ -302,6 +302,18 @@ pub unsafe extern "C" fn chroma_lut_build_from_image(
     ilevels: *const x3f_image_levels_t,
     prior: *const f64,
 ) -> libc::c_int {
+    unsafe { chroma_lut_build_from_image_masked(lut, image, ilevels, prior, None) }
+}
+
+/// Rust-only camera-aware donor selection; the existing C ABI and its
+/// unmasked arithmetic remain unchanged for processed and legacy output.
+pub(crate) unsafe fn chroma_lut_build_from_image_masked(
+    lut: *mut chroma_lut_t,
+    image: *const x3f_area16_t,
+    ilevels: *const x3f_image_levels_t,
+    prior: *const f64,
+    source_mask: Option<&crate::highlight_recovery::LocalRecovery>,
+) -> libc::c_int {
     let lut = unsafe { &mut *lut };
     let image = unsafe { &*image };
     let ilevels = unsafe { &*ilevels };
@@ -339,6 +351,10 @@ pub unsafe extern "C" fn chroma_lut_build_from_image(
                 let idx = row_stride * row + channels * col + c;
                 let v = unsafe { *image.data.add(idx) } as f64;
                 s[c] = (v - ilevels.black[c]) / (ilevels.white[c] as f64 - ilevels.black[c]);
+            }
+
+            if source_mask.is_some_and(|mask| !mask.accepts_camera_donor(row, col, s)) {
+                continue;
             }
 
             let sb = if s[0] > CHROMA_LUT_EPS {
@@ -462,9 +478,12 @@ pub unsafe extern "C" fn chroma_lut_build_from_image(
     );
     if populated == 0 {
         lut.valid = 0;
-        return 0;
+        if source_mask.is_none() {
+            return 0;
+        }
+    } else {
+        lut.valid = 1;
     }
-    lut.valid = 1;
     lut.neutral_tm = neutral_tm;
 
     lut.valid_b = (finish_table(
@@ -521,7 +540,7 @@ pub unsafe extern "C" fn chroma_lut_build_from_image(
             }
         }
     }
-    1
+    (lut.valid != 0 || lut.valid_b != 0 || lut.valid_m != 0) as libc::c_int
 }
 
 // ----------------------------------------------------------------------
