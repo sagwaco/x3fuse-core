@@ -84,14 +84,18 @@ mod tests {
         let mut sensor = [2.0, 3.0, 4.0];
         let mut temperature = [0.5, 2.0, 0.25];
         let mut aperture = [3.0, 0.5, 2.0];
-        let mut dims: [[camf_dim_entry_t; 2]; 5] = unsafe { std::mem::zeroed() };
-        let mut entries: [camf_entry_t; 5] = unsafe { std::mem::zeroed() };
+        // One preset gain triplet so the ColorTemp path can recover the
+        // body's gain-frame invariant: 2.0 * 1.5 / 1.0^2 = 3.0.
+        let mut sunlight = [2.0, 1.0, 1.5];
+        let mut dims: [[camf_dim_entry_t; 2]; 7] = unsafe { std::mem::zeroed() };
+        let mut entries: [camf_entry_t; 7] = unsafe { std::mem::zeroed() };
         for (i, (name, data, shape)) in [
             (c"ColorTempTableInfo", table.as_mut_slice(), [2, 12]),
             (c"ColorTempValue", kelvin.as_mut_slice(), [1, 0]),
             (c"SensorAdjustmentGainFact", sensor.as_mut_slice(), [3, 0]),
             (c"TempGainFact", temperature.as_mut_slice(), [3, 0]),
             (c"FNumberGainFact", aperture.as_mut_slice(), [3, 0]),
+            (c"SunlightWBGain", sunlight.as_mut_slice(), [3, 0]),
         ]
         .into_iter()
         .enumerate()
@@ -106,6 +110,13 @@ mod tests {
             entries[i].matrix_decoded = data.as_mut_ptr().cast();
             entries[i].matrix_elements = data.len() as u32;
         }
+        let mut preset_names = [c"Sunlight".as_ptr() as *mut c_char];
+        let mut preset_values = [c"SunlightWBGain".as_ptr() as *mut u8];
+        entries[6].id = ID_PROPERTY;
+        entries[6].name_address = c"WhiteBalanceGains".as_ptr() as *mut _;
+        entries[6].property_num = 1;
+        entries[6].property_name = preset_names.as_mut_ptr();
+        entries[6].property_value = preset_values.as_mut_ptr();
         let mut directory: x3f_directory_entry_t = unsafe { std::mem::zeroed() };
         directory.header.identifier = 0x6343_4553; // SECc
         directory.header.data_subsection.camf.entry_table = camf_entry_table_t {
@@ -124,7 +135,14 @@ mod tests {
             assert_eq!(x3f_get_bmt_to_xyz(&mut x3f, wb, matrix.as_mut_ptr()), 1);
             x3f_sRGB_to_XYZ(srgb.as_mut_ptr());
         }
-        assert_eq!(gain, [6.0, 3.0, 6.0]);
+        // Table row at 5250 K interpolates to (2.0, 3.0). With the preset
+        // invariant 3.0 the implied middle gain is sqrt(2.0 * 3.0 / 3.0), so
+        // the frame-corrected triplet is (sqrt 2, 1, 3 / sqrt 2); the sensor,
+        // temperature and aperture factors then multiply to (3, 3, 2).
+        let expected = [3.0 * 2f64.sqrt(), 3.0, 6.0 / 2f64.sqrt()];
+        for (actual, expected) in gain.into_iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
+        }
         for (actual, expected) in matrix.into_iter().zip(srgb) {
             assert!((actual - 1.5 * expected).abs() < 1e-12);
         }
