@@ -68,6 +68,115 @@ unsafe fn camf_find_by_name<'a>(x3f: *mut x3f_t, name: *const c_char) -> Option<
     None
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn color_temp_camf_lookup_applies_adjustments_and_rejects_bad_dimensions() {
+        // Stack-owned decoded CAMF entries exercise the real accessors without
+        // requiring a private camera file or invoking the parser's allocator.
+        let mut table = [
+            5000.0, 1.0, 2.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 5500.0, 3.0, 4.0, 2.0,
+            0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0,
+        ];
+        let mut kelvin = [5250.0];
+        let mut sensor = [2.0, 3.0, 4.0];
+        let mut temperature = [0.5, 2.0, 0.25];
+        let mut aperture = [3.0, 0.5, 2.0];
+        // One preset gain triplet so the ColorTemp path can recover the
+        // body's gain-frame invariant: 2.0 * 1.5 / 1.0^2 = 3.0.
+        let mut sunlight = [2.0, 1.0, 1.5];
+        let mut dims: [[camf_dim_entry_t; 2]; 7] = unsafe { std::mem::zeroed() };
+        let mut entries: [camf_entry_t; 7] = unsafe { std::mem::zeroed() };
+        for (i, (name, data, shape)) in [
+            (c"ColorTempTableInfo", table.as_mut_slice(), [2, 12]),
+            (c"ColorTempValue", kelvin.as_mut_slice(), [1, 0]),
+            (c"SensorAdjustmentGainFact", sensor.as_mut_slice(), [3, 0]),
+            (c"TempGainFact", temperature.as_mut_slice(), [3, 0]),
+            (c"FNumberGainFact", aperture.as_mut_slice(), [3, 0]),
+            (c"SunlightWBGain", sunlight.as_mut_slice(), [3, 0]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            dims[i][0].size = shape[0];
+            dims[i][1].size = shape[1];
+            entries[i].id = ID_MATRIX;
+            entries[i].name_address = name.as_ptr() as *mut _;
+            entries[i].matrix_dim = if shape[1] == 0 { 1 } else { 2 };
+            entries[i].matrix_dim_entry = dims[i].as_mut_ptr();
+            entries[i].matrix_decoded_type = matrix_type_t_M_FLOAT;
+            entries[i].matrix_decoded = data.as_mut_ptr().cast();
+            entries[i].matrix_elements = data.len() as u32;
+        }
+        let mut preset_names = [c"Sunlight".as_ptr() as *mut c_char];
+        let mut preset_values = [c"SunlightWBGain".as_ptr() as *mut u8];
+        entries[6].id = ID_PROPERTY;
+        entries[6].name_address = c"WhiteBalanceGains".as_ptr() as *mut _;
+        entries[6].property_num = 1;
+        entries[6].property_name = preset_names.as_mut_ptr();
+        entries[6].property_value = preset_values.as_mut_ptr();
+        let mut directory: x3f_directory_entry_t = unsafe { std::mem::zeroed() };
+        directory.header.identifier = 0x6343_4553; // SECc
+        directory.header.data_subsection.camf.entry_table = camf_entry_table_t {
+            size: entries.len() as u32,
+            element: entries.as_mut_ptr(),
+        };
+        let mut x3f: x3f_t = unsafe { std::mem::zeroed() };
+        x3f.directory_section.num_directory_entries = 1;
+        x3f.directory_section.directory_entry = &mut directory;
+        let wb = c"ColorTemp".as_ptr() as *mut _;
+        let mut gain = [0.0; 3];
+        let mut matrix = [0.0; 9];
+        let mut srgb = [0.0; 9];
+        unsafe {
+            assert_eq!(x3f_get_gain(&mut x3f, wb, gain.as_mut_ptr()), 1);
+            assert_eq!(x3f_get_bmt_to_xyz(&mut x3f, wb, matrix.as_mut_ptr()), 1);
+            x3f_sRGB_to_XYZ(srgb.as_mut_ptr());
+        }
+        // Table row at 5250 K interpolates to (2.0, 3.0). With the preset
+        // invariant 3.0 the implied middle gain is sqrt(2.0 * 3.0 / 3.0), so
+        // the frame-corrected triplet is (sqrt 2, 1, 3 / sqrt 2); the sensor,
+        // temperature and aperture factors then multiply to (3, 3, 2).
+        let expected = [3.0 * 2f64.sqrt(), 3.0, 6.0 / 2f64.sqrt()];
+        for (actual, expected) in gain.into_iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
+        }
+        for (actual, expected) in matrix.into_iter().zip(srgb) {
+            assert!((actual - 1.5 * expected).abs() < 1e-12);
+        }
+
+        for (shape, count) in [([2, 12], 23), ([65536, 65537], 65536), ([u32::MAX, 12], 24)] {
+            dims[0][0].size = shape[0];
+            dims[0][1].size = shape[1];
+            entries[0].matrix_elements = count;
+            let (mut rows, mut columns) = (0, 0);
+            let mut data = ptr::null_mut();
+            assert_eq!(
+                unsafe {
+                    x3f_get_camf_matrix_var(
+                        &mut x3f,
+                        c"ColorTempTableInfo".as_ptr() as *mut _,
+                        &mut rows,
+                        &mut columns,
+                        ptr::null_mut(),
+                        matrix_type_t_M_FLOAT,
+                        &mut data,
+                    )
+                },
+                0
+            );
+            assert!(data.is_null());
+            assert_eq!(unsafe { x3f_get_gain(&mut x3f, wb, gain.as_mut_ptr()) }, 0);
+            assert_eq!(
+                unsafe { x3f_get_bmt_to_xyz(&mut x3f, wb, matrix.as_mut_ptr()) },
+                0
+            );
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn x3f_get_camf_text(
     x3f: *mut x3f_t,
@@ -105,6 +214,34 @@ pub unsafe extern "C" fn x3f_get_camf_matrix_var(
     }
 
     let dims = entry.matrix_dim_entry;
+    if !(1..=3).contains(&entry.matrix_dim)
+        || dims.is_null()
+        || entry.matrix_decoded.is_null()
+        || matrix.is_null()
+    {
+        return 0;
+    }
+    // The loader's u32 element count can wrap. Never expose dimensions
+    // whose product exceeds the decoded allocation or Rust's slice limit.
+    let mut elements = 1usize;
+    for i in 0..entry.matrix_dim as usize {
+        let size = unsafe { (*dims.add(i)).size };
+        if size > c_int::MAX as u32 {
+            return 0;
+        }
+        let Some(product) = elements.checked_mul(size as usize) else {
+            return 0;
+        };
+        elements = product;
+    }
+    let element_size = if typ == matrix_type_t_M_FLOAT {
+        std::mem::size_of::<f64>()
+    } else {
+        std::mem::size_of::<u32>()
+    };
+    if elements != entry.matrix_elements as usize || elements > isize::MAX as usize / element_size {
+        return 0;
+    }
     match entry.matrix_dim {
         3 => {
             if dim2.is_null() || dim1.is_null() || dim0.is_null() {
@@ -335,10 +472,10 @@ pub unsafe extern "C" fn x3f_get_wb(x3f: *mut x3f_t) -> *mut c_char {
         let s: &'static [u8] = match wb_code {
             1 => b"Auto\0",
             2 => b"Sunlight\0",
-            3 => b"Shadow\0",
+            3 => b"Shade\0",
             4 => b"Overcast\0",
             5 => b"Incandescent\0",
-            6 => b"Florescent\0",
+            6 => b"Fluorescent\0",
             7 => b"Flash\0",
             8 => b"Custom\0",
             11 => b"ColorTemp\0",

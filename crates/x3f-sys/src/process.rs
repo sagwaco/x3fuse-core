@@ -70,6 +70,212 @@ const INTERMEDIATE_DEPTH: u32 = 14;
 const INTERMEDIATE_UNIT: u32 = (1u32 << INTERMEDIATE_DEPTH) - 1;
 const INTERMEDIATE_BIAS_FACTOR: f64 = 4.0;
 
+// Quattro bodies store manual colour-temperature white balance outside the
+// normal WhiteBalanceGains / WhiteBalanceColorCorrections property lists.
+// Each ColorTempTableInfo row is:
+//
+//   kelvin, gain[0], gain[2], 3x3 colour-correction matrix
+//
+// Older x3f-tools returned the literal preset name "ColorTemp" and then
+// failed because that key is not in either property list.  Interpolate the
+// camera-provided table instead.
+//
+// The two table gains are not in the same frame as the preset gain triplets.
+// Every preset triplet on a body is normalised so that
+// `gain[0] * gain[2] / gain[1]^2` is one body constant (about 1.29 on the
+// dp2 Quattro), while every table row is normalised so that
+// `gain[0] * gain[2]` is a different constant (about 0.905).  Taking the
+// table pair with an implicit middle gain of 1.0 therefore over-weights the
+// middle layer by roughly 19% and renders every ColorTemp file green.
+// Recover the implied middle gain from the preset invariant instead, then
+// rescale the triplet to a unit middle gain like the presets.  On the dp2
+// Quattro this puts a 5200 K manual white balance within 0.1% of the
+// Sunlight preset, which is what the physics predicts.
+const COLOR_TEMP_TABLE_COLUMNS: usize = 12;
+
+/// Geometric mean of `gain[0] * gain[2] / gain[1]^2` over the body's preset
+/// gain triplets.  `None` when no usable triplet is present.
+fn preset_gain_invariant(presets: impl IntoIterator<Item = [f64; 3]>) -> Option<f64> {
+    let mut log_sum = 0.0;
+    let mut count = 0usize;
+    for [r, g, b] in presets {
+        if ![r, g, b].iter().all(|v| v.is_finite() && *v > 0.0) {
+            continue;
+        }
+        log_sum += (r * b / (g * g)).ln();
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    let invariant = (log_sum / count as f64).exp();
+    (invariant.is_finite() && invariant > 0.0).then_some(invariant)
+}
+
+/// Map a `ColorTempTableInfo` `(gain[0], gain[2])` pair into the preset gain
+/// frame: solve for the middle gain that satisfies the preset invariant,
+/// then normalise the triplet to a unit middle gain.
+fn color_temp_gains(row_r: f64, row_b: f64, preset_invariant: f64) -> Option<[f64; 3]> {
+    if ![row_r, row_b, preset_invariant]
+        .iter()
+        .all(|v| v.is_finite() && *v > 0.0)
+    {
+        return None;
+    }
+    let middle = (row_r * row_b / preset_invariant).sqrt();
+    let gains = [row_r / middle, 1.0, row_b / middle];
+    gains
+        .iter()
+        .all(|v| v.is_finite() && *v > 0.0)
+        .then_some(gains)
+}
+
+/// Preset gain invariant for this body, read from the same property lists
+/// the preset white-balance path uses.
+unsafe fn get_preset_gain_invariant(x3f: *mut x3f_t) -> Option<f64> {
+    for list in [c"WhiteBalanceGains", c"DP1_WhiteBalanceGains"] {
+        let mut names: *mut *mut libc::c_char = ptr::null_mut();
+        let mut values: *mut *mut libc::c_char = ptr::null_mut();
+        let mut num: std::os::raw::c_uint = 0;
+        if unsafe {
+            x3f_get_camf_property_list(
+                x3f,
+                list.as_ptr() as *mut _,
+                &mut names,
+                &mut values,
+                &mut num,
+            )
+        } == 0
+            || values.is_null()
+        {
+            continue;
+        }
+        let triplets = (0..num as usize).filter_map(|i| {
+            let matrix_name = unsafe { *values.add(i) };
+            if matrix_name.is_null() {
+                return None;
+            }
+            let mut gain = [0.0_f64; 3];
+            (unsafe {
+                x3f_get_camf_matrix(
+                    x3f,
+                    matrix_name,
+                    3,
+                    0,
+                    0,
+                    matrix_type_t_M_FLOAT,
+                    gain.as_mut_ptr() as *mut libc::c_void,
+                )
+            } != 0)
+                .then_some(gain)
+        });
+        if let Some(invariant) = preset_gain_invariant(triplets) {
+            return Some(invariant);
+        }
+    }
+    None
+}
+
+fn interpolate_color_temp_row(
+    table: &[f64],
+    rows: usize,
+    columns: usize,
+    kelvin: f64,
+) -> Option<[f64; COLOR_TEMP_TABLE_COLUMNS]> {
+    if rows == 0
+        || columns < COLOR_TEMP_TABLE_COLUMNS
+        || table.len() < rows.checked_mul(columns)?
+        || !kelvin.is_finite()
+        || kelvin <= 0.0
+    {
+        return None;
+    }
+
+    let mut previous_kelvin = 0.0;
+    for row in table[..rows * columns].chunks_exact(columns) {
+        if row[..COLOR_TEMP_TABLE_COLUMNS]
+            .iter()
+            .any(|v| !v.is_finite())
+            || row[0] <= previous_kelvin
+            || row[1] <= 0.0
+            || row[2] <= 0.0
+        {
+            return None;
+        }
+        previous_kelvin = row[0];
+    }
+
+    let first = &table[..columns];
+    let last = &table[(rows - 1) * columns..rows * columns];
+    let (lower, upper) = if kelvin <= first[0] {
+        (first, first)
+    } else if kelvin >= last[0] {
+        (last, last)
+    } else {
+        let upper_index = (1..rows).find(|&row| table[row * columns] >= kelvin)?;
+        (
+            &table[(upper_index - 1) * columns..upper_index * columns],
+            &table[upper_index * columns..(upper_index + 1) * columns],
+        )
+    };
+
+    let span = upper[0] - lower[0];
+    let weight = if span > 0.0 {
+        ((kelvin - lower[0]) / span).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let mut result = [0.0; COLOR_TEMP_TABLE_COLUMNS];
+    for (column, value) in result.iter_mut().enumerate() {
+        *value = lower[column] + weight * (upper[column] - lower[column]);
+        if !value.is_finite() {
+            return None;
+        }
+    }
+    Some(result)
+}
+
+unsafe fn get_color_temp_row(
+    x3f: *mut x3f_t,
+    wb: *mut libc::c_char,
+) -> Option<[f64; COLOR_TEMP_TABLE_COLUMNS]> {
+    if wb.is_null() || unsafe { CStr::from_ptr(wb) }.to_bytes() != b"ColorTemp" {
+        return None;
+    }
+
+    let mut kelvin = 0.0;
+    if unsafe { x3f_get_camf_float(x3f, c"ColorTempValue".as_ptr() as *mut _, &mut kelvin) } == 0 {
+        return None;
+    }
+
+    let mut rows = 0;
+    let mut columns = 0;
+    let mut table: *mut libc::c_void = ptr::null_mut();
+    if unsafe {
+        x3f_get_camf_matrix_var(
+            x3f,
+            c"ColorTempTableInfo".as_ptr() as *mut _,
+            &mut rows,
+            &mut columns,
+            ptr::null_mut(),
+            matrix_type_t_M_FLOAT,
+            &mut table,
+        )
+    } == 0
+        || rows <= 0
+        || columns < COLOR_TEMP_TABLE_COLUMNS as libc::c_int
+        || table.is_null()
+    {
+        return None;
+    }
+
+    let rows = rows as usize;
+    let columns = columns as usize;
+    let elements = rows.checked_mul(columns)?;
+    let values = unsafe { std::slice::from_raw_parts(table as *const f64, elements) };
+    interpolate_color_temp_row(values, rows, columns, kelvin)
+}
+
 const D65_XYZ: [f64; 3] = [0.95047, 1.00000, 1.08883];
 
 /// Compute the raw-space neutral that corresponds to D65 white through
@@ -106,17 +312,37 @@ pub unsafe extern "C" fn x3f_get_gain(
     // The empty body on the first branch means: try A, if A fails try
     // B; either succeeds → fall through with gain populated. We mirror
     // that as a short-circuit OR.
-    let direct = unsafe {
-        x3f_get_camf_matrix_for_wb(x3f, c"WhiteBalanceGains".as_ptr() as *mut _, wb, 3, 0, gain)
-            != 0
-            || x3f_get_camf_matrix_for_wb(
-                x3f,
-                c"DP1_WhiteBalanceGains".as_ptr() as *mut _,
-                wb,
-                3,
-                0,
-                gain,
-            ) != 0
+    let direct = if let Some(row) = unsafe { get_color_temp_row(x3f, wb) } {
+        let Some(gains) = unsafe { get_preset_gain_invariant(x3f) }
+            .and_then(|invariant| color_temp_gains(row[1], row[2], invariant))
+        else {
+            unsafe {
+                x3f_printf(
+                    x3f_verbosity_t_ERR,
+                    c"Could not map ColorTemp gains into the preset white-balance frame\n".as_ptr(),
+                );
+            }
+            return 0;
+        };
+        unsafe {
+            *gain.add(0) = gains[0];
+            *gain.add(1) = gains[1];
+            *gain.add(2) = gains[2];
+        }
+        true
+    } else {
+        unsafe {
+            x3f_get_camf_matrix_for_wb(x3f, c"WhiteBalanceGains".as_ptr() as *mut _, wb, 3, 0, gain)
+                != 0
+                || x3f_get_camf_matrix_for_wb(
+                    x3f,
+                    c"DP1_WhiteBalanceGains".as_ptr() as *mut _,
+                    wb,
+                    3,
+                    0,
+                    gain,
+                ) != 0
+        }
     };
 
     if !direct {
@@ -208,23 +434,28 @@ pub unsafe extern "C" fn x3f_get_bmt_to_xyz(
     let mut cam_to_xyz = [0.0_f64; 9];
     let mut wb_correction = [0.0_f64; 9];
 
-    let cc_path = unsafe {
-        x3f_get_camf_matrix_for_wb(
-            x3f,
-            c"WhiteBalanceColorCorrections".as_ptr() as *mut _,
-            wb,
-            3,
-            3,
-            cc_matrix.as_mut_ptr(),
-        ) != 0
-            || x3f_get_camf_matrix_for_wb(
+    let cc_path = if let Some(row) = unsafe { get_color_temp_row(x3f, wb) } {
+        cc_matrix.copy_from_slice(&row[3..12]);
+        true
+    } else {
+        unsafe {
+            x3f_get_camf_matrix_for_wb(
                 x3f,
-                c"DP1_WhiteBalanceColorCorrections".as_ptr() as *mut _,
+                c"WhiteBalanceColorCorrections".as_ptr() as *mut _,
                 wb,
                 3,
                 3,
                 cc_matrix.as_mut_ptr(),
             ) != 0
+                || x3f_get_camf_matrix_for_wb(
+                    x3f,
+                    c"DP1_WhiteBalanceColorCorrections".as_ptr() as *mut _,
+                    wb,
+                    3,
+                    3,
+                    cc_matrix.as_mut_ptr(),
+                ) != 0
+        }
     };
 
     if cc_path {
@@ -3665,7 +3896,10 @@ static _A_X3F_GET_PREVIEW: unsafe extern "C" fn(
 
 #[cfg(test)]
 mod tests {
-    use super::{intermediate_levels, shoulder_compress, INTERMEDIATE_UNIT};
+    use super::{
+        color_temp_gains, intermediate_levels, interpolate_color_temp_row, preset_gain_invariant,
+        shoulder_compress, INTERMEDIATE_UNIT,
+    };
 
     #[test]
     fn uniform_digital_gain_preserves_intermediate_levels() {
@@ -3758,6 +3992,149 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Preset gain triplets and the 5200 K table row from a SIGMA dp2 Quattro.
+    const DP2Q_PRESET_GAINS: [[f64; 3]; 9] = [
+        [1.14215, 1.0, 1.12677], // Sunlight
+        [1.24481, 1.0, 1.03470], // Shade
+        [1.16013, 1.0, 1.10675], // Overcast
+        [0.87500, 1.0, 1.43874], // Incandescent
+        [1.06427, 1.0, 1.25716], // Fluorescent
+        [1.22989, 1.0, 1.04506], // Flash
+        [1.11700, 1.0, 1.16597], // Auto
+        [1.11783, 1.0, 1.15631], // AutoLSP
+        [0.71074, 1.0, 1.75519], // Custom
+    ];
+
+    #[test]
+    fn preset_gain_invariant_is_a_body_constant() {
+        let invariant = preset_gain_invariant(DP2Q_PRESET_GAINS).unwrap();
+        assert!((invariant - 1.2868).abs() < 1e-3, "{invariant}");
+        for [r, g, b] in DP2Q_PRESET_GAINS {
+            let k = r * b / (g * g);
+            assert!((k / invariant - 1.0).abs() < 0.05, "{k} vs {invariant}");
+        }
+    }
+
+    #[test]
+    fn preset_gain_invariant_skips_unusable_triplets() {
+        let invariant = preset_gain_invariant([
+            [1.14215, 1.0, 1.12677],
+            [0.0, 1.0, 1.0],
+            [f64::NAN, 1.0, 1.0],
+            [1.0, -1.0, 1.0],
+        ])
+        .unwrap();
+        assert!((invariant - 1.14215 * 1.12677).abs() < 1e-12);
+        assert!(preset_gain_invariant([[0.0, 1.0, 1.0]]).is_none());
+        assert!(preset_gain_invariant(std::iter::empty()).is_none());
+    }
+
+    #[test]
+    fn color_temp_gains_land_in_the_preset_frame() {
+        // 5200 K row interpolated from the dp2 Quattro ColorTempTableInfo.
+        let (row_r, row_b) = (0.959052, 0.944622);
+        let invariant = preset_gain_invariant(DP2Q_PRESET_GAINS).unwrap();
+        let gains = color_temp_gains(row_r, row_b, invariant).unwrap();
+        assert_eq!(gains[1], 1.0);
+        // The triplet now satisfies the body invariant exactly ...
+        assert!((gains[0] * gains[2] / (gains[1] * gains[1]) - invariant).abs() < 1e-9);
+        // ... and a 5200 K manual WB lands on the Sunlight preset.
+        let sunlight = DP2Q_PRESET_GAINS[0];
+        assert!((gains[0] - sunlight[0]).abs() < 0.005, "{:?}", gains);
+        assert!((gains[2] - sunlight[2]).abs() < 0.005, "{:?}", gains);
+        // The naive implicit-unit-middle reading is ~19% off, i.e. green.
+        assert!((row_r / gains[0] - 0.839).abs() < 0.005);
+    }
+
+    #[test]
+    fn color_temp_gains_reject_degenerate_inputs() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(color_temp_gains(bad, 0.9, 1.28).is_none());
+            assert!(color_temp_gains(0.9, bad, 1.28).is_none());
+            assert!(color_temp_gains(0.9, 0.9, bad).is_none());
+        }
+    }
+
+    #[test]
+    fn color_temp_table_interpolates_gain_and_matrix_values() {
+        let mut table = Vec::new();
+        table.extend([
+            5000.0, 0.9, 0.8, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0,
+        ]);
+        table.extend([
+            5500.0, 1.0, 1.2, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0,
+        ]);
+
+        let row = interpolate_color_temp_row(&table, 2, 12, 5250.0).unwrap();
+        assert_eq!(row[0], 5250.0);
+        assert!((row[1] - 0.95).abs() < 1e-12);
+        assert_eq!(row[2], 1.0);
+        assert_eq!(row[11], 9.5);
+    }
+
+    #[test]
+    fn color_temp_table_clamps_out_of_range_temperature() {
+        let low = [
+            5000.0, 0.9, 0.8, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0,
+        ];
+        let high = [
+            5500.0, 1.0, 1.2, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0,
+        ];
+        let table = [low, high].concat();
+
+        assert_eq!(
+            interpolate_color_temp_row(&table, 2, 12, 1000.0).unwrap(),
+            low
+        );
+        assert_eq!(
+            interpolate_color_temp_row(&table, 2, 12, 9000.0).unwrap(),
+            high
+        );
+    }
+
+    #[test]
+    fn color_temp_table_rejects_malformed_data() {
+        assert!(interpolate_color_temp_row(&[], 0, 12, 5200.0).is_none());
+        assert!(interpolate_color_temp_row(&[0.0; 11], 1, 11, 5200.0).is_none());
+        assert!(interpolate_color_temp_row(&[0.0; 12], 2, 12, 5200.0).is_none());
+        assert!(interpolate_color_temp_row(&[0.0; 12], 1, 12, f64::NAN).is_none());
+
+        let valid = [
+            5000.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        assert_eq!(
+            interpolate_color_temp_row(&valid, 1, 12, 5200.0),
+            Some(valid)
+        );
+        for kelvin in [0.0, -1.0, f64::INFINITY] {
+            assert!(interpolate_color_temp_row(&valid, 1, 12, kelvin).is_none());
+        }
+        for column in 0..12 {
+            for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let mut row = valid;
+                row[column] = bad;
+                assert!(interpolate_color_temp_row(&row, 1, 12, 5200.0).is_none());
+            }
+        }
+        for column in 0..3 {
+            for bad in [0.0, -1.0] {
+                let mut row = valid;
+                row[column] = bad;
+                assert!(interpolate_color_temp_row(&row, 1, 12, 5200.0).is_none());
+            }
+        }
+        for kelvin in [4000.0, 5000.0] {
+            let mut table = [valid, valid].concat();
+            table[12] = kelvin;
+            assert!(interpolate_color_temp_row(&table, 2, 12, 5200.0).is_none());
+        }
+        let mut table = [valid, valid].concat();
+        table[12] = 5500.0;
+        table[3] = -f64::MAX;
+        table[15] = f64::MAX;
+        assert!(interpolate_color_temp_row(&table, 2, 12, 5200.0).is_none());
     }
 
     fn s_for(global_max: f64, knee: f64) -> f64 {
