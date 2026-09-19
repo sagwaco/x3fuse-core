@@ -2,11 +2,11 @@
 
 Command-line converter for Sigma Foveon **X3F** raw files. Decodes Merrill, classic (SD9/SD14-era), and Quattro sensors and writes **DNG**, **TIFF**, **PPM**, embedded **JPEG** thumbnails, **metadata** dumps, and **histogram** CSVs.
 
-Built to power [X3Fuse](https://github.com/sagwaco/x3fuse), which provides a GUI for converting X3F files to DNG, TIFF, and JPEG. The codebase is a pure-Rust Cargo workspace (only two tiny C log/version shims remain) so it builds on every target (including `wasm32`) with no external dependencies.
+Built to power [X3Fuse](https://github.com/sagwaco/x3fuse), which provides a GUI for converting X3F files to DNG, TIFF, and JPEG. The codebase is a Rust Cargo workspace with two tiny C log/version shims. OpenCV is not required.
 
 ## Quick start
 
-Prerequisite: a Rust toolchain ([rustup](https://rustup.rs)).
+Prerequisites: Rust 1.88 or newer ([rustup](https://rustup.rs)), a C compiler and standard headers, and libclang for bindgen. No external TIFF or JPEG library is required.
 
 ```sh
 cargo build --release
@@ -14,6 +14,23 @@ target/release/x3f_extract -dng photo.X3F
 ```
 
 This produces `target/release/x3f_extract`. Multiple input files are processed in parallel.
+
+## Rust library
+
+Add the safe API crate to your application's `Cargo.toml`:
+
+```toml
+[dependencies]
+x3f-core = "0.1.5"
+```
+
+[`convert_file`](https://docs.rs/x3f-core/0.1.5/x3f_core/fn.convert_file.html)
+synchronously converts one file to DNG, TIFF, or its embedded JPEG. Pass an
+`AtomicBool` for cooperative cancellation and a callback for the four
+`ConversionStage` updates. Each call owns its reader and processing options,
+so a desktop application can run independent conversions on blocking workers.
+The destination must not already exist; failed or cancelled conversions remove
+the output they created.
 
 ## Usage
 

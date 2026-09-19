@@ -27,6 +27,7 @@
 #   -h, --help      Show this help.
 #
 # <version> is a bare semver like `0.1.1` — the `v` prefix is added for the tag.
+# Crates.io publication is a separate step; see docs/src/contributing.md.
 #
 # Requires: bash, git, cargo, perl on PATH (plus `gh` for --push).
 
@@ -78,7 +79,6 @@ done
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ROOT_MANIFEST="$ROOT/Cargo.toml"
-SYS_MANIFEST="$ROOT/crates/x3f-sys/Cargo.toml"
 cd "$ROOT"
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git work tree"
@@ -108,6 +108,8 @@ run_verify() {
     note "cargo build --workspace --all-targets (refreshes Cargo.lock)"
     cargo build --workspace --all-targets
     note "cargo test --workspace";                          cargo test --workspace
+    note "verify crates.io packages (no upload)"
+    cargo publish --dry-run --allow-dirty -p x3f-sys -p x3f-core
 }
 
 confirm() {
@@ -185,30 +187,32 @@ fi
 # Bump every place the version is written by hand:
 #   - [workspace.package] version           (root Cargo.toml)
 #   - [workspace.dependencies] x3f-* pins    (root Cargo.toml)
-#   - crates/x3f-sys/Cargo.toml version      (the only crate not on version.workspace)
-# The other crates inherit via `version.workspace = true`. perl -i is used for
+# All crates inherit via `version.workspace = true`. perl -i is used for
 # identical behavior on macOS (BSD) and Linux (GNU) hosts. \Q…\E quotes the dots.
 CUR_V="$CURRENT" NEW_V="$VERSION" perl -i -pe \
     's/^version = "\Q$ENV{CUR_V}\E"$/version = "$ENV{NEW_V}"/' "$ROOT_MANIFEST"
 CUR_V="$CURRENT" NEW_V="$VERSION" perl -i -pe \
     's/, version = "\Q$ENV{CUR_V}\E" \}/, version = "$ENV{NEW_V}" }/g' "$ROOT_MANIFEST"
-CUR_V="$CURRENT" NEW_V="$VERSION" perl -i -pe \
-    's/^version = "\Q$ENV{CUR_V}\E"$/version = "$ENV{NEW_V}"/' "$SYS_MANIFEST"
 
 # Fail loudly if any manifest still carries the old version where we expected a bump.
 grep -q "^version = \"$VERSION\"" "$ROOT_MANIFEST" || die "failed to bump $ROOT_MANIFEST"
-grep -q "^version = \"$VERSION\"" "$SYS_MANIFEST"  || die "failed to bump $SYS_MANIFEST"
+
+# Cargo packages files inside each crate. Keep the shipped license and
+# attribution identical to the canonical workspace copies.
+for crate in x3f-sys x3f-core; do
+    cp LICENSE NOTICE "crates/$crate/"
+done
 
 echo
 note "version changes:"
-git --no-pager diff -- "$ROOT_MANIFEST" "$SYS_MANIFEST"
+git --no-pager diff -- "$ROOT_MANIFEST" crates/x3f-{sys,core}/{LICENSE,NOTICE}
 echo
 
 run_verify
 
 note "committing version bump"
-# Cargo.lock is gitignored in this repo, so only the manifests are committed.
-git add "$ROOT_MANIFEST" "$SYS_MANIFEST"
+# Cargo.lock is gitignored; commit the manifest and packaged notices.
+git add "$ROOT_MANIFEST" crates/x3f-{sys,core}/{LICENSE,NOTICE}
 git commit -m "release: $TAG"
 
 if [[ "$DO_PUSH" -eq 1 ]]; then
@@ -234,4 +238,6 @@ Next steps:
   2. On an up-to-date main, run:
          scripts/release.sh $VERSION --tag
      to create and push $TAG, which triggers the CI 'publish release' job.
+  3. Publish x3f-sys and x3f-core to crates.io using the separate procedure in
+     docs/src/contributing.md (GitHub release CI does not publish crates).
 EOF

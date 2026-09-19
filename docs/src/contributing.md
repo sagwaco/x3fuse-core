@@ -33,6 +33,42 @@ the diffs small enough that parity-validation MD5s stay
 interpretable. Don't refactor adjacent code unless your change makes
 it dead.
 
+## Publishing the Rust libraries
+
+`x3f-sys` and `x3f-core` are published together at the workspace version.
+They require Rust 1.88 or newer, plus a C compiler and libclang for the
+remaining shims and bindgen. Multi-package publication requires
+[Cargo 1.90 or newer](https://doc.rust-lang.org/cargo/CHANGELOG.html#cargo-190-2025-09-18);
+the commands below were verified with Cargo 1.98.1.
+
+For a new version, `scripts/release.sh <version> --push` updates the
+workspace version and internal dependency requirements, copies the root
+`LICENSE` and `NOTICE` into both crates, runs the verification gates and a
+publication dry run, and opens the version-bump PR. Merge it first.
+The existing tag workflow publishes GitHub binaries; crates.io publication
+is a separate step from a clean checkout of the merged revision:
+
+```sh
+cargo login
+cargo publish --dry-run -p x3f-sys -p x3f-core
+cargo publish -p x3f-sys -p x3f-core
+```
+
+Cargo orders the packages by dependency, publishing `x3f-sys` before
+`x3f-core`. If publication stops after the first package succeeds, publish
+only the remaining package after checking its version on crates.io.
+Do not use `--no-verify`; the dry run compiles the packaged archives,
+including the headers and C shims shipped with `x3f-sys`.
+
+When changing license or attribution text outside a version bump, also
+refresh the regular files included in each crate before packaging:
+
+```sh
+for crate in x3f-sys x3f-core; do
+    cp LICENSE NOTICE "crates/$crate/"
+done
+```
+
 ## Port conventions
 
 A handful of conventions show up over and over in the milestone
