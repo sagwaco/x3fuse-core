@@ -105,6 +105,33 @@ pub unsafe extern "C" fn x3f_get_camf_matrix_var(
     }
 
     let dims = entry.matrix_dim_entry;
+    if !(1..=3).contains(&entry.matrix_dim)
+        || dims.is_null()
+        || entry.matrix_decoded.is_null()
+        || matrix.is_null()
+    {
+        return 0;
+    }
+    // Validate borrowed CAMF matrix storage before exposing dimensions.
+    let mut elements = 1usize;
+    for i in 0..entry.matrix_dim as usize {
+        let size = unsafe { (*dims.add(i)).size };
+        if size == 0 || size > c_int::MAX as u32 {
+            return 0;
+        }
+        let Some(product) = elements.checked_mul(size as usize) else {
+            return 0;
+        };
+        elements = product;
+    }
+    let element_size = if typ == matrix_type_t_M_FLOAT {
+        std::mem::size_of::<f64>()
+    } else {
+        std::mem::size_of::<u32>()
+    };
+    if elements != entry.matrix_elements as usize || elements > isize::MAX as usize / element_size {
+        return 0;
+    }
     match entry.matrix_dim {
         3 => {
             if dim2.is_null() || dim1.is_null() || dim0.is_null() {
@@ -531,3 +558,81 @@ static _A13: unsafe extern "C" fn(
 ) -> c_int = x3f_get_camf_matrix_for_wb;
 #[used]
 static _A14: unsafe extern "C" fn(*mut x3f_t, *mut u32) -> c_int = x3f_get_max_raw;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matrix_accessor_rejects_invalid_storage_and_dimensions() {
+        // Stack-owned storage exercises the accessor independently of the parser.
+        let mut values = [1u32, 2, 3, 4, 5, 6];
+        let mut dims: [camf_dim_entry_t; 2] = unsafe { std::mem::zeroed() };
+        let mut entry: camf_entry_t = unsafe { std::mem::zeroed() };
+        entry.id = ID_MATRIX;
+        entry.name_address = c"matrix".as_ptr() as *mut _;
+        entry.matrix_decoded_type = matrix_type_t_M_UINT;
+        // Valid, empty, mismatched, excessive, and absent backing storage.
+        for (shape, count, dimensions, null_dims, null_data, null_output, expected) in [
+            ([2, 3], 6, 2, false, false, false, 1),
+            ([0, 3], 0, 2, false, false, false, 0),
+            ([2, 3], 5, 2, false, false, false, 0),
+            ([65536, 65537], 65536, 2, false, false, false, 0),
+            ([u32::MAX, 3], 6, 2, false, false, false, 0),
+            ([2, 3], 6, 0, false, false, false, 0),
+            ([2, 3], 6, 4, false, false, false, 0),
+            ([2, 3], 6, 2, true, false, false, 0),
+            ([2, 3], 6, 2, false, true, false, 0),
+            ([2, 3], 6, 2, false, false, true, 0),
+        ] {
+            dims[0].size = shape[0];
+            dims[1].size = shape[1];
+            entry.matrix_dim = dimensions;
+            entry.matrix_elements = count;
+            entry.matrix_dim_entry = if null_dims {
+                ptr::null_mut()
+            } else {
+                dims.as_mut_ptr()
+            };
+            entry.matrix_decoded = if null_data {
+                ptr::null_mut()
+            } else {
+                values.as_mut_ptr().cast()
+            };
+            let mut directory: x3f_directory_entry_t = unsafe { std::mem::zeroed() };
+            directory.header.identifier = 0x6343_4553; // SECc
+            directory.header.data_subsection.camf.entry_table = camf_entry_table_t {
+                size: 1,
+                element: &mut entry,
+            };
+            let mut x3f: x3f_t = unsafe { std::mem::zeroed() };
+            x3f.directory_section.num_directory_entries = 1;
+            x3f.directory_section.directory_entry = &mut directory;
+            let (mut rows, mut columns) = (-1, -1);
+            let mut data = ptr::null_mut();
+            let result = unsafe {
+                x3f_get_camf_matrix_var(
+                    &mut x3f,
+                    c"matrix".as_ptr() as *mut _,
+                    &mut rows,
+                    &mut columns,
+                    ptr::null_mut(),
+                    matrix_type_t_M_UINT,
+                    if null_output {
+                        ptr::null_mut()
+                    } else {
+                        &mut data
+                    },
+                )
+            };
+            assert_eq!(result, expected, "shape {shape:?}, count {count}");
+            if expected == 1 {
+                assert_eq!((rows, columns), (2, 3));
+                assert_eq!(data, values.as_mut_ptr().cast());
+            } else {
+                assert_eq!((rows, columns), (-1, -1));
+                assert!(data.is_null());
+            }
+        }
+    }
+}

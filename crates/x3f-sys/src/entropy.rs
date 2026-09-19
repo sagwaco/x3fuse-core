@@ -43,7 +43,7 @@ struct HuffNode {
 }
 
 #[repr(C)]
-struct HuffTree {
+pub(crate) struct HuffTree {
     free_node_index: u32,
     nodes: *mut HuffNode,
 }
@@ -147,414 +147,393 @@ fn is_quattro_format(t: u32) -> bool {
     )
 }
 
-// ---------------------------------------------------------------------------
-// Bit reader. Mirrors the C `bit_state_t` semantics: each byte is split into
-// eight individual bits at consume time, MSB first. The C code pre-allocates
-// an 8-byte staging array for each byte; we keep the same shape so that any
-// off-by-one in either implementation surfaces identically.
-// ---------------------------------------------------------------------------
+use crate::control::{Control, Error, Result};
 
-struct BitReader {
-    next: *const u8,
-    bit_offset: u8,
-    bits: [u8; 8],
+pub(crate) struct BitReader<'a> {
+    bytes: &'a [u8],
+    bit: usize,
 }
 
-impl BitReader {
-    unsafe fn new(addr: *const u8) -> Self {
-        BitReader {
-            next: addr,
-            bit_offset: 8,
-            bits: [0; 8],
-        }
+impl<'a> BitReader<'a> {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, bit: 0 }
     }
-
     #[inline]
-    unsafe fn get_bit(&mut self) -> u8 {
-        if self.bit_offset == 8 {
-            let mut byte = unsafe { *self.next };
-            for i in (0..8).rev() {
-                self.bits[i] = byte & 1;
-                byte >>= 1;
-            }
-            self.next = unsafe { self.next.add(1) };
-            self.bit_offset = 0;
-        }
-        let b = self.bits[self.bit_offset as usize];
-        self.bit_offset += 1;
-        b
+    pub(crate) fn get_bit(&mut self) -> Result<u8> {
+        let byte = *self
+            .bytes
+            .get(self.bit / 8)
+            .ok_or(Error::InvalidData("truncated entropy stream"))?;
+        let result = (byte >> (7 - self.bit % 8)) & 1;
+        self.bit += 1;
+        Ok(result)
     }
 }
 
-/// One TRUE-coded difference: walk the Huffman tree to a leaf to get a bit
-/// length, then read that many magnitude bits and sign-extend per the
-/// classic JPEG-style scheme.
 #[inline]
-unsafe fn get_true_diff(br: &mut BitReader, tree: *const HuffTree) -> i32 {
-    let nodes = unsafe { (*tree).nodes };
-    let mut node: *const HuffNode = nodes;
-
-    while !unsafe { (*node).branch[0] }.is_null() || !unsafe { (*node).branch[1] }.is_null() {
-        let bit = unsafe { br.get_bit() };
-        let next = unsafe { (*node).branch[bit as usize] };
-        if next.is_null() {
-            // Mirror the C error path: log-and-zero rather than panic.
-            return 0;
+unsafe fn read_leaf(br: &mut BitReader<'_>, tree: *const HuffTree) -> Result<u32> {
+    if tree.is_null() {
+        return Err(Error::InvalidData("missing Huffman tree"));
+    }
+    let tree = unsafe { &*tree };
+    if tree.nodes.is_null() || tree.free_node_index == 0 {
+        return Err(Error::InvalidData("empty Huffman tree"));
+    }
+    let start = tree.nodes as usize;
+    let bytes = tree.free_node_index as usize * std::mem::size_of::<HuffNode>();
+    let mut node = tree.nodes;
+    for _ in 0..=27 {
+        let offset = (node as usize)
+            .checked_sub(start)
+            .ok_or(Error::InvalidData("Huffman node outside tree"))?;
+        if offset >= bytes || offset % std::mem::size_of::<HuffNode>() != 0 {
+            return Err(Error::InvalidData("Huffman node outside tree"));
         }
-        node = next;
+        let value = unsafe { &*node };
+        if value.branch[0].is_null() && value.branch[1].is_null() {
+            if value.leaf == u32::MAX {
+                return Err(Error::InvalidData("undefined Huffman code"));
+            }
+            return Ok(value.leaf);
+        }
+        node = value.branch[br.get_bit()? as usize];
+        if node.is_null() {
+            return Err(Error::InvalidData("invalid Huffman code"));
+        }
     }
-
-    let bits = unsafe { (*node).leaf } as u32;
-    if bits == 0 {
-        return 0;
-    }
-
-    let first_bit = unsafe { br.get_bit() };
-    let mut diff = first_bit as i32;
-    for _ in 1..bits {
-        diff = (diff << 1) + unsafe { br.get_bit() } as i32;
-    }
-    if first_bit == 0 {
-        diff -= (1 << bits) - 1;
-    }
-    diff
+    Err(Error::InvalidData("Huffman tree exceeds maximum depth"))
 }
 
-/// Decode one of the three color planes of a TRUE-coded RAW image. Mirrors
-/// `true_decode_one_color` in src/x3f_io.c.
-unsafe fn true_decode_one_color(id_ptr: *const ImageData, color: usize) {
-    let id = unsafe { &*id_ptr };
-    let tru = unsafe { &*id.tru };
+#[inline]
+pub(crate) unsafe fn true_diff(br: &mut BitReader<'_>, tree: *const HuffTree) -> Result<i32> {
+    let bits = unsafe { read_leaf(br, tree) }?;
+    if bits > 31 {
+        return Err(Error::InvalidData("TRUE difference exceeds 31 bits"));
+    }
+    if bits == 0 {
+        return Ok(0);
+    }
+    let first = br.get_bit()?;
+    let mut difference = first as i64;
+    for _ in 1..bits {
+        difference = (difference << 1) | br.get_bit()? as i64;
+    }
+    if first == 0 {
+        difference -= (1i64 << bits) - 1;
+    }
+    Ok(difference as i32)
+}
 
-    let seed = tru.seed[color] as i32;
+unsafe fn true_decode_one_color(
+    id_ptr: *const ImageData,
+    color: usize,
+    control: Control<'_>,
+) -> Result<()> {
+    let id = unsafe { &*id_ptr };
+    if id.tru.is_null() || id.data.is_null() {
+        return Err(Error::InvalidData("missing TRUE data"));
+    }
+    let tru = unsafe { &*id.tru };
+    if tru.plane_size.size != 3 || tru.plane_size.element.is_null() {
+        return Err(Error::InvalidData("missing TRUE plane lengths"));
+    }
     let mut rows = id.rows;
     let mut cols = id.columns;
-
-    let (area_data_base, area_cols, area_channels) = if is_quattro_format(id.type_format) {
+    let mut output = &tru.x3rgb16;
+    let mut channel = color;
+    if is_quattro_format(id.type_format) {
+        if id.quattro.is_null() {
+            return Err(Error::InvalidData("missing Quattro planes"));
+        }
         let q = unsafe { &*id.quattro };
         rows = q.plane[color].rows as u32;
         cols = q.plane[color].columns as u32;
         if q.quattro_layout != 0 && color == 2 {
-            // Quattro top plane is single-channel and lives in q.top16.
-            (q.top16.data, q.top16.columns, q.top16.channels as usize)
-        } else {
-            let cs = tru.x3rgb16.channels as usize;
-            (
-                unsafe { tru.x3rgb16.data.add(color) },
-                tru.x3rgb16.columns,
-                cs,
-            )
-        }
-    } else {
-        let cs = tru.x3rgb16.channels as usize;
-        (
-            unsafe { tru.x3rgb16.data.add(color) },
-            tru.x3rgb16.columns,
-            cs,
-        )
-    };
-
-    let mut br = unsafe { BitReader::new(tru.plane_address[color]) };
-    let mut row_start_acc = [[seed; 2]; 2];
-    let mut dst = area_data_base;
-
-    for row in 0..rows {
-        let odd_row = (row & 1) as usize;
-        let mut acc = [0i32; 2];
-
-        for col in 0..cols {
-            let odd_col = (col & 1) as usize;
-            let diff = unsafe { get_true_diff(&mut br, &tru.tree) };
-            let prev = if col < 2 {
-                row_start_acc[odd_row][odd_col]
-            } else {
-                acc[odd_col]
-            };
-            let value = prev + diff;
-            acc[odd_col] = value;
-            if col < 2 {
-                row_start_acc[odd_row][odd_col] = value;
-            }
-
-            // Discard padding columns at the right for binned Quattro plane 2.
-            if col >= area_cols {
-                continue;
-            }
-
-            unsafe { *dst = value as u16 };
-            dst = unsafe { dst.add(area_channels) };
+            output = &q.top16;
+            channel = 0;
         }
     }
+    if output.data.is_null()
+        || rows != output.rows
+        || cols < output.columns
+        || channel >= output.channels as usize
+        || output.row_stride
+            < output
+                .columns
+                .checked_mul(output.channels)
+                .ok_or(Error::Allocation)?
+    {
+        return Err(Error::InvalidData("invalid TRUE output geometry"));
+    }
+    let start = (tru.plane_address[color] as usize)
+        .checked_sub(id.data as usize)
+        .ok_or(Error::InvalidData("TRUE plane outside image"))?;
+    let length = unsafe { *tru.plane_size.element.add(color) } as usize;
+    if start
+        .checked_add(length)
+        .map_or(true, |end| end > id.data_size as usize)
+    {
+        return Err(Error::InvalidData("TRUE plane outside image"));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(tru.plane_address[color], length) };
+    let mut br = BitReader::new(bytes);
+    let mut starts = [[tru.seed[color] as i32; 2]; 2];
+    for row in 0..rows {
+        control.check()?;
+        let parity = (row & 1) as usize;
+        let mut acc = [0i32; 2];
+        for col in 0..cols {
+            if col % 4096 == 0 {
+                control.check()?;
+            }
+            let odd = (col & 1) as usize;
+            let previous = if col < 2 {
+                starts[parity][odd]
+            } else {
+                acc[odd]
+            };
+            let diff = unsafe { true_diff(&mut br, &tru.tree) }?;
+            let value = previous
+                .checked_add(diff)
+                .ok_or(Error::InvalidData("TRUE predictor overflow"))?;
+            acc[odd] = value;
+            if col < 2 {
+                starts[parity][odd] = value;
+            }
+            if col < output.columns {
+                let index = row as usize * output.row_stride as usize
+                    + col as usize * output.channels as usize
+                    + channel;
+                unsafe { *output.data.add(index) = value as u16 };
+            }
+        }
+    }
+    Ok(())
 }
 
-/// Native Rust replacement for `true_decode` in src/x3f_io.c. Decodes all
-/// three color planes of a TRUE-coded RAW image into the C-side preallocated
-/// `TRU->x3rgb16` (and `Q->top16` for quattro_layout color 2) buffers.
-///
-/// M7d — the three color planes have *independent* Huffman bitstreams
-/// (`tru.plane_address[color]`) and write to *disjoint* output regions
-/// (color 0/1/2 stagger into `tru.x3rgb16.data` at offsets {0,1,2} with
-/// stride `channels`=3, or color 2 in Quattro layout writes to its own
-/// `q.top16.data` buffer entirely). Shared reads are immutable
-/// (`tru.tree`, `tru.seed[]`, dimensions). Decoding the three planes on
-/// parallel rayon workers cuts entropy-decode wall-time by ~3× on
-/// Merrill TRUE inputs, which dominate single-image cost.
-///
-/// # Safety
-///
-/// `id` must be a non-null `*mut x3f_image_data_t` whose `tru` field has been
-/// fully populated by `x3f_load_true`: Huffman tree built, plane addresses
-/// computed, output buffers allocated.
-#[no_mangle]
-pub(crate) unsafe extern "C" fn x3f_rust_true_decode(id: *mut ImageData) {
-    assert!(!id.is_null(), "x3f_rust_true_decode: NULL ImageData");
-
-    // Sync-wrap the pointer so rayon's `Sync` closure bound is satisfied.
-    // SAFETY: see fn-level comment — disjoint writes per color, immutable
-    // shared reads through the `*const ImageData`.
-    //
-    // The pointer is exposed via a method (`as_ptr()`) rather than a tuple
-    // field so Rust 2021's disjoint-capture rule captures the whole
-    // (Sync) struct rather than the bare `*const ImageData` field.
-    #[derive(Copy, Clone)]
+pub(crate) unsafe fn true_decode(id: *mut ImageData, control: Control<'_>) -> Result<()> {
+    control.check()?;
+    if id.is_null() {
+        return Err(Error::InvalidData("missing TRUE image"));
+    }
+    #[derive(Clone, Copy)]
     struct SyncId(*const ImageData);
     unsafe impl Send for SyncId {}
     unsafe impl Sync for SyncId {}
     impl SyncId {
-        #[inline(always)]
-        fn as_ptr(self) -> *const ImageData {
+        fn get(self) -> *const ImageData {
             self.0
         }
     }
-    let sid = SyncId(id as *const ImageData);
-
+    let shared = SyncId(id);
     use rayon::prelude::*;
-    (0..3usize).into_par_iter().for_each(|color| {
-        unsafe { true_decode_one_color(sid.as_ptr(), color) };
-    });
+    (0..3usize)
+        .into_par_iter()
+        .try_for_each(|color| unsafe { true_decode_one_color(shared.get(), color, control) })
 }
 
-#[used]
-static _ANCHOR_X3F_RUST_TRUE_DECODE: unsafe extern "C" fn(*mut ImageData) = x3f_rust_true_decode;
+#[no_mangle]
+pub(crate) unsafe extern "C" fn x3f_rust_true_decode(id: *mut ImageData) {
+    let _ = unsafe { true_decode(id, Control::none()) };
+}
 
-// ---------------------------------------------------------------------------
-// M5c — Huffman + simple decoders.
-//
-// `huffman_decode` is the legacy path for X3F_IMAGE_RAW_HUFFMAN_X530 and
-// X3F_IMAGE_RAW_HUFFMAN_10BIT (older SD9/SD10-class raws), and for
-// X3F_IMAGE_THUMB_HUFFMAN (older thumbnails). Each row starts at an offset
-// listed in HUF->row_offsets; per pixel we walk the Huffman tree to a leaf,
-// add its value to the running per-channel accumulator. Output is 8-bit
-// for thumbs, 16-bit for raw.
-//
-// `simple_decode` is the uncompressed variant: each row is laid out as
-// packed `bits`-bit RGB triples in u32 words; we mask out each component
-// and (optionally) map it through HUF->mapping for X3F-lossy-compression
-// reverse-mapping.
-//
-// **Validation status:** the tier-3 differential test only exercises the
-// THUMB_HUFFMAN path on corpus that has Huffman thumbnails. We currently
-// have no SD9/SD10 raw files (see docs/PORT-PLAN.md M5 corpus question)
-// so RAW_HUFFMAN_* and `simple_decode` are sensor-validated at most via
-// the same code path on thumbnails. Layout asserts + structural unit
-// tests catch the obvious bugs; full sensor parity comes when the corpus
-// is augmented.
-//
-// Format constants
 const X3F_IMAGE_RAW_HUFFMAN_X530: u32 = 0x0003_0005;
 const X3F_IMAGE_RAW_HUFFMAN_10BIT: u32 = 0x0003_0006;
 const X3F_IMAGE_THUMB_HUFFMAN: u32 = 0x0002_000b;
 
-extern "C" {
-    static mut legacy_offset: std::os::raw::c_int;
-    static mut auto_legacy_offset: std::os::raw::c_int;
-}
-
-#[inline]
-unsafe fn get_huffman_diff(br: &mut BitReader, tree: *const HuffTree) -> i32 {
-    let nodes = unsafe { (*tree).nodes };
-    let mut node: *const HuffNode = nodes;
-    while !unsafe { (*node).branch[0] }.is_null() || !unsafe { (*node).branch[1] }.is_null() {
-        let bit = unsafe { br.get_bit() };
-        let next = unsafe { (*node).branch[bit as usize] };
-        if next.is_null() {
-            return 0;
+unsafe fn write_huffman_pixel(
+    id: &ImageData,
+    huf: &Huffman,
+    row: u32,
+    col: usize,
+    color: usize,
+    value: u32,
+) -> Result<()> {
+    let index = 3 * (row as usize * id.columns as usize + col) + color;
+    match id.type_format {
+        X3F_IMAGE_RAW_HUFFMAN_X530 | X3F_IMAGE_RAW_HUFFMAN_10BIT => {
+            if huf.x3rgb16.data.is_null() {
+                return Err(Error::InvalidData("missing Huffman output"));
+            }
+            unsafe { *huf.x3rgb16.data.add(index) = value as u16 };
         }
-        node = next;
+        X3F_IMAGE_THUMB_HUFFMAN => {
+            if huf.rgb8.data.is_null() {
+                return Err(Error::InvalidData("missing Huffman thumbnail output"));
+            }
+            unsafe { *huf.rgb8.data.add(index) = value as u8 };
+        }
+        _ => return Err(Error::InvalidData("unsupported Huffman format")),
     }
-    unsafe { (*node).leaf as i32 }
+    Ok(())
 }
 
-#[inline]
-unsafe fn get_simple_diff(huf: &Huffman, index: u16) -> i32 {
-    if huf.mapping.size == 0 {
-        index as i32
-    } else {
-        let elem = unsafe { *huf.mapping.element.add(index as usize) };
-        elem as i32
-    }
-}
-
-/// Mirror of `huffman_decode_row`. Decodes one row of either a 16-bit raw
-/// (X3F_IMAGE_RAW_HUFFMAN_*) or an 8-bit thumb (X3F_IMAGE_THUMB_HUFFMAN).
 unsafe fn huffman_decode_row(
     id: &ImageData,
     huf: &Huffman,
     row: u32,
     offset: i32,
     minimum: &mut i32,
-) {
-    let row_off = unsafe { *huf.row_offsets.element.add(row as usize) };
-    let stream_base = unsafe { (id.data as *const u8).add(row_off as usize) };
-    let mut br = unsafe { BitReader::new(stream_base) };
-
-    let mut c: [i16; 3] = [offset as i16, offset as i16, offset as i16];
-    let cols = id.columns as usize;
-    let row_us = row as usize;
-
-    for col in 0..cols {
-        for color in 0..3usize {
-            let diff = unsafe { get_huffman_diff(&mut br, &huf.tree) };
-            c[color] = c[color].wrapping_add(diff as i16);
-            let c_val = c[color] as i32;
-            let c_fix = if c_val < 0 {
-                if c_val < *minimum {
-                    *minimum = c_val;
-                }
-                0u32
-            } else {
-                c_val as u32
-            };
-
-            match id.type_format {
-                X3F_IMAGE_RAW_HUFFMAN_X530 | X3F_IMAGE_RAW_HUFFMAN_10BIT => unsafe {
-                    *huf.x3rgb16.data.add(3 * (row_us * cols + col) + color) = c_fix as u16;
-                },
-                X3F_IMAGE_THUMB_HUFFMAN => unsafe {
-                    *huf.rgb8.data.add(3 * (row_us * cols + col) + color) = c_fix as u8;
-                },
-                // The C falls through to a printf and silently corrupts; we
-                // do the same (no write) — should be unreachable since the
-                // dispatcher only calls us for these three type_formats.
-                _ => {}
-            }
-        }
-    }
-}
-
-/// Mirror of `huffman_decode`: per-row decode driver with the auto-
-/// legacy-offset retry. If `auto_legacy_offset` is set and any row dipped
-/// below zero on the first pass, we re-decode all rows with the offset
-/// shifted up so the negative excursion lands at zero.
-unsafe fn huffman_decode_impl(id: *mut ImageData, _bits: i32) {
-    let id_ref = unsafe { &*id };
-    let huf = unsafe { &*id_ref.huffman };
-    let mut minimum: i32 = 0;
-    let mut offset: i32 = unsafe { legacy_offset };
-
-    for row in 0..id_ref.rows {
-        unsafe { huffman_decode_row(id_ref, huf, row, offset, &mut minimum) };
-    }
-
-    let auto = unsafe { auto_legacy_offset };
-    if auto != 0 && minimum < 0 {
-        offset = -minimum;
-        for row in 0..id_ref.rows {
-            unsafe { huffman_decode_row(id_ref, huf, row, offset, &mut minimum) };
-        }
-    }
-}
-
-/// Mirror of `simple_decode_row`. Each row is `row_stride` bytes of
-/// packed `bits`-per-component RGB triples in 32-bit words.
-unsafe fn simple_decode_row(id: &ImageData, huf: &Huffman, bits: i32, row: u32, row_stride: u32) {
-    let mask: u32 = match bits {
-        8 => 0xff,
-        9 => 0x1ff,
-        10 => 0x3ff,
-        11 => 0x7ff,
-        12 => 0xfff,
-        _ => return, // C logs and zeros; unreachable from the dispatcher
+    control: Control<'_>,
+) -> Result<()> {
+    let start = unsafe { *huf.row_offsets.element.add(row as usize) } as usize;
+    let end = if row + 1 < id.rows {
+        (unsafe { *huf.row_offsets.element.add(row as usize + 1) }) as usize
+    } else {
+        id.data_size as usize
     };
+    if start >= end || end > id.data_size as usize {
+        return Err(Error::InvalidData("Huffman row outside image"));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(id.data.cast::<u8>().add(start), end - start) };
+    let mut br = BitReader::new(bytes);
+    let mut acc = [offset as i16; 3];
+    for col in 0..id.columns as usize {
+        if col % 4096 == 0 {
+            control.check()?;
+        }
+        for (color, value) in acc.iter_mut().enumerate() {
+            let diff = unsafe { read_leaf(&mut br, &huf.tree) }? as i32;
+            *value = value.wrapping_add(diff as i16);
+            *minimum = (*minimum).min(*value as i32);
+            unsafe {
+                write_huffman_pixel(id, huf, row, col, color, (*value as i32).max(0) as u32)
+            }?;
+        }
+    }
+    Ok(())
+}
 
-    let row_off = (row as usize) * (row_stride as usize);
-    let row_words = unsafe { (id.data as *const u32).add(row_off / 4) };
+pub(crate) unsafe fn huffman_decode(
+    id: *mut ImageData,
+    _bits: i32,
+    control: Control<'_>,
+) -> Result<()> {
+    control.check()?;
+    if id.is_null() {
+        return Err(Error::InvalidData("missing Huffman image"));
+    }
+    let id = unsafe { &*id };
+    if id.huffman.is_null() || id.data.is_null() {
+        return Err(Error::InvalidData("missing Huffman data"));
+    }
+    let huf = unsafe { &*id.huffman };
+    if huf.row_offsets.size != id.rows || huf.row_offsets.element.is_null() {
+        return Err(Error::InvalidData("missing Huffman row offsets"));
+    }
+    let mut minimum = 0i32;
+    let mut offset = unsafe { crate::legacy_offset };
+    for row in 0..id.rows {
+        control.check()?;
+        unsafe { huffman_decode_row(id, huf, row, offset, &mut minimum, control) }?;
+    }
+    if unsafe { crate::auto_legacy_offset } != 0 && minimum < 0 {
+        offset = -minimum;
+        for row in 0..id.rows {
+            control.check()?;
+            unsafe { huffman_decode_row(id, huf, row, offset, &mut minimum, control) }?;
+        }
+    }
+    Ok(())
+}
 
-    let mut c: [u16; 3] = [0; 3];
-    let cols = id.columns as usize;
-    let row_us = row as usize;
-
-    for col in 0..cols {
-        let val = unsafe { *row_words.add(col) };
-        for color in 0..3usize {
-            let idx = ((val >> (color * bits as usize)) & mask) as u16;
-            let d = unsafe { get_simple_diff(huf, idx) };
-            c[color] = c[color].wrapping_add(d as u16);
-
-            match id.type_format {
-                X3F_IMAGE_RAW_HUFFMAN_X530 | X3F_IMAGE_RAW_HUFFMAN_10BIT => {
-                    // C: `c_fix = (int16_t)c[color] > 0 ? c[color] : 0;`
-                    let signed = c[color] as i16;
-                    let c_fix = if signed > 0 { c[color] } else { 0 };
-                    unsafe {
-                        *huf.x3rgb16.data.add(3 * (row_us * cols + col) + color) = c_fix;
+pub(crate) unsafe fn simple_decode(
+    id: *mut ImageData,
+    bits: i32,
+    row_stride: i32,
+    control: Control<'_>,
+) -> Result<()> {
+    control.check()?;
+    if id.is_null() || row_stride <= 0 || !(8..=10).contains(&bits) {
+        return Err(Error::InvalidData("invalid simple decoder dimensions"));
+    }
+    let id = unsafe { &*id };
+    if id.huffman.is_null() || id.data.is_null() {
+        return Err(Error::InvalidData("missing simple image data"));
+    }
+    let huf = unsafe { &*id.huffman };
+    let stride = row_stride as usize;
+    if id.columns as usize * 4 > stride
+        || stride
+            .checked_mul(id.rows as usize)
+            .map_or(true, |n| n > id.data_size as usize)
+    {
+        return Err(Error::InvalidData("simple image raster exceeds input"));
+    }
+    let mask = (1u32 << bits) - 1;
+    for row in 0..id.rows {
+        control.check()?;
+        let mut acc = [0u16; 3];
+        for col in 0..id.columns as usize {
+            if col % 4096 == 0 {
+                control.check()?;
+            }
+            let address = unsafe { id.data.cast::<u8>().add(row as usize * stride + col * 4) };
+            let packed = unsafe { u32::from_le(ptr_read_u32(address)) };
+            for (color, value) in acc.iter_mut().enumerate() {
+                let index = ((packed >> (color * bits as usize)) & mask) as usize;
+                let diff = if huf.mapping.size == 0 {
+                    index as u16
+                } else {
+                    if index >= huf.mapping.size as usize || huf.mapping.element.is_null() {
+                        return Err(Error::InvalidData("simple mapping index outside table"));
                     }
-                }
-                X3F_IMAGE_THUMB_HUFFMAN => {
-                    let signed = (c[color] as u8) as i8;
-                    let c_fix = if signed > 0 { c[color] as u8 } else { 0 };
-                    unsafe {
-                        *huf.rgb8.data.add(3 * (row_us * cols + col) + color) = c_fix;
-                    }
-                }
-                _ => {}
+                    unsafe { *huf.mapping.element.add(index) }
+                };
+                *value = value.wrapping_add(diff);
+                let positive = if id.type_format == X3F_IMAGE_THUMB_HUFFMAN {
+                    (*value as u8 as i8) > 0
+                } else {
+                    (*value as i16) > 0
+                };
+                unsafe {
+                    write_huffman_pixel(
+                        id,
+                        huf,
+                        row,
+                        col,
+                        color,
+                        if positive { *value as u32 } else { 0 },
+                    )
+                }?;
             }
         }
     }
+    Ok(())
 }
 
-unsafe fn simple_decode_impl(id: *mut ImageData, bits: i32, row_stride: i32) {
-    let id_ref = unsafe { &*id };
-    let huf = unsafe { &*id_ref.huffman };
-    for row in 0..id_ref.rows {
-        unsafe { simple_decode_row(id_ref, huf, bits, row, row_stride as u32) };
-    }
+unsafe fn ptr_read_u32(pointer: *const u8) -> u32 {
+    unsafe { std::ptr::read_unaligned(pointer.cast::<u32>()) }
 }
 
-/// C entry point matching the `huffman_decode(I, DE, bits)` signature.
-/// Called from the X3F_RUST_DECODE dispatch in src/x3f_io.c.
 #[no_mangle]
 pub(crate) unsafe extern "C" fn x3f_rust_huffman_decode(
     id: *mut ImageData,
     bits: std::os::raw::c_int,
 ) {
-    assert!(!id.is_null(), "x3f_rust_huffman_decode: NULL ImageData");
-    unsafe { huffman_decode_impl(id, bits) };
+    let _ = unsafe { huffman_decode(id, bits, Control::none()) };
 }
 
-/// C entry point matching the `simple_decode(I, DE, bits, row_stride)`
-/// signature.
 #[no_mangle]
 pub(crate) unsafe extern "C" fn x3f_rust_simple_decode(
     id: *mut ImageData,
     bits: std::os::raw::c_int,
     row_stride: std::os::raw::c_int,
 ) {
-    assert!(!id.is_null(), "x3f_rust_simple_decode: NULL ImageData");
-    unsafe { simple_decode_impl(id, bits, row_stride) };
+    let _ = unsafe { simple_decode(id, bits, row_stride, Control::none()) };
 }
 
 #[used]
+static _ANCHOR_X3F_RUST_TRUE_DECODE: unsafe extern "C" fn(*mut ImageData) = x3f_rust_true_decode;
+#[used]
 static _ANCHOR_X3F_RUST_HUFFMAN_DECODE: unsafe extern "C" fn(*mut ImageData, std::os::raw::c_int) =
     x3f_rust_huffman_decode;
-
 #[used]
 static _ANCHOR_X3F_RUST_SIMPLE_DECODE: unsafe extern "C" fn(
     *mut ImageData,
     std::os::raw::c_int,
     std::os::raw::c_int,
 ) = x3f_rust_simple_decode;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,12 +589,33 @@ mod tests {
     #[test]
     fn bit_reader_msb_first_within_byte() {
         let bytes: Vec<u8> = vec![0b1010_0110, 0b1100_0011];
-        let mut br = unsafe { BitReader::new(bytes.as_ptr()) };
+        let mut br = BitReader::new(&bytes);
         let mut got = 0u32;
         for _ in 0..16 {
-            got = (got << 1) | unsafe { br.get_bit() } as u32;
+            got = (got << 1) | br.get_bit().unwrap() as u32;
         }
         assert_eq!(got, 0b1010_0110_1100_0011);
+        assert!(matches!(br.get_bit(), Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn malformed_codes_and_cancelled_decode_return_errors() {
+        for leaf in [32, u32::MAX] {
+            let mut nodes = [HuffNode {
+                branch: [std::ptr::null_mut(); 2],
+                leaf,
+            }];
+            let tree = HuffTree {
+                free_node_index: 1,
+                nodes: nodes.as_mut_ptr(),
+            };
+            assert!(unsafe { true_diff(&mut BitReader::new(&[0]), &tree) }.is_err());
+        }
+        let token = std::sync::atomic::AtomicBool::new(true);
+        assert!(matches!(
+            unsafe { true_decode(std::ptr::null_mut(), Control::new(&token)) },
+            Err(Error::Cancelled)
+        ));
     }
 
     /// Synthesise a tiny TRUE-coded plane and decode it. Tree has one symbol
@@ -625,18 +625,20 @@ mod tests {
     fn decode_constant_seed_plane() {
         // Tree: single root node with two branches both leading to the
         // length-0 leaf (so both bits 0 and 1 yield 0-magnitude diffs).
-        let mut leaf = HuffNode {
-            branch: [std::ptr::null_mut(); 2],
-            leaf: 0,
-        };
-        let leaf_ptr = &mut leaf as *mut HuffNode;
-        let mut root = HuffNode {
-            branch: [leaf_ptr, leaf_ptr],
-            leaf: 0,
-        };
+        let mut nodes = [
+            HuffNode {
+                branch: [std::ptr::null_mut(); 2],
+                leaf: u32::MAX,
+            },
+            HuffNode {
+                branch: [std::ptr::null_mut(); 2],
+                leaf: 0,
+            },
+        ];
+        nodes[0].branch = [&mut nodes[1] as *mut HuffNode; 2];
         let tree = HuffTree {
             free_node_index: 2,
-            nodes: &mut root as *mut HuffNode,
+            nodes: nodes.as_mut_ptr(),
         };
 
         // 1 byte of bit stream is enough to satisfy a 4x4 plane: 16 reads,
@@ -653,6 +655,7 @@ mod tests {
             row_stride: 4 * 3,
         };
 
+        let mut sizes = [4u32; 3];
         let mut tru = True {
             seed: [123, 0, 0],
             unknown: 0,
@@ -661,8 +664,8 @@ mod tests {
                 element: std::ptr::null_mut(),
             },
             plane_size: Table32 {
-                size: 0,
-                element: std::ptr::null_mut(),
+                size: 3,
+                element: sizes.as_mut_ptr(),
             },
             plane_address: [
                 stream.as_ptr() as *mut u8,
@@ -683,11 +686,11 @@ mod tests {
             huffman: std::ptr::null_mut(),
             tru: &mut tru as *mut True,
             quattro: std::ptr::null_mut(),
-            data: std::ptr::null_mut(),
-            data_size: 0,
+            data: stream.as_ptr() as *mut c_void,
+            data_size: stream.len() as u32,
         };
 
-        unsafe { true_decode_one_color(&id as *const ImageData, 0) };
+        unsafe { true_decode_one_color(&id as *const ImageData, 0, Control::none()) }.unwrap();
 
         for row in 0..4 {
             for col in 0..4 {

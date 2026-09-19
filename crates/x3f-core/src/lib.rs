@@ -41,11 +41,13 @@ use x3f_sys as sys;
 // we touch here (FILE / fopen / fclose / free).
 use x3f_sys::sysabi as libc;
 
+mod conversion;
 mod globals;
 mod icc;
 mod image;
 pub mod output;
 
+pub use conversion::{convert_file, ConversionReport, ConversionStage, OutputFormat};
 pub use globals::{
     set_log_callback, set_max_printed_matrix_elements, set_offset_legacy, set_verbosity,
     LogCallback, Verbosity,
@@ -196,6 +198,12 @@ impl Default for ProcessOptions {
 /// Errors returned by this crate.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// The caller requested cancellation; no final output should be published.
+    #[error("conversion cancelled")]
+    Cancelled,
+    /// The input or requested conversion is invalid.
+    #[error("invalid X3F data: {0}")]
+    InvalidData(String),
     /// The input file could not be opened.
     #[error("could not open input file `{path}`: {source}")]
     OpenInput {
@@ -255,6 +263,16 @@ impl LibraryError {
             sys::x3f_return_e_X3F_INTERNAL_ERROR => LibraryError::Internal,
             other => LibraryError::Unknown(other.into()),
         })
+    }
+}
+
+impl From<sys::Error> for Error {
+    fn from(error: sys::Error) -> Self {
+        match error {
+            sys::Error::Cancelled => Self::Cancelled,
+            sys::Error::InvalidData(message) => Self::InvalidData(message.to_string()),
+            other => Self::InvalidData(other.to_string()),
+        }
     }
 }
 
@@ -336,7 +354,17 @@ impl Reader {
         };
         // SAFETY: file is a valid FILE*; sys::FILE is layout-equivalent
         // to libc::FILE.
-        let x3f_ptr = unsafe { sys::x3f_new_from_file(file.as_ptr() as *mut sys::FILE) };
+        let x3f_ptr = match unsafe {
+            sys::new_from_file(file.as_ptr() as *mut sys::FILE, sys::Control::none())
+        } {
+            Ok(pointer) => pointer,
+            Err(error) => {
+                unsafe {
+                    libc::fclose(file.as_ptr());
+                }
+                return Err(error.into());
+            }
+        };
         let Some(x3f) = NonNull::new(x3f_ptr) else {
             // SAFETY: file is the FILE* we just opened.
             unsafe { libc::fclose(file.as_ptr()) };
@@ -351,13 +379,31 @@ impl Reader {
 
     /// Open and parse an X3F file's directory.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let path = path.as_ref();
-        let cpath = path_to_cstring(path)?;
-        let mode = c"rb";
-        // SAFETY: cpath and mode are valid C strings owned by this stack
-        // frame. fopen returns NULL on failure, otherwise a fresh FILE* we
-        // own.
-        let file_ptr = unsafe { libc::fopen(cpath.as_ptr(), mode.as_ptr()) };
+        Self::open_with_control(path.as_ref(), sys::Control::none())
+    }
+
+    fn open_with_control(path: &Path, control: sys::Control<'_>) -> Result<Self, Error> {
+        control.check()?;
+        #[cfg(not(windows))]
+        let file_ptr = {
+            let cpath = path_to_cstring(path)?;
+            // SAFETY: both strings are terminated and outlive fopen.
+            unsafe { libc::fopen(cpath.as_ptr(), c"rb".as_ptr()) }
+        };
+        #[cfg(windows)]
+        let file_ptr = {
+            use std::os::windows::ffi::OsStrExt;
+            let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+            if wide.contains(&0) {
+                return Err(Error::PathNul);
+            }
+            wide.push(0);
+            unsafe extern "C" {
+                fn _wfopen(path: *const u16, mode: *const u16) -> *mut libc::FILE;
+            }
+            // SAFETY: native Windows UTF-16 paths avoid the narrow CRT code page.
+            unsafe { _wfopen(wide.as_ptr(), [b'r' as u16, b'b' as u16, 0].as_ptr()) }
+        };
         let Some(file) = NonNull::new(file_ptr) else {
             return Err(Error::OpenInput {
                 path: path.display().to_string(),
@@ -369,7 +415,16 @@ impl Reader {
         // for the lifetime of Reader. libc::FILE and bindgen's FILE are both
         // opaque aliases of the same platform stdio struct; the cast is a
         // pointer reinterpretation only.
-        let x3f_ptr = unsafe { sys::x3f_new_from_file(file.as_ptr() as *mut sys::FILE) };
+        let x3f_ptr = match unsafe { sys::new_from_file(file.as_ptr() as *mut sys::FILE, control) }
+        {
+            Ok(pointer) => pointer,
+            Err(error) => {
+                unsafe {
+                    libc::fclose(file.as_ptr());
+                }
+                return Err(error.into());
+            }
+        };
         let Some(x3f) = NonNull::new(x3f_ptr) else {
             // SAFETY: file is the FILE* we just opened.
             unsafe { libc::fclose(file.as_ptr()) };
@@ -393,8 +448,7 @@ impl Reader {
             return Err(Error::Library(LibraryError::Argument));
         }
         // SAFETY: x3f and de are non-null and valid.
-        let r = unsafe { sys::x3f_load_data(self.x3f.as_ptr(), de) };
-        check(r)
+        unsafe { sys::load_data(self.x3f.as_ptr(), de, sys::Control::none()) }.map_err(Into::into)
     }
 
     /// Decode the embedded JPEG thumbnail into memory.
@@ -430,8 +484,7 @@ impl Reader {
             return Err(Error::Library(LibraryError::Argument));
         }
         // SAFETY: de is non-null.
-        let r = unsafe { sys::x3f_load_data(self.x3f.as_ptr(), de) };
-        check(r)
+        unsafe { sys::load_data(self.x3f.as_ptr(), de, sys::Control::none()) }.map_err(Into::into)
     }
 
     /// Load the RAW image block without decoding (used for `-raw` dump).
@@ -442,8 +495,8 @@ impl Reader {
             return Err(Error::Library(LibraryError::Argument));
         }
         // SAFETY: de is non-null.
-        let r = unsafe { sys::x3f_load_image_block(self.x3f.as_ptr(), de) };
-        check(r)
+        unsafe { sys::load_image_block(self.x3f.as_ptr(), de, sys::Control::none()) }
+            .map_err(Into::into)
     }
 
     /// Dump the metadata to a file (textual format matching the legacy CLI).
@@ -482,7 +535,7 @@ impl Reader {
         // legacy x3f_dump.c assumed the same).
         let (data, size) = unsafe {
             let img = (*de).header.data_subsection.image_data;
-            (img.data, (*de).input.size)
+            (img.data, img.data_size)
         };
         if data.is_null() {
             return Err(Error::Library(LibraryError::Internal));

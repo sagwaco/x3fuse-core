@@ -23,6 +23,7 @@
 //! at link time; no C stub competes for the symbol (the old
 //! `csrc/denoise_stub.c` that once held one has been deleted).
 
+use crate::Control;
 use std::slice;
 
 /// Mirror of `x3f_area16_t` from `x3f_io.h`. We accept raw pointers to the
@@ -113,7 +114,19 @@ fn sat_u16(v: f64) -> u16 {
 /// Bicubic 2x upscale of one channel from src (src_w x src_h) to dst
 /// (2*src_w x 2*src_h). Both buffers are tightly packed (no per-row padding
 /// beyond the channel data).
+#[cfg(test)]
 fn resize_bicubic_2x(src: &[u16], src_w: u32, src_h: u32, dst: &mut [u16]) {
+    resize_bicubic_2x_controlled(src, src_w, src_h, dst, Control::none()).unwrap();
+}
+
+fn resize_bicubic_2x_controlled(
+    src: &[u16],
+    src_w: u32,
+    src_h: u32,
+    dst: &mut [u16],
+    control: Control<'_>,
+) -> crate::Result<()> {
+    control.check()?;
     let sw = src_w as i32;
     let sh = src_h as i32;
     let dw = 2 * src_w as usize;
@@ -145,6 +158,7 @@ fn resize_bicubic_2x(src: &[u16], src_w: u32, src_h: u32, dst: &mut [u16]) {
     // vertical (dh x dw). Intermediate buffer is f64 to retain precision.
     let mut tmp = vec![0.0f64; src_h as usize * dw];
     for y in 0..src_h as usize {
+        control.check()?;
         let row_off = y * src_w as usize;
         let dst_row = y * dw;
         for dst_x in 0..dw {
@@ -158,6 +172,7 @@ fn resize_bicubic_2x(src: &[u16], src_w: u32, src_h: u32, dst: &mut [u16]) {
     }
 
     for dst_y in 0..dh {
+        control.check()?;
         let sy = (dst_y as f64 + 0.5) * 0.5 - 0.5;
         let isy = sy.floor() as i32;
         let t = sy - isy as f64;
@@ -177,6 +192,7 @@ fn resize_bicubic_2x(src: &[u16], src_w: u32, src_h: u32, dst: &mut [u16]) {
             dst[dst_row + dst_x] = sat_u16(v);
         }
     }
+    Ok(())
 }
 
 /// Walk an interleaved 3-channel `x3f_area16_t` and apply the BMT->YUV
@@ -257,8 +273,21 @@ const STAGE_POST_UPSAMPLE: i32 = 1;
 /// # Safety
 /// `area` must point to a valid YUV-layout 3-channel `x3f_area16_t`.
 #[inline]
-unsafe fn denoise_active(area: *mut Area16, stage: i32, scale: f32) {
-    unsafe { crate::denoise::denoise_active_area(area, crate::denoise::DENOISE_F23, stage, scale) };
+unsafe fn denoise_active(
+    area: *mut Area16,
+    stage: i32,
+    scale: f32,
+    control: Control<'_>,
+) -> crate::Result<()> {
+    unsafe {
+        crate::denoise::denoise_active_area(
+            area,
+            crate::denoise::DENOISE_F23,
+            stage,
+            scale,
+            control,
+        )
+    }
 }
 
 /// Native Rust replacement for the OpenCV-backed `x3f_expand_quattro`. The
@@ -285,20 +314,54 @@ pub(crate) unsafe extern "C" fn x3f_expand_quattro(
     active_exp: *mut Area16,
     scale: f32,
 ) {
-    assert!(!image.is_null() && !qtop.is_null() && !expanded.is_null());
+    let _ = unsafe {
+        expand_quattro_controlled(
+            image,
+            active,
+            qtop,
+            expanded,
+            active_exp,
+            scale,
+            Control::none(),
+        )
+    };
+}
+
+pub(crate) unsafe fn expand_quattro_controlled(
+    image: *mut Area16,
+    active: *mut Area16,
+    qtop: *mut Area16,
+    expanded: *mut Area16,
+    active_exp: *mut Area16,
+    scale: f32,
+    control: Control<'_>,
+) -> crate::Result<()> {
+    control.check()?;
+    if image.is_null() || qtop.is_null() || expanded.is_null() {
+        return Err(crate::Error::InvalidData("missing Quattro image"));
+    }
 
     let img = unsafe { &*image };
     let qt = unsafe { &*qtop };
     let exp = unsafe { &*expanded };
 
-    assert_eq!(img.channels, 3, "image must be 3-channel");
-    assert_eq!(qt.channels, 1, "qtop must be 1-channel");
-    assert_eq!(exp.channels, 3, "expanded must be 3-channel");
-    assert_eq!(qt.rows, exp.rows, "qtop and expanded must agree on rows");
-    assert_eq!(
-        qt.columns, exp.columns,
-        "qtop and expanded must agree on columns"
-    );
+    if img.channels != 3
+        || qt.channels != 1
+        || exp.channels != 3
+        || qt.rows != exp.rows
+        || qt.columns != exp.columns
+        || img.rows == 0
+        || img.columns == 0
+        || exp.rows != 2 * img.rows
+        || exp.columns != 2 * img.columns
+        || img.data.is_null()
+        || qt.data.is_null()
+        || exp.data.is_null()
+    {
+        return Err(crate::Error::InvalidData(
+            "invalid Quattro image dimensions",
+        ));
+    }
 
     // Step 1: BMT -> YUV in place on the (still half-res) image. After
     // this, `active` (a sub-area view into image->data) is also YUV.
@@ -308,7 +371,7 @@ pub(crate) unsafe extern "C" fn x3f_expand_quattro(
     // (mirrors the legacy C++ `denoise_nlm(act, d->h)` call). No-op when
     // `active` is null (caller passed null because denoise was disabled).
     if !active.is_null() {
-        unsafe { denoise_active(active, STAGE_PRE_UPSAMPLE, scale) };
+        unsafe { denoise_active(active, STAGE_PRE_UPSAMPLE, scale, control) }?;
     }
 
     // Step 2: bicubic 2x upsample, per channel, image -> expanded.
@@ -317,8 +380,6 @@ pub(crate) unsafe extern "C" fn x3f_expand_quattro(
     let src_h = img.rows;
     let dst_w = exp.columns;
     let dst_h = exp.rows;
-    assert_eq!(dst_w, 2 * src_w);
-    assert_eq!(dst_h, 2 * src_h);
 
     // Deinterleave each channel into a tight buffer, resize, write back.
     let src_stride = img.row_stride as usize;
@@ -329,6 +390,7 @@ pub(crate) unsafe extern "C" fn x3f_expand_quattro(
     for c in 0..3usize {
         // Deinterleave channel c.
         for row in 0..src_h as usize {
+            control.check()?;
             let row_ptr = unsafe { img.data.add(row * src_stride) };
             let out_row = row * src_w as usize;
             for col in 0..src_w as usize {
@@ -336,10 +398,11 @@ pub(crate) unsafe extern "C" fn x3f_expand_quattro(
             }
         }
 
-        resize_bicubic_2x(&src_plane, src_w, src_h, &mut dst_plane);
+        resize_bicubic_2x_controlled(&src_plane, src_w, src_h, &mut dst_plane, control)?;
 
         // Re-interleave into expanded's channel c.
         for row in 0..dst_h as usize {
+            control.check()?;
             let row_ptr = unsafe { exp.data.add(row * dst_stride) };
             let in_row = row * dst_w as usize;
             for col in 0..dst_w as usize {
@@ -353,6 +416,7 @@ pub(crate) unsafe extern "C" fn x3f_expand_quattro(
     // directly; multiplying by 4 puts it on the same scale as Y = 4*T.
     let qt_stride = qt.row_stride as usize;
     for row in 0..dst_h as usize {
+        control.check()?;
         let qt_row = unsafe { slice::from_raw_parts(qt.data.add(row * qt_stride), dst_w as usize) };
         let exp_row = unsafe { exp.data.add(row * dst_stride) };
         for col in 0..dst_w as usize {
@@ -367,11 +431,13 @@ pub(crate) unsafe extern "C" fn x3f_expand_quattro(
     // Runs while `expanded` is still in YUV layout, before the final
     // YUV->BMT transform below.
     if !active_exp.is_null() {
-        unsafe { denoise_active(active_exp, STAGE_POST_UPSAMPLE, scale) };
+        unsafe { denoise_active(active_exp, STAGE_POST_UPSAMPLE, scale, control) }?;
     }
 
     // Step 4: YUV -> BMT in place on expanded.
+    control.check()?;
     unsafe { yuv_to_bmt_yis4t(expanded) };
+    control.check()
 }
 
 // Anchor `x3f_expand_quattro` so cross-crate dead-code elimination cannot

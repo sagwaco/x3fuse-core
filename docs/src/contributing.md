@@ -62,10 +62,30 @@ Two layers of MD5 baselines, one automated and one manual:
 
 **Automated (tier-2,
 [`crates/x3f-cli/tests/tier2_md5.rs`](../../crates/x3f-cli/tests/tier2_md5.rs)):**
-metadata dumps, the embedded JPEG thumbnail, and PPM rasters are pinned
-to exact hashes. Processed TIFF/DNG output is deliberately *not* in
+metadata dumps and PPM rasters are pinned to exact hashes; the embedded JPEG
+is compared byte-for-byte with its declared source section payload.
+Processed TIFF/DNG output is deliberately *not* in
 tier-2 — it shifts whenever the highlight-recovery work iterates;
 tier-3 perceptual diffs cover it.
+
+The desktop-library refactor fixes a JPEG extraction overread: the section's
+28-byte header was counted again after the allocated image payload. Extraction
+now copies exactly `image_data.data_size`, preserving the complete embedded JPEG
+while omitting those 28 unrelated trailing bytes. JPEG file hashes intentionally
+change; decoded pixels and the actual JPEG payload do not. The previous JPEG
+hash assertions now compare the declared section payload directly; no replacement
+hashes were guessed for unavailable fixtures.
+
+For local camera fixtures, the desktop API's cancellation and concurrent-option
+checks can be run with:
+
+```sh
+X3F_TEST_FILES=/absolute/path/to/fixtures cargo test -p x3f-core --test conversion --release
+```
+
+Set `X3F_BASELINE_DIR` to outputs from the pre-change CLI (`-no-denoise -dng`
+and `-no-denoise -tiff`) to additionally compare default DNG and TIFF bytes.
+The tests use up to two sorted X3F files; include Merrill and Quattro examples.
 
 **Manual (run before merging anything that touches the pipeline):**
 three reference baselines, produced with

@@ -279,11 +279,22 @@ impl LocalRecovery {
     /// Build in deterministic row order from normalized, pre-export samples.
     /// The callback is only used here; it is never retained or called during
     /// pixel reconstruction. Empty donor support still permits fallback.
+    #[cfg(test)]
     pub fn build(
         reliability: SensorReliability,
         sample: impl Fn(usize, usize) -> [f64; 3],
         recovery_cap: Option<f64>,
     ) -> Option<Self> {
+        Self::build_controlled(reliability, sample, recovery_cap, crate::Control::none())
+    }
+
+    pub fn build_controlled(
+        reliability: SensorReliability,
+        sample: impl Fn(usize, usize) -> [f64; 3],
+        recovery_cap: Option<f64>,
+        control: crate::Control<'_>,
+    ) -> Option<Self> {
+        control.check().ok()?;
         let count = reliability.rows.checked_mul(reliability.cols)?;
         if count == 0 || count != reliability.data.len() {
             return None;
@@ -292,6 +303,7 @@ impl LocalRecovery {
         let tile_cols = reliability.cols.checked_add(TILE_SIZE - 1)? / TILE_SIZE;
         let mut first = Level::new(tile_rows, tile_cols, TILE_SIZE)?;
         for row in 0..reliability.rows {
+            control.check().ok()?;
             for col in 0..reliability.cols {
                 if reliability.data[row * reliability.cols + col] != [255; 3] {
                     continue;
@@ -325,6 +337,7 @@ impl LocalRecovery {
                 previous.tile_size * 2,
             )?;
             for row in 0..previous.rows {
+                control.check().ok()?;
                 for col in 0..previous.cols {
                     next.tiles[(row / 2) * next.cols + col / 2]
                         .merge(&previous.tiles[row * previous.cols + col]);
@@ -333,7 +346,7 @@ impl LocalRecovery {
             levels.push(next);
         }
         let camera_color_support = if reliability.camera_map_channels != 0 {
-            build_camera_color_support(&reliability)
+            build_camera_color_support(&reliability, control)
         } else {
             None
         };
@@ -789,7 +802,10 @@ impl LocalRecovery {
 
 /// A short distance ramp for reference confidence only. Allocation failure
 /// retains the unfeathered mask instead of failing the conversion.
-fn build_camera_color_support(reliability: &SensorReliability) -> Option<Vec<[u8; 3]>> {
+fn build_camera_color_support(
+    reliability: &SensorReliability,
+    control: crate::Control<'_>,
+) -> Option<Vec<[u8; 3]>> {
     let rows = reliability.rows;
     let cols = reliability.cols;
     let count = rows.checked_mul(cols)?;
@@ -802,6 +818,7 @@ fn build_camera_color_support(reliability: &SensorReliability) -> Option<Vec<[u8
         support.push(std::array::from_fn(|c| if mask[c] == 0 { 0_u8 } else { 4 }));
     }
     for row in 0..rows {
+        control.check().ok()?;
         for col in 0..cols {
             let index = row * cols + col;
             for c in 0..3 {
@@ -817,6 +834,7 @@ fn build_camera_color_support(reliability: &SensorReliability) -> Option<Vec<[u8
         }
     }
     for row in (0..rows).rev() {
+        control.check().ok()?;
         for col in (0..cols).rev() {
             let index = row * cols + col;
             for c in 0..3 {

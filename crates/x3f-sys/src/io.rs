@@ -21,7 +21,6 @@
 //! byte (independent of host endianness).
 #![allow(clippy::missing_safety_doc)]
 
-use std::mem;
 use std::ptr;
 
 use crate::*;
@@ -46,198 +45,156 @@ const SIZE_COLOR_MODE: usize = 32;
 const NUM_EXT_DATA_2_1: usize = 32;
 const NUM_EXT_DATA_3_0: usize = 64;
 
-#[inline]
-unsafe fn get1(f: *mut libc::FILE) -> u32 {
-    unsafe { (libc::fgetc(f) as u32) & 0xFF }
-}
-
-#[inline]
-unsafe fn get4(f: *mut libc::FILE) -> u32 {
-    let b0 = unsafe { get1(f) };
-    let b1 = unsafe { get1(f) };
-    let b2 = unsafe { get1(f) };
-    let b3 = unsafe { get1(f) };
-    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
-}
-
-#[inline]
-unsafe fn get4f(f: *mut libc::FILE) -> f32 {
-    let bits = unsafe { get4(f) };
-    f32::from_bits(bits)
-}
-
-/// Loop on partial reads (mirrors PUT_GET_N). On a 0-byte short read the
-/// C source prints "Failure to access file" and exits — preserve that.
-unsafe fn getn(f: *mut libc::FILE, buf: *mut u8, size: usize) {
-    let mut left = size;
-    let mut p = buf;
-    while left != 0 {
-        let cur = unsafe { libc::fread(p as *mut libc::c_void, 1, left, f) };
-        if cur == 0 {
-            unsafe {
-                x3f_printf(x3f_verbosity_t_ERR, c"Failure to access file\n".as_ptr());
-                libc::exit(1);
+/// Parse a container without terminating the embedding process on invalid data.
+/// The caller retains ownership of `infile` and owns the returned X3F handle.
+pub unsafe fn new_from_file(
+    infile: *mut FILE,
+    control: crate::control::Control<'_>,
+) -> crate::control::Result<*mut x3f_t> {
+    use crate::control::Error;
+    use crate::parse::{alloc, Input};
+    let mut input = unsafe { Input::new(infile.cast(), control) }?;
+    let x3f = unsafe { alloc::<x3f_t>(1) }?;
+    unsafe { (*x3f).info.input.file = infile };
+    let parsed = (|| -> crate::control::Result<()> {
+        unsafe {
+            let h = &mut (*x3f).header;
+            h.identifier = input.u32()?;
+            if h.identifier != X3F_FOVB {
+                return Err(Error::InvalidData("invalid X3F signature"));
+            }
+            h.version = input.u32()?;
+            input.read(&mut h.unique_identifier)?;
+            if h.version < X3F_VERSION_4_0 {
+                h.mark_bits = input.u32()?;
+                h.columns = input.u32()?;
+                h.rows = input.u32()?;
+                h.rotation = input.u32()?;
+                if h.version >= X3F_VERSION_2_1 {
+                    let n = if h.version >= X3F_VERSION_3_0 {
+                        NUM_EXT_DATA_3_0
+                    } else {
+                        NUM_EXT_DATA_2_1
+                    };
+                    input.read(std::slice::from_raw_parts_mut(
+                        h.white_balance.as_mut_ptr().cast(),
+                        SIZE_WHITE_BALANCE,
+                    ))?;
+                    if !h.white_balance.contains(&0) {
+                        return Err(Error::InvalidData("unterminated white balance"));
+                    }
+                    if h.version >= X3F_VERSION_2_3 {
+                        input.read(std::slice::from_raw_parts_mut(
+                            h.color_mode.as_mut_ptr().cast(),
+                            SIZE_COLOR_MODE,
+                        ))?;
+                        if !h.color_mode.contains(&0) {
+                            return Err(Error::InvalidData("unterminated color mode"));
+                        }
+                    }
+                    input.read(&mut h.extended_types[..n])?;
+                    for value in &mut h.extended_data[..n] {
+                        *value = f32::from_bits(input.u32()?);
+                    }
+                }
+            }
+            let header_end = input.position();
+            let directory_tail = input
+                .end()
+                .checked_sub(4)
+                .ok_or(Error::InvalidData("missing directory"))?;
+            input.seek(directory_tail)?;
+            let directory_offset = input.u32()? as u64;
+            if directory_offset < header_end {
+                return Err(Error::InvalidData("directory overlaps header"));
+            }
+            input.seek(directory_offset)?;
+            let ds = &mut (*x3f).directory_section;
+            ds.identifier = input.u32()?;
+            if ds.identifier != 0x6443_4553 {
+                return Err(Error::InvalidData("invalid directory signature"));
+            }
+            ds.version = input.u32()?;
+            let count = input.u32()? as usize;
+            if count > input.remaining().saturating_sub(4) / 12 {
+                return Err(Error::InvalidData("directory count exceeds input"));
+            }
+            ds.directory_entry = alloc::<x3f_directory_entry_t>(count)?;
+            ds.num_directory_entries = count as u32;
+            for i in 0..count {
+                control.check()?;
+                let de = &mut *ds.directory_entry.add(i);
+                de.input.offset = input.u32()?;
+                de.input.size = input.u32()?;
+                de.type_ = input.u32()?;
+                let next = input.position();
+                let start = de.input.offset as u64;
+                let end = start + de.input.size as u64;
+                if start < header_end || end > directory_offset || de.input.size < 8 {
+                    return Err(Error::InvalidData("section outside container data"));
+                }
+                input.seek(start)?;
+                de.header.identifier = input.u32()?;
+                de.header.version = input.u32()?;
+                match de.header.identifier {
+                    X3F_SECP => {
+                        if de.input.size < 24 {
+                            return Err(Error::InvalidData("truncated property header"));
+                        }
+                        let pl = &mut de.header.data_subsection.property_list;
+                        pl.num_properties = input.u32()?;
+                        pl.character_format = input.u32()?;
+                        pl.reserved = input.u32()?;
+                        pl.total_length = input.u32()?;
+                    }
+                    X3F_SECI => {
+                        if de.input.size < 28 {
+                            return Err(Error::InvalidData("truncated image header"));
+                        }
+                        let id = &mut de.header.data_subsection.image_data;
+                        id.type_ = input.u32()?;
+                        id.format = input.u32()?;
+                        if id.type_ > 0xffff || id.format > 0xffff {
+                            return Err(Error::InvalidData("invalid image format"));
+                        }
+                        id.type_format = (id.type_ << 16) | id.format;
+                        id.columns = input.u32()?;
+                        id.rows = input.u32()?;
+                        id.row_stride = input.u32()?;
+                        if id.columns == 0 || id.rows == 0 {
+                            return Err(Error::InvalidData("empty image dimensions"));
+                        }
+                        crate::parse::checked_size(id.columns as usize, id.rows as usize)
+                            .and_then(|pixels| crate::parse::checked_size(pixels, 6))?;
+                    }
+                    X3F_SECC => {
+                        if de.input.size < 28 {
+                            return Err(Error::InvalidData("truncated CAMF header"));
+                        }
+                        let camf = &mut de.header.data_subsection.camf;
+                        camf.type_ = input.u32()?;
+                        camf.__bindgen_anon_1.tN.val0 = input.u32()?;
+                        camf.__bindgen_anon_1.tN.val1 = input.u32()?;
+                        camf.__bindgen_anon_1.tN.val2 = input.u32()?;
+                        camf.__bindgen_anon_1.tN.val3 = input.u32()?;
+                    }
+                    _ => {}
+                }
+                input.seek(next)?;
             }
         }
-        left -= cur;
-        p = unsafe { p.add(cur) };
+        Ok(())
+    })();
+    if let Err(error) = parsed {
+        unsafe { x3f_delete(x3f) };
+        return Err(error);
     }
+    Ok(x3f)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn x3f_new_from_file(infile: *mut FILE) -> *mut x3f_t {
-    let x3f = unsafe { libc::calloc(1, mem::size_of::<x3f_t>()) as *mut x3f_t };
-    if x3f.is_null() {
-        return ptr::null_mut();
-    }
-
-    unsafe {
-        (*x3f).info.error = ptr::null_mut();
-        (*x3f).info.input.file = infile;
-        (*x3f).info.output.file = ptr::null_mut();
-    }
-
-    if infile.is_null() {
-        // Match the C: stash a static "No infile" string and return the
-        // partially-initialised struct so the caller can read .info.error.
-        unsafe {
-            (*x3f).info.error = c"No infile".as_ptr() as *mut _;
-        }
-        return x3f;
-    }
-
-    let f = infile as *mut libc::FILE;
-
-    // Read file header.
-    unsafe {
-        libc::fseek(f, 0, libc::SEEK_SET);
-        (*x3f).header.identifier = get4(f);
-
-        if (*x3f).header.identifier != X3F_FOVB {
-            x3f_printf(x3f_verbosity_t_ERR, c"Faulty file type\n".as_ptr());
-            x3f_delete(x3f);
-            return ptr::null_mut();
-        }
-
-        (*x3f).header.version = get4(f);
-        getn(
-            f,
-            (*x3f).header.unique_identifier.as_mut_ptr(),
-            SIZE_UNIQUE_IDENTIFIER,
-        );
-
-        // For version >= 4.0 (Quattro-and-newer), the rest of the header
-        // fields are unknown and left zero.
-        if (*x3f).header.version < X3F_VERSION_4_0 {
-            (*x3f).header.mark_bits = get4(f);
-            (*x3f).header.columns = get4(f);
-            (*x3f).header.rows = get4(f);
-            (*x3f).header.rotation = get4(f);
-            if (*x3f).header.version >= X3F_VERSION_2_1 {
-                let num_ext_data: usize = if (*x3f).header.version >= X3F_VERSION_3_0 {
-                    NUM_EXT_DATA_3_0
-                } else {
-                    NUM_EXT_DATA_2_1
-                };
-                getn(
-                    f,
-                    (*x3f).header.white_balance.as_mut_ptr() as *mut u8,
-                    SIZE_WHITE_BALANCE,
-                );
-                if (*x3f).header.version >= X3F_VERSION_2_3 {
-                    getn(
-                        f,
-                        (*x3f).header.color_mode.as_mut_ptr() as *mut u8,
-                        SIZE_COLOR_MODE,
-                    );
-                }
-                getn(f, (*x3f).header.extended_types.as_mut_ptr(), num_ext_data);
-                for i in 0..num_ext_data {
-                    (*x3f).header.extended_data[i] = get4f(f);
-                }
-            }
-        }
-
-        // Jump to the directory section: last 4 bytes of the file are the
-        // directory offset.
-        libc::fseek(f, -4, libc::SEEK_END);
-        let dir_offset = get4(f) as libc::c_long;
-        libc::fseek(f, dir_offset, libc::SEEK_SET);
-
-        (*x3f).directory_section.identifier = get4(f);
-        (*x3f).directory_section.version = get4(f);
-        (*x3f).directory_section.num_directory_entries = get4(f);
-
-        let n = (*x3f).directory_section.num_directory_entries as usize;
-        if n > 0 {
-            let size = n * mem::size_of::<x3f_directory_entry_t>();
-            (*x3f).directory_section.directory_entry =
-                libc::calloc(1, size) as *mut x3f_directory_entry_t;
-        }
-
-        // Walk each directory entry. Read its header by seeking into the
-        // entry, then return to the directory pos for the next iteration.
-        for d in 0..n {
-            let de = (*x3f).directory_section.directory_entry.add(d);
-            (*de).input.offset = get4(f);
-            (*de).input.size = get4(f);
-            (*de).output.offset = 0;
-            (*de).output.size = 0;
-            (*de).type_ = get4(f);
-
-            let save_dir_pos = libc::ftell(f);
-            libc::fseek(f, (*de).input.offset as libc::c_long, libc::SEEK_SET);
-
-            (*de).header.identifier = get4(f);
-            (*de).header.version = get4(f);
-
-            match (*de).header.identifier {
-                X3F_SECP => {
-                    let pl = &mut (*de).header.data_subsection.property_list;
-                    pl.num_properties = get4(f);
-                    pl.character_format = get4(f);
-                    pl.reserved = get4(f);
-                    pl.total_length = get4(f);
-                    pl.data = ptr::null_mut();
-                    pl.data_size = 0;
-                }
-                X3F_SECI => {
-                    let id = &mut (*de).header.data_subsection.image_data;
-                    id.type_ = get4(f);
-                    id.format = get4(f);
-                    id.type_format = (id.type_ << 16) + id.format;
-                    id.columns = get4(f);
-                    id.rows = get4(f);
-                    id.row_stride = get4(f);
-                    id.huffman = ptr::null_mut();
-                    id.data = ptr::null_mut();
-                    id.data_size = 0;
-                }
-                X3F_SECC => {
-                    let camf = &mut (*de).header.data_subsection.camf;
-                    camf.type_ = get4(f);
-                    camf.__bindgen_anon_1.tN.val0 = get4(f);
-                    camf.__bindgen_anon_1.tN.val1 = get4(f);
-                    camf.__bindgen_anon_1.tN.val2 = get4(f);
-                    camf.__bindgen_anon_1.tN.val3 = get4(f);
-                    camf.data = ptr::null_mut();
-                    camf.data_size = 0;
-                    camf.table.element = ptr::null_mut();
-                    camf.table.size = 0;
-                    camf.tree.nodes = ptr::null_mut();
-                    camf.decoded_data = ptr::null_mut();
-                    camf.decoded_data_size = 0;
-                    camf.entry_table.element = ptr::null_mut();
-                    camf.entry_table.size = 0;
-                }
-                _ => {}
-            }
-
-            libc::fseek(f, save_dir_pos, libc::SEEK_SET);
-        }
-    }
-
-    x3f
+    unsafe { new_from_file(infile, crate::control::Control::none()) }.unwrap_or(ptr::null_mut())
 }
 
 // Cross-crate dead-code-elimination guard: anchor the no-mangle symbol so
@@ -389,6 +346,80 @@ unsafe fn free_camf_entry(entry: *mut camf_entry_t) {
     }
 }
 
+pub(crate) unsafe fn cleanup_entry(de: *mut x3f_directory_entry_t) {
+    unsafe {
+        let deh = &mut (*de).header;
+        match deh.identifier {
+            X3F_SECP => {
+                let pl = &mut deh.data_subsection.property_list;
+                for i in 0..pl.property_table.size as usize {
+                    let p = pl.property_table.element.add(i);
+                    if !(*p).name_utf8.is_null() {
+                        libc::free((*p).name_utf8 as *mut libc::c_void);
+                        (*p).name_utf8 = ptr::null_mut();
+                    }
+                    if !(*p).value_utf8.is_null() {
+                        libc::free((*p).value_utf8 as *mut libc::c_void);
+                        (*p).value_utf8 = ptr::null_mut();
+                    }
+                }
+                if !pl.property_table.element.is_null() {
+                    libc::free(pl.property_table.element as *mut libc::c_void);
+                    pl.property_table.element = ptr::null_mut();
+                }
+                pl.property_table.size = 0;
+                if !pl.data.is_null() {
+                    libc::free(pl.data as *mut libc::c_void);
+                    pl.data = ptr::null_mut();
+                }
+                pl.data_size = 0;
+            }
+            X3F_SECI => {
+                let id = &mut deh.data_subsection.image_data;
+                cleanup_huffman(&mut id.huffman);
+                cleanup_true(&mut id.tru);
+                cleanup_quattro(&mut id.quattro);
+                if !id.data.is_null() {
+                    libc::free(id.data as *mut libc::c_void);
+                    id.data = ptr::null_mut();
+                }
+                id.data_size = 0;
+            }
+            X3F_SECC => {
+                let camf = &mut deh.data_subsection.camf;
+                if !camf.data.is_null() {
+                    libc::free(camf.data as *mut libc::c_void);
+                    camf.data = ptr::null_mut();
+                }
+                if !camf.table.element.is_null() {
+                    libc::free(camf.table.element as *mut libc::c_void);
+                    camf.table.element = ptr::null_mut();
+                }
+                cleanup_huffman_tree(&mut camf.tree);
+                if !camf.decoded_data.is_null() {
+                    libc::free(camf.decoded_data as *mut libc::c_void);
+                    camf.decoded_data = ptr::null_mut();
+                }
+                for i in 0..camf.entry_table.size as usize {
+                    free_camf_entry(camf.entry_table.element.add(i));
+                }
+                if !camf.entry_table.element.is_null() {
+                    libc::free(camf.entry_table.element as *mut libc::c_void);
+                    camf.entry_table.element = ptr::null_mut();
+                }
+                camf.data_size = 0;
+                camf.table.size = 0;
+                camf.tree.free_node_index = 0;
+                camf.decoded_data_size = 0;
+                camf.entry_table.size = 0;
+                camf.decoding_start = ptr::null_mut();
+                camf.decoding_size = 0;
+            }
+            _ => {}
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn x3f_delete(x3f: *mut x3f_t) -> x3f_return_t {
     if x3f.is_null() {
@@ -400,66 +431,7 @@ pub unsafe extern "C" fn x3f_delete(x3f: *mut x3f_t) -> x3f_return_t {
         let ds = &mut (*x3f).directory_section;
         for d in 0..ds.num_directory_entries as usize {
             let de = ds.directory_entry.add(d);
-            let deh = &mut (*de).header;
-
-            match deh.identifier {
-                X3F_SECP => {
-                    let pl = &mut deh.data_subsection.property_list;
-                    for i in 0..pl.property_table.size as usize {
-                        let p = pl.property_table.element.add(i);
-                        if !(*p).name_utf8.is_null() {
-                            libc::free((*p).name_utf8 as *mut libc::c_void);
-                            (*p).name_utf8 = ptr::null_mut();
-                        }
-                        if !(*p).value_utf8.is_null() {
-                            libc::free((*p).value_utf8 as *mut libc::c_void);
-                            (*p).value_utf8 = ptr::null_mut();
-                        }
-                    }
-                    if !pl.property_table.element.is_null() {
-                        libc::free(pl.property_table.element as *mut libc::c_void);
-                        pl.property_table.element = ptr::null_mut();
-                    }
-                    if !pl.data.is_null() {
-                        libc::free(pl.data as *mut libc::c_void);
-                        pl.data = ptr::null_mut();
-                    }
-                }
-                X3F_SECI => {
-                    let id = &mut deh.data_subsection.image_data;
-                    cleanup_huffman(&mut id.huffman);
-                    cleanup_true(&mut id.tru);
-                    cleanup_quattro(&mut id.quattro);
-                    if !id.data.is_null() {
-                        libc::free(id.data as *mut libc::c_void);
-                        id.data = ptr::null_mut();
-                    }
-                }
-                X3F_SECC => {
-                    let camf = &mut deh.data_subsection.camf;
-                    if !camf.data.is_null() {
-                        libc::free(camf.data as *mut libc::c_void);
-                        camf.data = ptr::null_mut();
-                    }
-                    if !camf.table.element.is_null() {
-                        libc::free(camf.table.element as *mut libc::c_void);
-                        camf.table.element = ptr::null_mut();
-                    }
-                    cleanup_huffman_tree(&mut camf.tree);
-                    if !camf.decoded_data.is_null() {
-                        libc::free(camf.decoded_data as *mut libc::c_void);
-                        camf.decoded_data = ptr::null_mut();
-                    }
-                    for i in 0..camf.entry_table.size as usize {
-                        free_camf_entry(camf.entry_table.element.add(i));
-                    }
-                    if !camf.entry_table.element.is_null() {
-                        libc::free(camf.entry_table.element as *mut libc::c_void);
-                        camf.entry_table.element = ptr::null_mut();
-                    }
-                }
-                _ => {}
-            }
+            cleanup_entry(de);
         }
 
         if !ds.directory_entry.is_null() {
@@ -581,3 +553,145 @@ static _A_GET_THUMB_JPEG: unsafe extern "C" fn(*mut x3f_t) -> *mut x3f_directory
 static _A_GET_CAMF: unsafe extern "C" fn(*mut x3f_t) -> *mut x3f_directory_entry_t = x3f_get_camf;
 #[used]
 static _A_GET_PROP: unsafe extern "C" fn(*mut x3f_t) -> *mut x3f_directory_entry_t = x3f_get_prop;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod parser_tests {
+    use super::*;
+    use crate::control::{Control, Error};
+    use std::sync::atomic::AtomicBool;
+
+    fn with_file(bytes: &[u8], f: impl FnOnce(*mut FILE)) {
+        unsafe {
+            let file = libc::tmpfile();
+            assert!(!file.is_null());
+            assert_eq!(
+                libc::fwrite(bytes.as_ptr().cast(), 1, bytes.len(), file),
+                bytes.len()
+            );
+            f(file.cast());
+            libc::fclose(file);
+        }
+    }
+
+    fn container(section: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"FOVb");
+        bytes.extend_from_slice(&X3F_VERSION_4_0.to_le_bytes());
+        bytes.extend_from_slice(&[0; 16]);
+        bytes.extend_from_slice(section);
+        let directory = bytes.len() as u32;
+        bytes.extend_from_slice(b"SECd");
+        bytes.extend_from_slice(&0x20000u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&24u32.to_le_bytes());
+        bytes.extend_from_slice(&(section.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(b"PROP");
+        bytes.extend_from_slice(&directory.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn malformed_containers_return_errors_and_can_be_retried() {
+        let mut property = Vec::new();
+        for word in [X3F_SECP, 0x20000, 1, 0, 0, 0, u32::MAX, 0, 0] {
+            property.extend_from_slice(&word.to_le_bytes());
+        }
+        let good_header = container(&property);
+        for bytes in [
+            &b"FOVb"[..],
+            &good_header[..20],
+            &good_header[..good_header.len() - 2],
+        ] {
+            with_file(bytes, |file| unsafe {
+                assert!(new_from_file(file, Control::none()).is_err());
+                assert!(x3f_new_from_file(file).is_null());
+            });
+        }
+        with_file(&good_header, |file| unsafe {
+            let reader = new_from_file(file, Control::none()).unwrap();
+            let section = x3f_get_prop(reader);
+            for _ in 0..3 {
+                assert!(crate::load_data(reader, section, Control::none()).is_err());
+                let pl = (*section).header.data_subsection.property_list;
+                assert!(pl.data.is_null());
+                assert!(pl.property_table.element.is_null());
+            }
+            assert!(matches!(
+                crate::load_data(reader, section, Control::new(&AtomicBool::new(true))),
+                Err(Error::Cancelled)
+            ));
+            x3f_delete(reader);
+        });
+        with_file(&good_header, |file| unsafe {
+            assert!(matches!(
+                new_from_file(file, Control::new(&AtomicBool::new(true))),
+                Err(Error::Cancelled)
+            ));
+        });
+    }
+
+    #[test]
+    fn directory_count_and_section_ranges_are_bounded() {
+        let mut section = Vec::new();
+        for word in [X3F_SECP, 0x20000, 0, 0, 0, 0] {
+            section.extend_from_slice(&word.to_le_bytes());
+        }
+        let bytes = container(&section);
+        let directory = 24 + section.len();
+        for (offset, value) in [
+            (directory + 8, u32::MAX),
+            (directory + 12, 0),
+            (directory + 16, u32::MAX),
+        ] {
+            let mut corrupt = bytes.clone();
+            corrupt[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            with_file(&corrupt, |file| unsafe {
+                assert!(new_from_file(file, Control::none()).is_err());
+            });
+        }
+        with_file(&bytes, |file| unsafe {
+            let reader = new_from_file(file, Control::none()).unwrap();
+            crate::load_data(reader, x3f_get_prop(reader), Control::none()).unwrap();
+            x3f_delete(reader);
+        });
+    }
+
+    #[test]
+    fn raw_block_can_be_decoded_and_malformed_true_data_is_recoverable() {
+        let mut section = Vec::new();
+        for word in [X3F_SECI, 0x20000, 1, 30, 2, 2, 0] {
+            section.extend_from_slice(&word.to_le_bytes());
+        }
+        for word in [123u16, 123, 123, 0] {
+            section.extend_from_slice(&word.to_le_bytes());
+        }
+        section.extend_from_slice(&[1, 0, 1, 128, 0, 0]);
+        for _ in 0..3 {
+            section.extend_from_slice(&1u32.to_le_bytes());
+        }
+        section.extend_from_slice(&[0; 33]);
+        with_file(&container(&section), |file| unsafe {
+            let reader = new_from_file(file, Control::none()).unwrap();
+            let raw = x3f_get_raw(reader);
+            crate::load_image_block(reader, raw, Control::none()).unwrap();
+            crate::load_data(reader, raw, Control::none()).unwrap();
+            let tru = &*(*raw).header.data_subsection.image_data.tru;
+            assert!(std::slice::from_raw_parts(tru.x3rgb16.data, 12)
+                .iter()
+                .all(|&v| v == 123));
+            x3f_delete(reader);
+        });
+        for offset in [36, 42] {
+            let mut malformed = section.clone();
+            malformed[offset] = 255;
+            with_file(&container(&malformed), |file| unsafe {
+                let reader = new_from_file(file, Control::none()).unwrap();
+                let raw = x3f_get_raw(reader);
+                assert!(crate::load_data(reader, raw, Control::none()).is_err());
+                let id = (*raw).header.data_subsection.image_data;
+                assert!(id.data.is_null() && id.tru.is_null());
+                x3f_delete(reader);
+            });
+        }
+    }
+}

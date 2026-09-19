@@ -44,19 +44,12 @@ pub struct Image {
     pub row_stride: u32,
     /// Per-channel black/white levels for this image.
     pub levels: ImageLevels,
-    /// Snapshot of `x3f_get_dng_highlight_scale()` taken immediately
-    /// after [`Reader::get_image`] returns, on the same thread that ran
-    /// `apply_highlight_clip_dng`. The DNG writer adds `log2(scale)` to
-    /// `BaselineExposure` so consumers restore brightness on import. We
-    /// capture it here (instead of letting the writer re-read a global
-    /// side-channel later) so nested-rayon work-stealing in batch mode
-    /// can't have another file's `apply_highlight_clip_dng` clobber the
-    /// thread-local cell between when this image was rendered and when
-    /// the DNG writer needs the value.
+    /// Per-image highlight scale returned directly by processing. The DNG
+    /// writer adds `log2(scale)` to `BaselineExposure` so consumers restore
+    /// brightness on import. It remains isolated across concurrent readers.
     pub dng_highlight_scale: f64,
-    /// Snapshot of `x3f_get_dng_shoulder_ceiling()`, captured with the
-    /// same immediately-after-`x3f_get_image` discipline as
-    /// `dng_highlight_scale`. This is the pre-shoulder global max
+    /// Per-image shoulder ceiling returned alongside `dng_highlight_scale`.
+    /// This is the pre-shoulder maximum
     /// sat_ratio: `> 1.0` means highlight recovery overshot WhiteLevel
     /// and Pass 3 baked the soft shoulder into the raster, so the DNG
     /// writer publishes `LinearResponseLimit = knee`; `1.0` means the
@@ -104,22 +97,17 @@ impl Reader {
     /// highlight-recovery, optional crop) and return the result as a Rust-owned
     /// 16-bit RGB image.
     pub fn get_image(&self, opts: &ProcessOptions) -> Result<Image, Error> {
+        self.get_image_with_control(opts, sys::Control::none())
+    }
+
+    pub(crate) fn get_image_with_control(
+        &self,
+        opts: &ProcessOptions,
+        control: sys::Control<'_>,
+    ) -> Result<Image, Error> {
+        control.check()?;
         let cwb = wb_cstring(opts.wb.as_deref())?;
         let sgain = self.resolve_sgain(opts.apply_sgain);
-        // Communicate the DNG highlight-recovery toggle to
-        // `apply_highlight_clip_dng` via the thread-local FFI hook.
-        // Set immediately before `x3f_get_image` so a stale value from
-        // a prior conversion on this thread can't bleed into ours.
-        // SAFETY: setter is a plain Cell write, no aliasing concerns.
-        unsafe { sys::x3f_set_dng_highlight_recovery(opts.dng_highlight_recovery as libc::c_int) };
-        // Always set the mapping as well, including recovery-disabled
-        // conversions, so each call replaces the previous thread-local choice.
-        unsafe { sys::x3f_set_dng_highlight_mapping(opts.dng_highlight_mapping.to_raw()) };
-        // Same pattern for the Cineon-log TIFF mode toggle. Always
-        // written (true *or* false) so a stale `true` from a previous
-        // cineon conversion on this rayon worker can't leak into a
-        // non-cineon call.
-        unsafe { sys::x3f_set_cineon(opts.cineon as libc::c_int) };
         // SAFETY: zero-init is a valid x3f_area16_t (all-NULL pointers, all-0
         // dimensions). x3f_get_image overwrites every field on success.
         let mut area: sys::x3f_area16_t = unsafe { std::mem::zeroed() };
@@ -137,8 +125,8 @@ impl Reader {
 
         // SAFETY: x3f is valid; area is a stack sink x3f_get_image populates;
         // wb pointer (if any) outlives the call.
-        let ok = unsafe {
-            sys::x3f_get_image(
+        let info = unsafe {
+            sys::get_image_controlled(
                 self.x3f.as_ptr(),
                 &mut area,
                 ilevels_ptr,
@@ -148,30 +136,27 @@ impl Reader {
                 opts.denoise_intensity.min(10) as i32,
                 sgain,
                 cwb_ptr(&cwb),
+                sys::ProcessingOptions {
+                    dng_highlight_recovery: opts.dng_highlight_recovery,
+                    dng_shoulder: opts.dng_highlight_mapping.to_raw() == 1,
+                    cineon: opts.cineon,
+                },
+                control,
             )
-        };
-        if ok == 0 {
-            return Err(Error::Library(LibraryError::Argument));
-        }
+        }?;
 
-        // Capture the DNG highlight scale RIGHT NOW, before any other
-        // FFI call (notably `get_preview` or any nested-rayon work
-        // inside the DNG writer's strip encoder) can let rayon
-        // work-steal another file's `apply_highlight_clip_dng` onto
-        // this thread and clobber the thread-local cell. The set+read
-        // pair is safely co-located inside `x3f_get_image`'s body
-        // here.
-        let dng_highlight_scale = unsafe { sys::x3f_get_dng_highlight_scale() };
-        let dng_shoulder_ceiling = unsafe { sys::x3f_get_dng_shoulder_ceiling() };
+        let dng_highlight_scale = info.highlight_scale;
+        let dng_shoulder_ceiling = info.shoulder_ceiling;
 
         // SAFETY: each logical row returned by x3f_get_image is valid. A
         // cropped view may start inside its backing allocation, so the
         // final row's trailing stride padding need not be readable.
-        let data = unsafe { copy_image_rows(&area) };
+        let data = unsafe { copy_image_rows_controlled(&area, control) };
 
         // SAFETY: area.buf was malloc'd by the C library and is non-null on
         // a successful return; we are the unique owner now.
         unsafe { libc::free(area.buf) };
+        let data = data?;
 
         Ok(Image {
             data,
@@ -197,6 +182,17 @@ impl Reader {
         opts: &ProcessOptions,
         max_width: u32,
     ) -> Result<Preview, Error> {
+        self.get_preview_with_control(image, opts, max_width, sys::Control::none())
+    }
+
+    pub(crate) fn get_preview_with_control(
+        &self,
+        image: &Image,
+        opts: &ProcessOptions,
+        max_width: u32,
+        control: sys::Control<'_>,
+    ) -> Result<Preview, Error> {
+        control.check()?;
         let cwb = wb_cstring(opts.wb.as_deref())?;
         let sgain = self.resolve_sgain(opts.apply_sgain);
 
@@ -221,7 +217,7 @@ impl Reader {
         // SAFETY: every pointer is non-null and outlives the call. The C
         // function reads from area+ilevels and populates preview.
         let ok = unsafe {
-            sys::x3f_get_preview_with_scale(
+            sys::get_preview_controlled(
                 self.x3f.as_ptr(),
                 &mut area,
                 &mut ilevels,
@@ -231,9 +227,11 @@ impl Reader {
                 max_width,
                 &mut preview,
                 image.dng_highlight_scale,
+                control,
             )
         };
         if ok == 0 {
+            control.check()?;
             return Err(Error::Library(LibraryError::Argument));
         }
 
@@ -260,17 +258,26 @@ impl Reader {
 ///
 /// Each row must contain `columns * channels` readable samples starting
 /// at `data + row * row_stride`, with that width no larger than the stride.
+#[cfg(test)]
 unsafe fn copy_image_rows(area: &sys::x3f_area16_t) -> Vec<u16> {
+    unsafe { copy_image_rows_controlled(area, sys::Control::none()) }.unwrap()
+}
+
+unsafe fn copy_image_rows_controlled(
+    area: &sys::x3f_area16_t,
+    control: sys::Control<'_>,
+) -> Result<Vec<u16>, Error> {
     let stride = area.row_stride as usize;
     let width = area.columns as usize * area.channels as usize;
     let mut data = vec![0; area.rows as usize * stride];
     for row in 0..area.rows as usize {
+        control.check()?;
         let start = row * stride;
         // SAFETY: the caller guarantees the logical row is readable.
         let source = unsafe { std::slice::from_raw_parts(area.data.add(start), width) };
         data[start..start + width].copy_from_slice(source);
     }
-    data
+    Ok(data)
 }
 
 #[cfg(test)]

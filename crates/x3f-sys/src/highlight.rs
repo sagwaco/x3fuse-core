@@ -31,6 +31,8 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(non_camel_case_types)]
 
+use crate::Control;
+
 use std::ptr;
 
 use crate::*;
@@ -302,7 +304,7 @@ pub unsafe extern "C" fn chroma_lut_build_from_image(
     ilevels: *const x3f_image_levels_t,
     prior: *const f64,
 ) -> libc::c_int {
-    unsafe { chroma_lut_build_from_image_masked(lut, image, ilevels, prior, None) }
+    unsafe { chroma_lut_build_from_image_masked(lut, image, ilevels, prior, None, Control::none()) }
 }
 
 /// Rust-only camera-aware donor selection; the existing C ABI and its
@@ -313,6 +315,7 @@ pub(crate) unsafe fn chroma_lut_build_from_image_masked(
     ilevels: *const x3f_image_levels_t,
     prior: *const f64,
     source_mask: Option<&crate::highlight_recovery::LocalRecovery>,
+    control: Control<'_>,
 ) -> libc::c_int {
     let lut = unsafe { &mut *lut };
     let image = unsafe { &*image };
@@ -345,6 +348,9 @@ pub(crate) unsafe fn chroma_lut_build_from_image_masked(
     let row_stride = image.row_stride as usize;
     let channels = image.channels as usize;
     for row in 0..image.rows as usize {
+        if control.check().is_err() {
+            return 0;
+        }
         for col in 0..image.columns as usize {
             let mut s = [0.0_f64; 3];
             for c in 0..3 {
@@ -999,6 +1005,15 @@ pub unsafe extern "C" fn build_sat_map(
     ilevels: *const x3f_image_levels_t,
     sat_threshold: f64,
 ) -> *mut u8 {
+    unsafe { build_sat_map_controlled(image, ilevels, sat_threshold, Control::none()) }
+}
+
+pub(crate) unsafe fn build_sat_map_controlled(
+    image: *const x3f_area16_t,
+    ilevels: *const x3f_image_levels_t,
+    sat_threshold: f64,
+    control: Control<'_>,
+) -> *mut u8 {
     let image = unsafe { &*image };
     let ilevels = unsafe { &*ilevels };
 
@@ -1015,6 +1030,12 @@ pub unsafe extern "C" fn build_sat_map(
     let channels = image.channels as usize;
     let cols = image.columns as usize;
     for row in 0..image.rows as usize {
+        if control.check().is_err() {
+            unsafe {
+                libc::free(map.cast());
+            }
+            return ptr::null_mut();
+        }
         for col in 0..cols {
             let mut flag: u8 = 0;
             for c in 0..3 {

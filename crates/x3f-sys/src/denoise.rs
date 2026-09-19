@@ -23,6 +23,8 @@
 //! it: every tier-2/tier-3 test runs with `-no-denoise`. The goal is a visually
 //! equivalent denoise, not a bit-exact clone.
 
+use crate::Control;
+
 use crate::quattro::Area16;
 
 // ----------------------------------------------------------------------
@@ -228,6 +230,7 @@ fn cubic_weights(t: f64) -> [f64; 4] {
 
 /// Precomputed NLM state shared by all row bands.
 struct NlmCtx<'a> {
+    control: Control<'a>,
     /// `BORDER_REFLECT_101`-extended source, `ext_rows × ext_cols`, 3 channels.
     ext: &'a [u16],
     ext_cols: usize,
@@ -293,7 +296,13 @@ impl NlmCtx<'_> {
         let mut first_col_num = -1i32;
 
         for i in row_from..=row_to {
+            if self.control.check().is_err() {
+                return;
+            }
             for j in 0..cols {
+                if j % 64 == 0 && self.control.check().is_err() {
+                    return;
+                }
                 if j == 0 {
                     self.calc_first_in_row(
                         i,
@@ -455,11 +464,23 @@ impl NlmCtx<'_> {
 ///
 /// `template_window` / `search_window` are full (odd) window sizes, exactly
 /// as passed to OpenCV (e.g. `3, 11`).
+#[cfg(test)]
 fn fast_nlm_denoise(src: &Img3, h: [f64; 3], template_window: i32, search_window: i32) -> Img3 {
+    fast_nlm_denoise_controlled(src, h, template_window, search_window, Control::none()).unwrap()
+}
+
+fn fast_nlm_denoise_controlled(
+    src: &Img3,
+    h: [f64; 3],
+    template_window: i32,
+    search_window: i32,
+    control: Control<'_>,
+) -> crate::Result<Img3> {
+    control.check()?;
     let rows = src.rows;
     let cols = src.cols;
     if rows == 0 || cols == 0 {
-        return Img3::new(rows, cols);
+        return Ok(Img3::new(rows, cols));
     }
 
     let tr = template_window / 2;
@@ -480,6 +501,7 @@ fn fast_nlm_denoise(src: &Img3, h: [f64; 3], template_window: i32, search_window
         .collect();
     let mut ext = vec![0u16; ext_rows * ext_cols * 3];
     for ey in 0..ext_rows {
+        control.check()?;
         let sy = row_map[ey];
         for ex in 0..ext_cols {
             let sx = col_map[ex];
@@ -506,6 +528,9 @@ fn fast_nlm_denoise(src: &Img3, h: [f64; 3], template_window: i32, search_window
     let threshold = 0.001 * fixed_point_mult as f64;
     let mut lut = vec![[0i32; 3]; almost_max.max(1)];
     for (ad, slot) in lut.iter_mut().enumerate() {
+        if ad % 1024 == 0 {
+            control.check()?;
+        }
         let dist = ad as f64 * mult;
         for c in 0..3 {
             // DistAbs weight: exp(-dist^2 / (h^2 * channels)); h = 0 ⇒ the
@@ -524,6 +549,7 @@ fn fast_nlm_denoise(src: &Img3, h: [f64; 3], template_window: i32, search_window
     }
 
     let ctx = NlmCtx {
+        control,
         ext: &ext,
         ext_cols,
         rows,
@@ -560,7 +586,8 @@ fn fast_nlm_denoise(src: &Img3, h: [f64; 3], template_window: i32, search_window
         ctx.process_rows(0, rows as i32 - 1, &mut out.data);
     }
 
-    out
+    control.check()?;
+    Ok(out)
 }
 
 // ----------------------------------------------------------------------
@@ -779,9 +806,10 @@ fn subtract_u16_inplace(out: &mut Img3, res: &Img3i16) {
 ///   2. 3×3 median on the V channel (channel 2);
 ///   3. low-frequency pass: ÷4 area-downscale → NLM `{0, h/8, h/4}`
 ///      (search 21) → signed residual → cubic upscale → subtract.
-fn denoise_nlm(img: &mut Img3, h: f64) {
+fn denoise_nlm(img: &mut Img3, h: f64, control: Control<'_>) -> crate::Result<()> {
+    control.check()?;
     // 1. main NLM.
-    let mut out = fast_nlm_denoise(img, [0.0, h, h], 3, 11);
+    let mut out = fast_nlm_denoise_controlled(img, [0.0, h, h], 3, 11, control)?;
 
     // 2. V-channel median.
     median_blur_channel_3x3(&mut out, 2);
@@ -791,13 +819,15 @@ fn denoise_nlm(img: &mut Img3, h: f64) {
     let sub_cols = ((out.cols as f64) * 0.25).round_ties_even() as usize;
     if sub_rows >= 1 && sub_cols >= 1 {
         let sub = resize_area(&out, sub_rows, sub_cols);
-        let sub_dn = fast_nlm_denoise(&sub, [0.0, h / 8.0, h / 4.0], 3, 21);
+        let sub_dn = fast_nlm_denoise_controlled(&sub, [0.0, h / 8.0, h / 4.0], 3, 21, control)?;
         let sub_res = subtract_to_i16(&sub, &sub_dn);
         let res = resize_cubic_i16(&sub_res, out.rows, out.cols);
         subtract_u16_inplace(&mut out, &res);
     }
 
+    control.check()?;
     *img = out;
+    Ok(())
 }
 
 // ----------------------------------------------------------------------
@@ -875,9 +905,20 @@ unsafe fn yuv_to_bmt(area: *mut Area16, dt: DType) {
 ///
 /// # Safety
 /// `image` must be null or a valid 3-channel `x3f_area16_t`.
+#[cfg(test)]
 pub(crate) unsafe fn denoise_area(image: *mut Area16, dtype: u32, scale: f32) {
+    let _ = unsafe { denoise_area_controlled(image, dtype, scale, Control::none()) };
+}
+
+pub(crate) unsafe fn denoise_area_controlled(
+    image: *mut Area16,
+    dtype: u32,
+    scale: f32,
+    control: Control<'_>,
+) -> crate::Result<()> {
+    control.check()?;
     if image.is_null() {
-        return;
+        return Ok(());
     }
     debug_assert_eq!(unsafe { (*image).channels }, 3);
     let dt = DType::from_u32(dtype);
@@ -885,9 +926,10 @@ pub(crate) unsafe fn denoise_area(image: *mut Area16, dtype: u32, scale: f32) {
 
     unsafe { bmt_to_yuv(image, dt) };
     let mut img = unsafe { area_to_img3(image) };
-    denoise_nlm(&mut img, h);
+    denoise_nlm(&mut img, h, control)?;
     unsafe { img3_to_area(&img, image) };
     unsafe { yuv_to_bmt(image, dt) };
+    control.check()
 }
 
 /// Active-area Quattro pass: the area is already YUV (was the OpenCV
@@ -897,9 +939,16 @@ pub(crate) unsafe fn denoise_area(image: *mut Area16, dtype: u32, scale: f32) {
 ///
 /// # Safety
 /// `area` must be null or a valid 3-channel `x3f_area16_t`.
-pub(crate) unsafe fn denoise_active_area(area: *mut Area16, dtype: u32, stage: i32, scale: f32) {
+pub(crate) unsafe fn denoise_active_area(
+    area: *mut Area16,
+    dtype: u32,
+    stage: i32,
+    scale: f32,
+    control: Control<'_>,
+) -> crate::Result<()> {
+    control.check()?;
     if area.is_null() {
-        return;
+        return Ok(());
     }
     debug_assert_eq!(unsafe { (*area).channels }, 3);
     let dt = DType::from_u32(dtype);
@@ -907,13 +956,14 @@ pub(crate) unsafe fn denoise_active_area(area: *mut Area16, dtype: u32, stage: i
 
     if stage == 0 {
         let mut img = unsafe { area_to_img3(area) };
-        denoise_nlm(&mut img, sigma);
+        denoise_nlm(&mut img, sigma, control)?;
         unsafe { img3_to_area(&img, area) };
     } else {
         let img = unsafe { area_to_img3(area) };
-        let out = fast_nlm_denoise(&img, [0.0, sigma, sigma * 2.0], 3, 11);
+        let out = fast_nlm_denoise_controlled(&img, [0.0, sigma, sigma * 2.0], 3, 11, control)?;
         unsafe { img3_to_area(&out, area) };
     }
+    control.check()
 }
 
 // ----------------------------------------------------------------------
@@ -923,6 +973,35 @@ pub(crate) unsafe fn denoise_active_area(area: *mut Area16, dtype: u32, stage: i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_interrupts_nlm_without_cancelling_another_call() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let cancel = AtomicBool::new(false);
+        let image = Img3::new(512, 512);
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(10));
+                cancel.store(true, Ordering::Relaxed);
+            });
+            let result = fast_nlm_denoise_controlled(
+                &image,
+                [0.0, 80.0, 80.0],
+                3,
+                21,
+                Control::new(&cancel),
+            );
+            assert!(matches!(result, Err(crate::Error::Cancelled)));
+        });
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let other = Img3::new(8, 8);
+        let result =
+            fast_nlm_denoise_controlled(&other, [0.0, 80.0, 80.0], 3, 11, Control::none()).unwrap();
+        assert_eq!(result.data, other.data);
+    }
 
     /// Tiny deterministic LCG so tests don't need an RNG crate.
     struct Lcg(u64);

@@ -20,11 +20,35 @@
 /// long. `width`/`height` must fit the SOF3 16-bit fields and
 /// `components` the 8-bit field — callers pass strip dimensions, which
 /// are far below the limits.
+#[cfg(test)]
 pub(crate) fn encode(samples: &[u16], width: usize, height: usize, components: usize) -> Vec<u8> {
-    assert!(width > 0 && width <= u16::MAX as usize);
-    assert!(height > 0 && height <= u16::MAX as usize);
-    assert!(components > 0 && components <= 4);
-    assert_eq!(samples.len(), width * height * components);
+    encode_controlled(samples, width, height, components, x3f_sys::Control::none()).unwrap()
+}
+
+pub(crate) fn encode_controlled(
+    samples: &[u16],
+    width: usize,
+    height: usize,
+    components: usize,
+    control: x3f_sys::Control<'_>,
+) -> std::io::Result<Vec<u8>> {
+    crate::conversion::check_io(control)?;
+    if width == 0
+        || width > u16::MAX as usize
+        || height == 0
+        || height > u16::MAX as usize
+        || components == 0
+        || components > 4
+        || width
+            .checked_mul(height)
+            .and_then(|v| v.checked_mul(components))
+            != Some(samples.len())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid lossless JPEG dimensions",
+        ));
+    }
 
     // Pass 1: per-sample prediction differences (mod 2^16) + the
     // category histogram the Huffman table is built from.
@@ -32,6 +56,7 @@ pub(crate) fn encode(samples: &[u16], width: usize, height: usize, components: u
     let mut freq = [0u32; 17];
     let row_samples = width * components;
     for row in 0..height {
+        crate::conversion::check_io(control)?;
         for col in 0..width {
             let off = row * row_samples + col * components;
             for c in 0..components {
@@ -59,7 +84,10 @@ pub(crate) fn encode(samples: &[u16], width: usize, height: usize, components: u
 
     // Pass 2: entropy-coded data.
     let mut bw = BitWriter::new(out);
-    for &diff in &diffs {
+    for (index, &diff) in diffs.iter().enumerate() {
+        if index % row_samples == 0 {
+            crate::conversion::check_io(control)?;
+        }
         let ssss = category(diff);
         let (code, len) = table.codes[ssss as usize];
         bw.put(code as u32, len);
@@ -74,7 +102,7 @@ pub(crate) fn encode(samples: &[u16], width: usize, height: usize, components: u
     }
     let mut out = bw.finish();
     out.extend_from_slice(&[0xFF, 0xD9]); // EOI
-    out
+    Ok(out)
 }
 
 /// JPEG difference category: the SSSS value for a mod-2^16 difference.

@@ -17,7 +17,7 @@
 //! actually care about.
 
 use std::fs::File;
-use std::io::{self, BufWriter};
+use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use tiff::encoder::colortype::{Gray16, RGB16};
@@ -43,30 +43,73 @@ pub fn write(
     compress: bool,
     icc_profile: Option<&[u8]>,
 ) -> io::Result<()> {
+    write_controlled(image, out, compress, icc_profile, x3f_sys::Control::none())
+}
+
+pub(crate) fn write_controlled(
+    image: &Image,
+    out: impl AsRef<Path>,
+    compress: bool,
+    icc_profile: Option<&[u8]>,
+    control: x3f_sys::Control<'_>,
+) -> io::Result<()> {
+    crate::conversion::check_io(control)?;
     let path = out.as_ref();
-    let f = BufWriter::new(File::create(path)?);
-    let mut enc = TiffEncoder::new(f).map_err(to_io)?;
+    let mut f = ControlledWriter {
+        inner: BufWriter::new(File::create(path)?),
+        control,
+    };
+    let mut enc = TiffEncoder::new(&mut f).map_err(to_io)?;
     if compress {
         enc = enc
             .with_predictor(Predictor::Horizontal)
             .with_compression(Compression::Deflate(DeflateLevel::default()));
     }
 
-    match image.channels {
-        3 => write_image::<RGB16>(&mut enc, image, 3, icc_profile),
-        1 => write_image::<Gray16>(&mut enc, image, 1, icc_profile),
+    let result = match image.channels {
+        3 => write_image::<RGB16>(&mut enc, image, 3, icc_profile, control),
+        1 => write_image::<Gray16>(&mut enc, image, 1, icc_profile, control),
         n => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("TIFF writer needs 1 or 3 channels, got {n}"),
         )),
+    };
+    result?;
+    f.flush()
+}
+
+/// The encoder calls this writer for each 32-row strip. Keep cancellation above
+/// buffering so even small strips are checked before they reach the filesystem.
+struct ControlledWriter<'a, W> {
+    inner: W,
+    control: x3f_sys::Control<'a>,
+}
+
+impl<W: Write> Write for ControlledWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        crate::conversion::check_io(self.control)?;
+        self.inner.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        crate::conversion::check_io(self.control)?;
+        self.inner.flush()
+    }
+}
+
+impl<W: Seek> Seek for ControlledWriter<'_, W> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        crate::conversion::check_io(self.control)?;
+        self.inner.seek(position)
     }
 }
 
 fn write_image<C>(
-    enc: &mut TiffEncoder<BufWriter<File>>,
+    enc: &mut TiffEncoder<impl Write + Seek>,
     image: &Image,
     channels: u32,
     icc_profile: Option<&[u8]>,
+    control: x3f_sys::Control<'_>,
 ) -> io::Result<()>
 where
     C: tiff::encoder::colortype::ColorType<Inner = u16>,
@@ -76,10 +119,14 @@ where
         .new_image::<C>(image.columns, image.rows)
         .map_err(to_io)?;
     img.rows_per_strip(32).map_err(to_io)?;
-    img.resolution(
-        ResolutionUnit::Inch,
-        tiff::encoder::Rational { n: 72, d: 1 },
-    );
+    img.encoder()
+        .write_tag(Tag::ResolutionUnit, ResolutionUnit::Inch.to_u16())
+        .map_err(to_io)?;
+    for tag in [Tag::XResolution, Tag::YResolution] {
+        img.encoder()
+            .write_tag(tag, tiff::encoder::Rational { n: 72, d: 1 })
+            .map_err(to_io)?;
+    }
 
     if let Some(profile) = icc_profile {
         // The TIFF spec stores the ICC profile as type UNDEFINED (= byte
@@ -94,22 +141,21 @@ where
     let pixel_samples = (image.columns as usize) * (channels as usize);
     let stride = image.row_stride as usize;
 
-    // The tiff crate's write_data handles compression + predictor + striping
-    // in one shot, but only on a tightly-packed buffer. When the C-side image
-    // has stride padding (rows are wider than columns*channels — common after
-    // crop) we materialise a packed copy. The transient ~2× memory bump is
-    // acceptable for now; revisit if it shows up in profiling.
+    // write_data enables the crate's compression before calling write_strip.
+    // Calling write_strip directly would emit uncompressed bytes with ZIP tags.
     if stride == pixel_samples {
+        crate::conversion::check_io(control)?;
         img.write_data(&image.data).map_err(to_io)?;
     } else {
-        let total = pixel_samples * (image.rows as usize);
-        let mut packed = Vec::with_capacity(total);
-        for r in 0..image.rows as usize {
-            let off = r * stride;
-            packed.extend_from_slice(&image.data[off..off + pixel_samples]);
+        let mut packed = Vec::with_capacity(image.rows as usize * pixel_samples);
+        for row in 0..image.rows as usize {
+            crate::conversion::check_io(control)?;
+            let offset = row * stride;
+            packed.extend_from_slice(&image.data[offset..offset + pixel_samples]);
         }
         img.write_data(&packed).map_err(to_io)?;
     }
+    crate::conversion::check_io(control)?;
     Ok(())
 }
 
@@ -186,9 +232,61 @@ mod tests {
 
     #[test]
     fn rgb16_compressed_roundtrips_losslessly() {
-        let img = fake_image(8, 8, 3, 0);
+        let img = fake_image(8, 70, 3, 0);
         let decoded = round_trip(&img, true);
         assert_eq!(decoded, img.data);
+    }
+
+    #[test]
+    fn cancellation_stops_between_tiff_strips() {
+        use std::io::Cursor;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct CancelOnStrip<'a> {
+            bytes: Cursor<Vec<u8>>,
+            cancel: &'a AtomicBool,
+            strips: usize,
+        }
+        impl Write for CancelOnStrip<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                // Headers/tags are small; the first raster write cancels the
+                // conversion before the next strip, even inside write_all.
+                if bytes.len() > 1000 {
+                    self.strips += 1;
+                    self.cancel.store(true, Ordering::Relaxed);
+                }
+                self.bytes.write(bytes)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Seek for CancelOnStrip<'_> {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                self.bytes.seek(position)
+            }
+        }
+
+        for compressed in [false, true] {
+            let cancel = AtomicBool::new(false);
+            let control = x3f_sys::Control::new(&cancel);
+            let mut writer = ControlledWriter {
+                inner: CancelOnStrip {
+                    bytes: Cursor::new(Vec::new()),
+                    cancel: &cancel,
+                    strips: 0,
+                },
+                control,
+            };
+            let mut enc = TiffEncoder::new(&mut writer).unwrap();
+            if compressed {
+                enc = enc.with_compression(Compression::Deflate(DeflateLevel::default()));
+            }
+            let result =
+                write_image::<RGB16>(&mut enc, &fake_image(128, 100, 3, 0), 3, None, control);
+            assert!(result.is_err());
+            assert_eq!(writer.inner.strips, 1);
+        }
     }
 
     #[test]

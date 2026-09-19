@@ -34,15 +34,38 @@ pub(crate) type CropWindow = (u32, u32, u32, u32);
 /// cross-strip state), so the per-strip work runs on rayon. Output order
 /// is preserved by `into_par_iter()` over an indexed range +
 /// `collect::<Result<Vec<_>>>`.
+#[cfg(test)]
 pub(crate) fn encode_strips(
     image: &Image,
     rows_per_strip: u32,
     compress: bool,
     crop: Option<CropWindow>,
 ) -> io::Result<Vec<EncodedStrip>> {
+    encode_strips_controlled(
+        image,
+        rows_per_strip,
+        compress,
+        crop,
+        x3f_sys::Control::none(),
+    )
+}
+
+pub(crate) fn encode_strips_controlled(
+    image: &Image,
+    rows_per_strip: u32,
+    compress: bool,
+    crop: Option<CropWindow>,
+    control: x3f_sys::Control<'_>,
+) -> io::Result<Vec<EncodedStrip>> {
     use rayon::prelude::*;
 
     let (top, left, out_rows, out_cols) = crop.unwrap_or((0, 0, image.rows, image.columns));
+    if rows_per_strip == 0 || out_rows == 0 || out_cols == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty image strips",
+        ));
+    }
     let cpp = image.channels as usize;
     let samples_per_row = (out_cols as usize) * cpp;
     let stride = image.row_stride as usize;
@@ -54,18 +77,20 @@ pub(crate) fn encode_strips(
     (0..total_strips)
         .into_par_iter()
         .map(|strip_idx| {
+            crate::conversion::check_io(control)?;
             let start_row = (strip_idx * rows_per_strip) as usize;
             let end_row = ((strip_idx + 1) * rows_per_strip).min(out_rows) as usize;
             let n_rows = end_row - start_row;
 
             let mut packed: Vec<u16> = Vec::with_capacity(n_rows * samples_per_row);
             for r in start_row..end_row {
+                crate::conversion::check_io(control)?;
                 let off = (top as usize + r) * stride + left_off;
                 packed.extend_from_slice(&image.data[off..off + samples_per_row]);
             }
 
             let bytes = if compress {
-                ljpeg::encode(&packed, out_cols as usize, n_rows, cpp)
+                ljpeg::encode_controlled(&packed, out_cols as usize, n_rows, cpp, control)?
             } else {
                 let mut payload: Vec<u8> = Vec::with_capacity(packed.len() * 2);
                 for &v in &packed {

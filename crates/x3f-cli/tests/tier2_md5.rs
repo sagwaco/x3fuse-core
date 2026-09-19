@@ -1,8 +1,9 @@
 //! Tier-2 — exact MD5 of stable surfaces.
 //!
 //! Outputs that should be **bit-stable** as the port progresses (metadata
-//! dumps, the embedded JPEG thumbnail extraction, and PPM rasters) get exact
-//! MD5 hashes. If the hash changes, either the test or the implementation is
+//! dumps and PPM rasters) get exact MD5 hashes. Embedded JPEG extraction is
+//! compared directly against the declared source payload. If a hash changes,
+//! either the test or the implementation is
 //! wrong — neither should drift silently.
 //!
 //! These are deliberately *not* used for processed TIFF/DNG output: those
@@ -18,6 +19,32 @@ mod common;
 
 use common::{file_md5, run_extract};
 
+/// Independently read the container directory: JPEG extraction must preserve
+/// exactly the payload, excluding its 28-byte section header. The old MD5s
+/// included 28 bytes read beyond the payload allocation and are not valid pins.
+fn assert_jpeg_payload(input: &std::path::Path, output: &std::path::Path) {
+    let source = std::fs::read(input).unwrap();
+    let u32_at =
+        |offset| u32::from_le_bytes(source[offset..offset + 4].try_into().unwrap()) as usize;
+    let directory = u32_at(source.len() - 4);
+    assert_eq!(&source[directory..directory + 4], b"SECd");
+    for entry in 0..u32_at(directory + 8) {
+        let offset = u32_at(directory + 12 + entry * 12);
+        let size = u32_at(directory + 16 + entry * 12);
+        if &source[offset..offset + 4] == b"SECi"
+            && u32_at(offset + 8) == 2
+            && u32_at(offset + 12) == 18
+        {
+            assert_eq!(
+                std::fs::read(output).unwrap(),
+                &source[offset + 28..offset + size]
+            );
+            return;
+        }
+    }
+    panic!("fixture has no embedded JPEG section");
+}
+
 // ---------------------------------------------------------------------------
 // Merrill (DP* / SD1) — full coverage, all stable surfaces.
 // ---------------------------------------------------------------------------
@@ -32,10 +59,10 @@ fn merrill_meta_md5() {
 }
 
 #[test]
-fn merrill_jpeg_thumbnail_md5() {
+fn merrill_jpeg_matches_section_payload() {
     let input = skip_if_missing!(MERRILL_INPUT);
     let out = run_extract(&input, &["-jpg"], ".jpg");
-    assert_eq!(file_md5(&out), "73a324ff01fcdf63e0655ec0585c5bf0");
+    assert_jpeg_payload(&input, &out);
 }
 
 // The two PPM hashes were re-pinned alongside the DNG-compatibility
@@ -82,8 +109,18 @@ fn quattro_meta_md5() {
 }
 
 #[test]
-fn quattro_jpeg_thumbnail_md5() {
+fn quattro_jpeg_matches_section_payload() {
     let input = skip_if_missing!(QUATTRO_INPUT);
     let out = run_extract(&input, &["-jpg"], ".jpg");
-    assert_eq!(file_md5(&out), "87cd494d3bc4eab4e481de6afeb058de");
+    assert_jpeg_payload(&input, &out);
+}
+
+#[test]
+fn available_local_camera_jpegs_match_section_payloads() {
+    for name in ["DP2M0981.X3F", "DP0Q0010.X3F"] {
+        if let Some(input) = common::find_input(name) {
+            let output = run_extract(&input, &["-jpg"], ".jpg");
+            assert_jpeg_payload(&input, &output);
+        }
+    }
 }

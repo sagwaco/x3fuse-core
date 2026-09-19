@@ -34,7 +34,11 @@ use super::exif::CaptureMetadata;
 /// can't derive a model/aperture, or when the matching file isn't on
 /// disk. Emits a warning on the latter case so the user knows their
 /// directory was queried but nothing matched.
-pub(crate) fn load_for(meta: &CaptureMetadata, dir: &Path) -> Option<Vec<u8>> {
+pub(crate) fn load_for_report(
+    meta: &CaptureMetadata,
+    dir: &Path,
+    warnings: &mut Vec<String>,
+) -> Option<Vec<u8>> {
     let model_id = derive_model_id(meta)?;
     let aperture = format_aperture(meta)?;
     let lens_id = if model_id == "SD1M" {
@@ -51,11 +55,9 @@ pub(crate) fn load_for(meta: &CaptureMetadata, dir: &Path) -> Option<Vec<u8>> {
     match std::fs::read(&path) {
         Ok(bytes) => Some(bytes),
         Err(_) => {
-            eprintln!(
-                "x3f: DNG opcode file not found in `{}` (looked for `{}`); flat-field correction not embedded",
-                dir.display(),
-                filename
-            );
+            let warning = format!("DNG opcode file not found in `{}` (looked for `{filename}`); flat-field correction not embedded", dir.display());
+            eprintln!("x3f: {warning}");
+            warnings.push(warning);
             None
         }
     }

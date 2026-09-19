@@ -59,7 +59,25 @@ const PREVIEW_MAX_WIDTH: u32 = 300;
 /// overrides the file's recorded white balance; `apply_sgain`,
 /// `fix_bad`, `denoise` flow through to image processing.
 pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> Result<(), Error> {
-    let path = path.as_ref();
+    write_controlled(
+        reader,
+        path.as_ref(),
+        opts,
+        x3f_sys::Control::none(),
+        &mut || {},
+        &mut Vec::new(),
+    )
+}
+
+pub(crate) fn write_controlled(
+    reader: &Reader,
+    path: &Path,
+    opts: &ProcessOptions,
+    control: x3f_sys::Control<'_>,
+    on_write: &mut dyn FnMut(),
+    warnings: &mut Vec<String>,
+) -> Result<(), Error> {
+    control.check()?;
 
     // Resolve white balance up front — used both for image processing and
     // for the matrix tags.
@@ -83,7 +101,9 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
     let calibration =
         ColorCalibration::new(reader, &wb).ok_or(Error::Library(crate::LibraryError::Argument))?;
 
-    let mut image = reader.get_image(&opts)?;
+    let mut image = reader.get_image_with_control(&opts, control)?;
+    on_write();
+    control.check()?;
     if image.channels != 3 {
         return Err(Error::Library(crate::LibraryError::Argument));
     }
@@ -102,7 +122,7 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
     // WhiteLevel=65535 removes the only metadata those readers
     // mishandled; the normalized values (and therefore Adobe/LibRaw
     // renders) are unchanged.
-    equalize_levels(&mut image);
+    equalize_levels_controlled(&mut image, control)?;
 
     // The legacy CPP and earlier Rust ports wrote the full raw frame
     // (including the masked-pixel border) and marked the usable region
@@ -125,7 +145,8 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
         // raw samples. Preview rendering only restores the exposure scale.
         preview_opts.apply_sgain = Some(false);
     }
-    let preview = reader.get_preview(&image, &preview_opts, PREVIEW_MAX_WIDTH)?;
+    let preview =
+        reader.get_preview_with_control(&image, &preview_opts, PREVIEW_MAX_WIDTH, control)?;
     let preview_bytes = strip::encode_preview_strip(&preview);
     // Lossless JPEG must go out as ONE full-height strip: the dcraw-
     // lineage decoders (LibRaw, and Apple's engine behaves the same)
@@ -141,18 +162,14 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
         ROWS_PER_STRIP
     };
     let raw_strips =
-        strip::encode_strips(&image, rows_per_strip, opts.compress, crop).map_err(|source| {
-            Error::Io {
+        strip::encode_strips_controlled(&image, rows_per_strip, opts.compress, crop, control)
+            .map_err(|source| Error::Io {
                 path: path.display().to_string(),
                 source,
-            }
-        })?;
+            })?;
 
-    // The DNG highlight-recovery scale is captured on `image` itself
-    // (snapshotted on the rendering thread immediately after
-    // `apply_highlight_clip_dng` set it). Reading the FFI side-channel
-    // here would race with rayon work-stealing in batch mode — see
-    // `Image::dng_highlight_scale`.
+    // Processing returns this scale on the image itself; it belongs to this
+    // reader even when Rayon schedules work from multiple conversions.
     let highlight_scale = image.dng_highlight_scale;
 
     // Resolve required identity before opening the output. Quattro stores
@@ -163,6 +180,7 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
         .ok_or(Error::Library(crate::LibraryError::Argument))?;
     let orientation = capture_meta.orientation.unwrap_or(1);
 
+    control.check()?;
     let f = BufWriter::new(File::create(path).map_err(|source| Error::Io {
         path: path.display().to_string(),
         source,
@@ -177,6 +195,7 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
     let mut raw_strip_offsets: Vec<u32> = Vec::with_capacity(raw_strips.len());
     let mut raw_strip_byte_counts: Vec<u32> = Vec::with_capacity(raw_strips.len());
     for s in &raw_strips {
+        control.check()?;
         let off = tiff.write_data(&s.bytes).map_err(io_err(path))?;
         raw_strip_offsets.push(off);
         raw_strip_byte_counts.push(s.bytes.len() as u32);
@@ -201,7 +220,7 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
     let opcode_blob = opts
         .opcodes_dir
         .as_deref()
-        .and_then(|dir| opcodes::load_for(&capture_meta, dir));
+        .and_then(|dir| opcodes::load_for_report(&capture_meta, dir, warnings));
 
     // -- Build IFD1 (raw) first so we know its offset for IFD0's SubIFDs.
     // When highlight recovery actually overshot WhiteLevel
@@ -281,6 +300,7 @@ pub fn write(reader: &Reader, path: impl AsRef<Path>, opts: &ProcessOptions) -> 
     }
     let ifd0_offset = ifd0.build(&mut tiff).map_err(io_err(path))?;
 
+    control.check()?;
     let mut inner = tiff.finalize(ifd0_offset).map_err(io_err(path))?;
     inner.flush().map_err(io_err(path))?;
     Ok(())
@@ -300,7 +320,16 @@ fn io_err(path: &Path) -> impl Fn(io::Error) -> Error + '_ {
 /// — this only moves the per-channel normalization out of the WhiteLevel
 /// / BlackLevel tags and into the raster, for readers that mishandle
 /// per-channel levels on LinearRaw.
+#[cfg(test)]
 fn equalize_levels(image: &mut Image) {
+    equalize_levels_controlled(image, x3f_sys::Control::none()).unwrap();
+}
+
+fn equalize_levels_controlled(
+    image: &mut Image,
+    control: x3f_sys::Control<'_>,
+) -> Result<(), Error> {
+    control.check()?;
     use rayon::prelude::*;
 
     const WHITE_OUT: f64 = 65535.0;
@@ -308,7 +337,7 @@ fn equalize_levels(image: &mut Image) {
     let white = image.levels.white;
     // Already uniform at the target levels — nothing to do.
     if black == [0.0; 3] && white == [65535; 3] {
-        return;
+        return Ok(());
     }
     // A degenerate channel range (white <= black) would turn the scale
     // into ±inf/NaN and bake garbage into every sample of that channel.
@@ -317,7 +346,7 @@ fn equalize_levels(image: &mut Image) {
     // writer behaviour, which Adobe/LibRaw still render) rather than
     // destroy the image.
     if (0..3).any(|c| white[c] as f64 <= black[c]) {
-        return;
+        return Ok(());
     }
     let scale: Vec<f64> = (0..3)
         .map(|c| WHITE_OUT / (white[c] as f64 - black[c]))
@@ -327,6 +356,9 @@ fn equalize_levels(image: &mut Image) {
     let cols = image.columns as usize;
     let stride = image.row_stride as usize;
     image.data.par_chunks_mut(stride).for_each(|row| {
+        if control.check().is_err() {
+            return;
+        }
         for col in 0..cols {
             let off = col * channels;
             for c in 0..3 {
@@ -339,6 +371,8 @@ fn equalize_levels(image: &mut Image) {
 
     image.levels.black = [0.0; 3];
     image.levels.white = [65535; 3];
+    control.check()?;
+    Ok(())
 }
 
 fn populate_preview_ifd(

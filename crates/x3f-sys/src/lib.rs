@@ -25,7 +25,10 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 // Submodules opt in via `use crate::sysabi as libc;` so the existing
 // `libc::*` call sites resolve through the shim on wasm32 without
 // touching their bodies.
+pub mod control;
 pub mod sysabi;
+pub use control::{Control, Error, Result};
+mod parse;
 
 // `#[no_mangle]` Rust shim for the variadic `x3f_printf` symbol still
 // referenced from the bindgen-generated bindings on wasm32. On non-wasm
@@ -112,8 +115,8 @@ pub use print_meta_wasm_stub::{max_printed_matrix_elements, x3f_dump_meta_data, 
 // src/entropy.rs + src/quattro.rs.
 mod io;
 pub use io::{
-    auto_legacy_offset, legacy_offset, x3f_delete, x3f_get_camf, x3f_get_prop, x3f_get_raw,
-    x3f_get_thumb_huffman, x3f_get_thumb_jpeg, x3f_get_thumb_plain, x3f_new_from_file,
+    auto_legacy_offset, legacy_offset, new_from_file, x3f_delete, x3f_get_camf, x3f_get_prop,
+    x3f_get_raw, x3f_get_thumb_huffman, x3f_get_thumb_jpeg, x3f_get_thumb_plain, x3f_new_from_file,
 };
 
 // M4d: native Rust port of x3f_load_data and the section data loaders
@@ -122,7 +125,7 @@ pub use io::{
 // machinery (`x3f_delete`, `cleanup_*`, `free_camf_entry`) and the
 // directory-entry searchers (`x3f_get_*`).
 mod load;
-pub use load::{x3f_err, x3f_load_data, x3f_load_image_block};
+pub use load::{load_data, load_image_block, x3f_err, x3f_load_data, x3f_load_image_block};
 
 // M6a: native Rust port of src/x3f_matrix.c — 3×3 / 3×1 matrix math,
 // color-space conversion matrices, and gamma/sRGB LUT helpers. Same
@@ -187,10 +190,11 @@ pub use spatial_gain::{
 // points remain C until later phases.
 mod process;
 pub use process::{
-    x3f_get_bmt_to_xyz, x3f_get_digital_iso_gain, x3f_get_dng_highlight_scale,
-    x3f_get_dng_shoulder_ceiling, x3f_get_dng_shoulder_knee, x3f_get_gain, x3f_get_image,
-    x3f_get_preview, x3f_get_preview_with_scale, x3f_get_raw_to_xyz, x3f_set_cineon,
-    x3f_set_dng_highlight_mapping, x3f_set_dng_highlight_recovery,
+    get_image_controlled, get_preview_controlled, x3f_get_bmt_to_xyz, x3f_get_digital_iso_gain,
+    x3f_get_dng_highlight_scale, x3f_get_dng_shoulder_ceiling, x3f_get_dng_shoulder_knee,
+    x3f_get_gain, x3f_get_image, x3f_get_preview, x3f_get_preview_with_scale, x3f_get_raw_to_xyz,
+    x3f_set_cineon, x3f_set_dng_highlight_mapping, x3f_set_dng_highlight_recovery, ProcessingInfo,
+    ProcessingOptions,
 };
 
 // M6e4: highlight-recovery family (highlight_params, chroma LUT, sat
