@@ -27,12 +27,12 @@ cargo build --release
 target/release/x3f_extract -dng input.X3F
 ```
 
-Only prerequisite is a Rust toolchain (rustup). Output formats (PPM,
+Build prerequisites are Rust 1.88 or newer, a C compiler with standard
+headers for the remaining shims, and libclang for bindgen. Output formats (PPM,
 TIFF, DNG, JPEG thumbnail extract, metadata text dump, histogram CSV)
 are pure Rust as of M3 — no system `libtiff` / `libjpeg` / `zlib`
 needed. The denoise path is the pure-Rust NLM in `crates/x3f-sys/src/denoise.rs`
-(no external dependency, no build-time download), so there are no mandatory
-system deps and the rest of the pipeline is libc-only.
+(no external dependency, no build-time download).
 
 The binary preserves the legacy single-dash flag syntax (`-tiff`,
 `-no-denoise`, `-color sRGB`, …) so existing scripts and the test
