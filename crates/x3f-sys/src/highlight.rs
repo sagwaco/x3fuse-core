@@ -241,7 +241,10 @@ fn env_present(name: &str) -> bool {
 
 #[no_mangle]
 pub unsafe extern "C" fn chroma_lut_init_defaults(lut: *mut chroma_lut_t) {
-    let lut = unsafe { &mut *lut };
+    chroma_lut_defaults(unsafe { &mut *lut }, true);
+}
+
+pub(crate) fn chroma_lut_defaults(lut: &mut chroma_lut_t, environment: bool) {
     for v in lut.lut.iter_mut() {
         *v = 0.0;
     }
@@ -270,6 +273,10 @@ pub unsafe extern "C" fn chroma_lut_init_defaults(lut: *mut chroma_lut_t) {
     // Brightness-blend defaults — see C source for tuning notes.
     lut.blend_threshold = 0.75;
     lut.blend_divisor = 0.10;
+
+    if !environment {
+        return;
+    }
 
     if let Some(v) = env_atof("X3F_CHROMA_LUT_SAT") {
         lut.sat_threshold = v;
@@ -304,7 +311,9 @@ pub unsafe extern "C" fn chroma_lut_build_from_image(
     ilevels: *const x3f_image_levels_t,
     prior: *const f64,
 ) -> libc::c_int {
-    unsafe { chroma_lut_build_from_image_masked(lut, image, ilevels, prior, None, Control::none()) }
+    unsafe {
+        chroma_lut_build_from_image_masked(lut, image, ilevels, prior, None, Control::none(), true)
+    }
 }
 
 /// Rust-only camera-aware donor selection; the existing C ABI and its
@@ -316,6 +325,7 @@ pub(crate) unsafe fn chroma_lut_build_from_image_masked(
     prior: *const f64,
     source_mask: Option<&crate::highlight_recovery::LocalRecovery>,
     control: Control<'_>,
+    environment: bool,
 ) -> libc::c_int {
     let lut = unsafe { &mut *lut };
     let image = unsafe { &*image };
@@ -419,7 +429,10 @@ pub(crate) unsafe fn chroma_lut_build_from_image_masked(
     // Empty-bin nearest-populated fill (default radius 16; capped so a
     // genuinely-absent chromaticity falls through to the neutral ratio).
     let mut fill_dist = 16_i32;
-    if let Some(v) = env_atoi("X3F_CHROMA_LUT_FILL_DIST") {
+    if let Some(v) = environment
+        .then(|| env_atoi("X3F_CHROMA_LUT_FILL_DIST"))
+        .flatten()
+    {
         fill_dist = v;
     }
     if fill_dist < 0 {
@@ -509,7 +522,7 @@ pub(crate) unsafe fn chroma_lut_build_from_image_masked(
     ) > 0) as libc::c_int;
     lut.neutral_mt = neutral_mt;
 
-    if env_present("X3F_CHROMA_LUT_TRACE") {
+    if environment && env_present("X3F_CHROMA_LUT_TRACE") {
         unsafe {
             x3f_printf(
                 x3f_verbosity_t_INFO,
@@ -533,7 +546,7 @@ pub(crate) unsafe fn chroma_lut_build_from_image_masked(
     // because Rust can't shim variadic `fprintf` on stable; the trace
     // surface isn't reachable from any wasm consumer entrypoint anyway.
     #[cfg(not(target_arch = "wasm32"))]
-    if env_present("X3F_CHROMA_LUT_DUMP") {
+    if environment && env_present("X3F_CHROMA_LUT_DUMP") {
         for i in 0..CHROMA_LUT_BINS {
             unsafe {
                 libc::fprintf(

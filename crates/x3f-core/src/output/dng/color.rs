@@ -9,14 +9,14 @@ use crate::Reader;
 
 const WB_CALIBRATION: &str = "Overcast";
 
-pub(super) struct ColorCalibration {
-    pub(super) neutral: [f64; 3],
+pub(crate) struct ColorCalibration {
+    pub(crate) neutral: [f64; 3],
     pub(super) digital_gain_ev: f64,
     calibration_diagonal: [f64; 3],
 }
 
 impl ColorCalibration {
-    pub(super) fn new(reader: &Reader, wb: &str) -> Option<Self> {
+    pub(crate) fn new(reader: &Reader, wb: &str) -> Option<Self> {
         Self::from_gains(
             reader.dng_gain(Some(wb))?,
             reader.dng_gain(Some(WB_CALIBRATION))?,
@@ -72,7 +72,7 @@ impl ColorCalibration {
     /// mandatory matrix tag. This is a row scale because ColorMatrix maps
     /// XYZ into camera coordinates. A diagonal calibration cancels from the
     /// DNG ForwardMatrix transform; ForwardMatrix must remain unchanged.
-    pub(super) fn fold_color_matrix(&self, matrix: &[f64; 9]) -> [f64; 9] {
+    pub(crate) fn fold_color_matrix(&self, matrix: &[f64; 9]) -> [f64; 9] {
         mat3_mul(&mat3_diag(&self.calibration_diagonal), matrix)
     }
 }

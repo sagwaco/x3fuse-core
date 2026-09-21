@@ -27,11 +27,11 @@
 //!   emits lossless JPEG ([`ljpeg`]), the compression the spec sanctions
 //!   for 16-bit integer raws and the one all RAW engines decode.
 
-mod color;
-mod exif;
+pub(crate) mod color;
+pub(crate) mod exif;
 mod hue_sat_map;
 mod ljpeg;
-mod metadata;
+pub(crate) mod metadata;
 mod opcodes;
 mod profiles;
 mod strip;
@@ -609,8 +609,19 @@ fn add_dng_top_level_tags(
 ///
 /// Returns `None` when there's no embedded JPEG to derive the aspect from
 /// — in that case the C path silently omits the tag and so do we.
-fn compute_default_user_crop(reader: &Reader, active_area: &[u32; 4]) -> Option<[f32; 4]> {
+pub(crate) fn compute_default_user_crop(
+    reader: &Reader,
+    active_area: &[u32; 4],
+) -> Option<[f32; 4]> {
     let (jpeg_w, jpeg_h) = reader.dng_thumb_jpeg_dims()?;
+    default_user_crop_for_dimensions(jpeg_w, jpeg_h, active_area)
+}
+
+fn default_user_crop_for_dimensions(
+    jpeg_w: u32,
+    jpeg_h: u32,
+    active_area: &[u32; 4],
+) -> Option<[f32; 4]> {
     if jpeg_w == 0 || jpeg_h == 0 {
         return None;
     }
@@ -708,6 +719,22 @@ fn baseline_exposure(iso_be: Option<f64>, gain_be: f64, highlight_scale: f64) ->
 mod tests {
     use super::*;
     use crate::ImageLevels;
+
+    #[test]
+    fn camera_jpeg_aspect_preserves_wide_and_square_as_shot_crops() {
+        let active = [24, 12, 3024, 4512];
+        for (jpeg, expected) in [
+            ((1500, 1000), [0.0, 0.0, 1.0, 1.0]),
+            ((1600, 900), [0.078125, 0.0, 0.921875, 1.0]),
+            ((1000, 1000), [0.0, 1.0 / 6.0, 1.0, 5.0 / 6.0]),
+        ] {
+            let actual = default_user_crop_for_dimensions(jpeg.0, jpeg.1, &active).unwrap();
+            for (a, b) in actual.into_iter().zip(expected) {
+                assert!((a - b).abs() < 1e-6);
+            }
+        }
+        assert_eq!(default_user_crop_for_dimensions(0, 900, &active), None);
+    }
 
     #[test]
     fn baseline_exposure_restores_headroom_without_iso_metadata() {

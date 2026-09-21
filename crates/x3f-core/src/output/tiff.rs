@@ -19,6 +19,7 @@
 use std::fs::File;
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 use tiff::encoder::colortype::{Gray16, RGB16};
 use tiff::encoder::compression::DeflateLevel;
@@ -53,10 +54,101 @@ pub(crate) fn write_controlled(
     icc_profile: Option<&[u8]>,
     control: x3f_sys::Control<'_>,
 ) -> io::Result<()> {
+    write_samples(
+        ImageView {
+            data: &image.data,
+            rows: image.rows,
+            columns: image.columns,
+            channels: image.channels,
+            row_stride: image.row_stride,
+        },
+        out.as_ref(),
+        compress,
+        icc_profile,
+        control,
+    )
+}
+
+/// Write an existing image with caller-owned cancellation.
+/// The caller owns the output path and handles temporary-file publication.
+pub fn write_cancellable(
+    image: &Image,
+    out: impl AsRef<Path>,
+    compress: bool,
+    icc_profile: Option<&[u8]>,
+    cancel: &AtomicBool,
+) -> io::Result<()> {
+    write_controlled(
+        image,
+        out.as_ref(),
+        compress,
+        icc_profile,
+        x3f_sys::Control::new(cancel),
+    )
+}
+
+/// Write packed transfer-encoded RGB16 without copying the input pixels.
+/// No gamma, matrix, orientation or other image adjustment is applied here.
+/// The caller owns the output path and handles temporary-file publication.
+pub fn write_rgb16(
+    data: &[u16],
+    width: u32,
+    height: u32,
+    out: impl AsRef<Path>,
+    compress: bool,
+    icc_profile: Option<&[u8]>,
+    cancel: &AtomicBool,
+) -> io::Result<()> {
+    let stride = width
+        .checked_mul(3)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "RGB width overflow"))?;
+    write_samples(
+        ImageView {
+            data,
+            rows: height,
+            columns: width,
+            channels: 3,
+            row_stride: stride,
+        },
+        out.as_ref(),
+        compress,
+        icc_profile,
+        x3f_sys::Control::new(cancel),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct ImageView<'a> {
+    data: &'a [u16],
+    rows: u32,
+    columns: u32,
+    channels: u32,
+    row_stride: u32,
+}
+
+fn write_samples(
+    image: ImageView<'_>,
+    out: &Path,
+    compress: bool,
+    icc_profile: Option<&[u8]>,
+    control: x3f_sys::Control<'_>,
+) -> io::Result<()> {
     crate::conversion::check_io(control)?;
-    let path = out.as_ref();
+    let samples = (image.columns as usize).checked_mul(image.channels as usize);
+    let length = (image.row_stride as usize).checked_mul(image.rows as usize);
+    if image.rows == 0
+        || image.columns == 0
+        || !matches!(image.channels, 1 | 3)
+        || samples.is_none_or(|n| n > image.row_stride as usize)
+        || length.is_none_or(|n| n != image.data.len())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid TIFF image dimensions or samples",
+        ));
+    }
     let mut f = ControlledWriter {
-        inner: BufWriter::new(File::create(path)?),
+        inner: BufWriter::new(File::create(out)?),
         control,
     };
     let mut enc = TiffEncoder::new(&mut f).map_err(to_io)?;
@@ -106,7 +198,7 @@ impl<W: Seek> Seek for ControlledWriter<'_, W> {
 
 fn write_image<C>(
     enc: &mut TiffEncoder<impl Write + Seek>,
-    image: &Image,
+    image: ImageView<'_>,
     channels: u32,
     icc_profile: Option<&[u8]>,
     control: x3f_sys::Control<'_>,
@@ -145,7 +237,7 @@ where
     // Calling write_strip directly would emit uncompressed bytes with ZIP tags.
     if stride == pixel_samples {
         crate::conversion::check_io(control)?;
-        img.write_data(&image.data).map_err(to_io)?;
+        img.write_data(image.data).map_err(to_io)?;
     } else {
         let mut packed = Vec::with_capacity(image.rows as usize * pixel_samples);
         for row in 0..image.rows as usize {
@@ -219,6 +311,37 @@ mod tests {
     }
 
     #[test]
+    fn editor_rgb16_preserves_samples_and_profile_and_checks_before_truncating() {
+        let path = std::env::temp_dir().join(format!(
+            "x3f-editor-tiff-{}-{}.tif",
+            std::process::id(),
+            counter()
+        ));
+        let cancel = AtomicBool::new(false);
+        let pixels = [0, 32768, 65535, 60000, 40, 500];
+        let profile = crate::srgb_icc_profile();
+        write_rgb16(&pixels, 2, 1, &path, true, Some(&profile), &cancel).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut decoder = Decoder::new(File::open(&path).unwrap()).unwrap();
+        assert_eq!(decoder.dimensions().unwrap(), (2, 1));
+        assert_eq!(
+            decoder
+                .get_tag_u8_vec(Tag::Unknown(ICC_PROFILE_TAG))
+                .unwrap(),
+            profile
+        );
+        match decoder.read_image().unwrap() {
+            DecodingResult::U16(data) => assert_eq!(data, pixels),
+            _ => panic!("expected RGB16"),
+        }
+        assert!(write_rgb16(&pixels, 3, 1, &path, false, None, &cancel).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(write_rgb16(&pixels, 2, 1, &path, false, None, &AtomicBool::new(true)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn rgb16_with_stride_padding_strips_padding() {
         // pad each row with 5 extra u16 elements that must NOT appear in the
         // decoded TIFF.
@@ -282,8 +405,20 @@ mod tests {
             if compressed {
                 enc = enc.with_compression(Compression::Deflate(DeflateLevel::default()));
             }
-            let result =
-                write_image::<RGB16>(&mut enc, &fake_image(128, 100, 3, 0), 3, None, control);
+            let image = fake_image(128, 100, 3, 0);
+            let result = write_image::<RGB16>(
+                &mut enc,
+                ImageView {
+                    data: &image.data,
+                    rows: image.rows,
+                    columns: image.columns,
+                    channels: image.channels,
+                    row_stride: image.row_stride,
+                },
+                3,
+                None,
+                control,
+            );
             assert!(result.is_err());
             assert_eq!(writer.inner.strips, 1);
         }

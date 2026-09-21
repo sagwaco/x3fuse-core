@@ -48,11 +48,50 @@ pub fn cineon_log_profile(encoding: ColorEncoding) -> Option<Vec<u8>> {
         ColorEncoding::ProPhotoRgb => &PROPHOTO_RGB_PRIMARIES,
         ColorEncoding::None | ColorEncoding::Unprocessed | ColorEncoding::Qtop => return None,
     };
-    Some(assemble(primaries))
+    Some(assemble(primaries, build_linear_curve()))
+}
+
+/// ICC v2 profile for ordinary transfer-encoded RGB output. This describes
+/// encoded pixels, unlike the legacy Cineon profile's identity transfer curve.
+/// Returns None for camera-native or undefined color encodings.
+pub fn color_icc_profile(encoding: ColorEncoding) -> Option<Vec<u8>> {
+    let (primaries, name) = match encoding {
+        ColorEncoding::Srgb => (&SRGB_PRIMARIES, "x3f sRGB"),
+        ColorEncoding::AdobeRgb => (&ADOBE_RGB_PRIMARIES, "x3f Adobe RGB (1998)"),
+        ColorEncoding::ProPhotoRgb => (&PROPHOTO_RGB_PRIMARIES, "x3f ProPhoto RGB"),
+        _ => return None,
+    };
+    let profile = ProfileSpec {
+        desc: name,
+        ..*primaries
+    };
+    let mut curve = b"curv".to_vec();
+    write_u32(&mut curve, 0);
+    const SAMPLES: u32 = 4096;
+    write_u32(&mut curve, SAMPLES);
+    for i in 0..SAMPLES {
+        let encoded = f64::from(i) / f64::from(SAMPLES - 1);
+        let linear = match encoding {
+            ColorEncoding::Srgb if encoded <= 0.04045 => encoded / 12.92,
+            ColorEncoding::Srgb => ((encoded + 0.055) / 1.055).powf(2.4),
+            ColorEncoding::AdobeRgb => encoded.powf(563.0 / 256.0),
+            ColorEncoding::ProPhotoRgb if encoded <= 16.0 / 512.0 => encoded / 16.0,
+            ColorEncoding::ProPhotoRgb => encoded.powf(1.8),
+            _ => unreachable!(),
+        };
+        write_u16(&mut curve, (linear * 65535.0).round() as u16);
+    }
+    Some(assemble(&profile, curve))
+}
+
+/// ICC profile matching standard nonlinear sRGB display/export pixels.
+pub fn srgb_icc_profile() -> Vec<u8> {
+    color_icc_profile(ColorEncoding::Srgb).expect("sRGB is a named color space")
 }
 
 /// Description text + the three D50-adapted primary XYZ tristimuli that
 /// distinguish one cineon-log RGB profile from another.
+#[derive(Clone, Copy)]
 struct ProfileSpec {
     desc: &'static str,
     /// (X, Y, Z) for the red primary, D50-adapted.
@@ -106,7 +145,7 @@ const SIG_RTRC: [u8; 4] = *b"rTRC";
 const SIG_GTRC: [u8; 4] = *b"gTRC";
 const SIG_BTRC: [u8; 4] = *b"bTRC";
 
-fn assemble(p: &ProfileSpec) -> Vec<u8> {
+fn assemble(p: &ProfileSpec, trc_body: Vec<u8>) -> Vec<u8> {
     // Build the tag bodies first so we know each one's offset and size,
     // then prepend the header + tag table.
     let desc_body = build_desc(p.desc);
@@ -115,7 +154,6 @@ fn assemble(p: &ProfileSpec) -> Vec<u8> {
     let rxyz_body = build_xyz_f(&p.r_xyz);
     let gxyz_body = build_xyz_f(&p.g_xyz);
     let bxyz_body = build_xyz_f(&p.b_xyz);
-    let trc_body = build_linear_curve();
 
     // The three TRC tags share one body — same bytes, one offset. The
     // ICC spec explicitly permits this and Photoshop's reference encoder
@@ -354,6 +392,28 @@ mod tests {
             let count = read_u32(&p, off + 8);
             assert_eq!(count, 0, "{sig:?} is not linear (count={count})");
         }
+    }
+
+    #[test]
+    fn encoded_profiles_have_correct_decoding_curves() {
+        for (encoding, expected) in [
+            (ColorEncoding::Srgb, ((0.5_f64 + 0.055) / 1.055).powf(2.4)),
+            (ColorEncoding::AdobeRgb, 0.5_f64.powf(563.0 / 256.0)),
+            (ColorEncoding::ProPhotoRgb, 0.5_f64.powf(1.8)),
+        ] {
+            let profile = color_icc_profile(encoding).unwrap();
+            let off = find_tag_offset(&profile, b"rTRC").unwrap() as usize;
+            assert_eq!(read_u32(&profile, off + 8), 4096);
+            let values = &profile[off + 12..off + 12 + 8192];
+            let sample = |i: usize| {
+                f64::from(u16::from_be_bytes([values[2 * i], values[2 * i + 1]])) / 65535.0
+            };
+            assert_eq!(sample(0), 0.0);
+            assert_eq!(sample(4095), 1.0);
+            assert!((sample(2048) - expected).abs() < 0.0003);
+            assert!((1..4096).all(|i| sample(i) >= sample(i - 1)));
+        }
+        assert!(color_icc_profile(ColorEncoding::None).is_none());
     }
 
     #[test]

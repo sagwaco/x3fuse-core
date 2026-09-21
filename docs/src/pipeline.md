@@ -208,6 +208,37 @@ file list.
 
 ## 5. Output
 
+### Editor source
+
+`x3f_core::prepare_scene_linear` opens a fresh reader and runs the same sensor
+normalization, repair, Quattro expansion and optional NLM used by conversion.
+It returns an owned, active-area-cropped, unrotated RGB `Vec<f32>` in extended
+linear sRGB/D65. As-shot WB and capture/digital ISO gains are already applied.
+Orientation and camera WB calibration accompany the pixels. The renderer must
+apply orientation once and preserve negative channels and values above one until
+its chosen output transform.
+
+`read_as_shot_crop` reads camera framing without decoding RAW pixels. It uses
+the embedded JPEG aspect and CAMF active area, matching DNG `DefaultUserCrop`,
+and returns normalized `[x, y, width, height]` in EXIF-oriented coordinates.
+Use it only to initialize new recipes; saved user crops remain authoritative.
+
+The editor handoff evaluates the existing floating sensor-recovery stage before
+the DNG pixel normalization, image-maximum scaling or 16-bit encoding. It does
+not apply a gamma curve, creative EV or display clamp. Sensor preparation still
+uses the established integer intermediates; this is not a replacement decoder.
+Editor options are per call; legacy research environment variables continue to
+control legacy conversion, not editor exposure or recovery options.
+
+Because sensor preparation mutates its buffers, each denoise/repair change uses
+a fresh preparation. Color/tone changes reuse the immutable returned image.
+The API reports Read/Decode/Process and accepts caller-owned cancellation.
+
+`output::tiff::write_rgb16` writes already transfer-encoded RGB16 with cancellation
+and without a pixel copy. `color_icc_profile` supplies matching sRGB, Adobe RGB
+or ProPhoto RGB ICC profiles. These describe actual nonlinear export pixels;
+the older Cineon identity-TRC profile remains exclusive to that legacy mode.
+
 One of:
 
 - **DNG** — pure-Rust IFD writer in

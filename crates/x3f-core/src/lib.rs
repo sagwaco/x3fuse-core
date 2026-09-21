@@ -46,13 +46,19 @@ mod globals;
 mod icc;
 mod image;
 pub mod output;
+mod scene;
 
 pub use conversion::{convert_file, ConversionReport, ConversionStage, OutputFormat};
 pub use globals::{
     set_log_callback, set_max_printed_matrix_elements, set_offset_legacy, set_verbosity,
     LogCallback, Verbosity,
 };
+pub use icc::{color_icc_profile, srgb_icc_profile};
 pub use image::{Image, ImageLevels, Preview};
+pub use scene::{
+    prepare_scene_linear, read_as_shot_crop, SceneLinearImage, SceneLinearOptions,
+    WhiteBalanceCalibration,
+};
 
 /// Color space the processed RGB output is converted to.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
