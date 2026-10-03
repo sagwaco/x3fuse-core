@@ -22,6 +22,18 @@ A [`cbindgen.toml`](../../crates/x3f-ffi-c/cbindgen.toml) +
 [`build.rs`](../../crates/x3f-ffi-c/build.rs) generate `x3f.h` into
 `OUT_DIR` and `target/<profile>/include/x3f.h` on every build.
 
+For CPU-only library artifacts, build the package on its own:
+
+```sh
+cargo build --release -p x3f-ffi-c
+```
+
+A whole-workspace build also enables the CLI's default `gpu` feature; Cargo
+unifies that feature into `x3f-core`/`x3f-sys` and their linked dependencies.
+Legacy C processing entry points explicitly use CPU regardless, preserving
+their output and ABI. GPU backend selection is exposed by the Rust 0.2 API;
+the opaque-handle C API above still only provides metadata and thumbnails.
+
 ## C ABI surface
 
 The current surface is intentionally small — enough to satisfy the

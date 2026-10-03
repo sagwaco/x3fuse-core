@@ -2422,19 +2422,26 @@ fn denoise_scale(intensity: libc::c_int) -> f32 {
 
 #[no_mangle]
 pub unsafe extern "C" fn run_denoising(x3f: *mut x3f_t, intensity: libc::c_int) -> libc::c_int {
-    unsafe { run_denoising_controlled(x3f, intensity, Control::none()) }
+    unsafe {
+        run_denoising_controlled(
+            x3f,
+            intensity,
+            Control::none().with_denoise_backend(crate::DenoiseBackend::Cpu),
+        )
+    }
+    .is_ok() as libc::c_int
 }
 
 unsafe fn run_denoising_controlled(
     x3f: *mut x3f_t,
     intensity: libc::c_int,
     control: Control<'_>,
-) -> libc::c_int {
+) -> crate::Result<()> {
     let mut original_image: x3f_area16_t = unsafe { std::mem::zeroed() };
     let mut image: x3f_area16_t = unsafe { std::mem::zeroed() };
 
     if unsafe { x3f_image_area(x3f, &mut original_image) } == 0 {
-        return 0;
+        return Err(crate::Error::InvalidData("missing denoising image"));
     }
     if unsafe {
         x3f_crop_area_camf(
@@ -2473,7 +2480,6 @@ unsafe fn run_denoising_controlled(
             control,
         )
     }
-    .is_ok() as libc::c_int
 }
 
 #[no_mangle]
@@ -2482,7 +2488,15 @@ pub unsafe extern "C" fn expand_quattro(
     intensity: libc::c_int,
     expanded: *mut x3f_area16_t,
 ) -> libc::c_int {
-    unsafe { expand_quattro_controlled(x3f, intensity, expanded, Control::none()) }
+    unsafe {
+        expand_quattro_controlled(
+            x3f,
+            intensity,
+            expanded,
+            Control::none().with_denoise_backend(crate::DenoiseBackend::Cpu),
+        )
+    }
+    .is_ok() as libc::c_int
 }
 
 unsafe fn expand_quattro_controlled(
@@ -2490,10 +2504,8 @@ unsafe fn expand_quattro_controlled(
     intensity: libc::c_int,
     expanded: *mut x3f_area16_t,
     control: Control<'_>,
-) -> libc::c_int {
-    if control.check().is_err() {
-        return 0;
-    }
+) -> crate::Result<()> {
+    control.check()?;
     let mut image: x3f_area16_t = unsafe { std::mem::zeroed() };
     let mut active: x3f_area16_t = unsafe { std::mem::zeroed() };
     let mut qtop: x3f_area16_t = unsafe { std::mem::zeroed() };
@@ -2501,13 +2513,13 @@ unsafe fn expand_quattro_controlled(
     let mut active_exp: x3f_area16_t = unsafe { std::mem::zeroed() };
 
     if unsafe { x3f_image_area_qtop(x3f, &mut qtop) } == 0 {
-        return 0;
+        return Err(crate::Error::InvalidData("missing Quattro top layer"));
     }
     if unsafe { x3f_image_area(x3f, &mut image) } == 0 {
-        return 0;
+        return Err(crate::Error::InvalidData("missing Quattro image"));
     }
     if image.columns == 0 || image.rows == 0 {
-        return 0;
+        return Err(crate::Error::InvalidData("empty Quattro image"));
     }
 
     if intensity != 0
@@ -2536,7 +2548,7 @@ unsafe fn expand_quattro_controlled(
     rect[2] = 2 * image.columns - 1;
     rect[3] = 2 * image.rows - 1;
     if unsafe { x3f_crop_area(rect.as_mut_ptr(), &mut qtop, &mut qtop_crop) } == 0 {
-        return 0;
+        return Err(crate::Error::InvalidData("invalid Quattro crop"));
     }
 
     let exp = unsafe { &mut *expanded };
@@ -2548,7 +2560,7 @@ unsafe fn expand_quattro_controlled(
     exp.buf = unsafe { libc::malloc(bytes) };
     exp.data = exp.buf as *mut u16;
     if exp.buf.is_null() {
-        return 0;
+        return Err(crate::Error::Allocation);
     }
 
     if intensity != 0
@@ -2597,9 +2609,8 @@ unsafe fn expand_quattro_controlled(
             libc::free((*expanded).buf);
             *expanded = std::mem::zeroed();
         }
-        return 0;
     }
-    1
+    result
 }
 
 // ----------------------------------------------------------------------
@@ -3484,7 +3495,7 @@ pub unsafe extern "C" fn x3f_get_image(
             apply_sgain,
             wb,
             options,
-            Control::none(),
+            Control::none().with_denoise_backend(crate::DenoiseBackend::Cpu),
         )
     } {
         Ok(info) => {
@@ -3546,7 +3557,7 @@ pub unsafe fn get_scene_linear_controlled(
         shoulder_ceiling: 1.0,
     };
     let mut output = SceneLinearData::default();
-    let ok = unsafe {
+    let result = unsafe {
         get_image_impl(
             x3f,
             &mut area,
@@ -3572,7 +3583,8 @@ pub unsafe fn get_scene_linear_controlled(
         libc::free(area.buf);
     }
     control.check()?;
-    if ok == 0 || output.data.is_empty() || output.data.iter().any(|v| !v.is_finite()) {
+    result?;
+    if output.data.is_empty() || output.data.iter().any(|v| !v.is_finite()) {
         return Err(crate::Error::InvalidData(
             "could not prepare finite scene-linear image",
         ));
@@ -3605,7 +3617,7 @@ pub unsafe fn get_image_controlled(
         highlight_scale: 1.0,
         shoulder_ceiling: 1.0,
     };
-    let ok = unsafe {
+    let result = unsafe {
         get_image_impl(
             x3f,
             image,
@@ -3622,14 +3634,14 @@ pub unsafe fn get_image_controlled(
             None,
         )
     };
-    if ok == 0 || control.check().is_err() {
+    let result = control.check().and(result);
+    if result.is_err() {
         unsafe {
             libc::free((*image).buf);
             (*image).buf = ptr::null_mut();
         }
-        control.check()?;
-        return Err(crate::Error::InvalidData("could not process image"));
     }
+    result?;
     Ok(info)
 }
 
@@ -3647,7 +3659,7 @@ unsafe fn get_image_impl(
     control: Control<'_>,
     info: &mut ProcessingInfo,
     linear: Option<&mut SceneLinearData>,
-) -> libc::c_int {
+) -> crate::Result<()> {
     let dng_recovery = options.dng_highlight_recovery;
     let dng_mapping = if options.dng_shoulder {
         DngMapping::Shoulder
@@ -3662,7 +3674,7 @@ unsafe fn get_image_impl(
     if encoding == x3f_color_encoding_e_QTOP {
         let mut qtop: x3f_area16_t = unsafe { std::mem::zeroed() };
         if unsafe { x3f_image_area_qtop(x3f, &mut qtop) } == 0 {
-            return 0;
+            return Err(crate::Error::InvalidData("missing Quattro top layer"));
         }
         if crop == 0
             || unsafe {
@@ -3677,12 +3689,16 @@ unsafe fn get_image_impl(
         {
             unsafe { *image = qtop };
         }
-        return (ilevels.is_null()) as libc::c_int;
+        return if ilevels.is_null() {
+            Ok(())
+        } else {
+            Err(crate::Error::InvalidData("unprocessed image has no levels"))
+        };
     }
 
     let mut original_image: x3f_area16_t = unsafe { std::mem::zeroed() };
     if unsafe { x3f_image_area(x3f, &mut original_image) } == 0 {
-        return 0;
+        return Err(crate::Error::InvalidData("missing processing image"));
     }
     if crop == 0
         || unsafe {
@@ -3699,7 +3715,11 @@ unsafe fn get_image_impl(
     }
 
     if encoding == x3f_color_encoding_e_UNPROCESSED {
-        return (ilevels.is_null()) as libc::c_int;
+        return if ilevels.is_null() {
+            Ok(())
+        } else {
+            Err(crate::Error::InvalidData("unprocessed image has no levels"))
+        };
     }
 
     let mut il: x3f_image_levels_t = unsafe { std::mem::zeroed() };
@@ -3716,16 +3736,15 @@ unsafe fn get_image_impl(
         )
     } == 0
     {
-        return 0;
+        control.check()?;
+        return Err(crate::Error::InvalidData("could not preprocess image"));
     }
 
     let mut qtop: x3f_area16_t = unsafe { std::mem::zeroed() };
     let is_quattro = unsafe { x3f_image_area_qtop(x3f, &mut qtop) } != 0;
     let mut expanded: x3f_area16_t = unsafe { std::mem::zeroed() };
     if is_quattro {
-        if unsafe { expand_quattro_controlled(x3f, denoise, &mut expanded, control) } == 0 {
-            return 0;
-        }
+        unsafe { expand_quattro_controlled(x3f, denoise, &mut expanded, control) }?;
         // NOTE: expand_quattro destroys the data of original_image
         if crop == 0
             || unsafe {
@@ -3741,13 +3760,11 @@ unsafe fn get_image_impl(
             unsafe { *image = expanded };
         }
         original_image = expanded;
-    } else if denoise != 0 && unsafe { run_denoising_controlled(x3f, denoise, control) } == 0 {
-        return 0;
+    } else if denoise != 0 {
+        unsafe { run_denoising_controlled(x3f, denoise, control) }?;
     }
 
-    if control.check().is_err() {
-        return 0;
-    }
+    control.check()?;
 
     // `apply_highlight_clip_dng` is the DNG path's clip-curve renderer.
     // Quattro must also run this pass when recovery is requested; its
@@ -3798,13 +3815,14 @@ unsafe fn get_image_impl(
             )
         } == 0
     {
-        return 0;
+        control.check()?;
+        return Err(crate::Error::InvalidData("could not convert image colors"));
     }
 
     if !ilevels.is_null() {
         unsafe { *ilevels = il };
     }
-    control.check().is_ok() as libc::c_int
+    control.check()
 }
 
 #[no_mangle]

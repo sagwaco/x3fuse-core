@@ -54,28 +54,112 @@ pub unsafe extern "C" fn x3f_dump_raw_data_as_histogram(
     wb: *mut libc::c_char,
     log_hist: libc::c_int,
 ) -> x3f_return_t {
-    let f_out = unsafe { libc::fopen(outfilename, c"wb".as_ptr()) };
-    if f_out.is_null() {
-        return x3f_return_e_X3F_OUTFILE_ERROR;
-    }
-
-    let mut image: x3f_area16_t = unsafe { mem::zeroed() };
-    let ok = unsafe {
-        x3f_get_image(
+    unsafe {
+        dump_histogram_impl(
             x3f,
-            &mut image,
-            ptr::null_mut(),
+            outfilename,
             encoding,
             crop,
             fix_bad,
             denoise,
             apply_sgain,
             wb,
+            log_hist,
+            None,
         )
+    }
+    .unwrap_or(x3f_return_e_X3F_ARGUMENT_ERROR)
+}
+
+/// Rust entry point carrying per-conversion options; the legacy ABI is unchanged.
+pub unsafe fn dump_histogram_controlled(
+    x3f: *mut x3f_t,
+    outfilename: *mut libc::c_char,
+    encoding: x3f_color_encoding_t,
+    crop: libc::c_int,
+    fix_bad: libc::c_int,
+    denoise: libc::c_int,
+    apply_sgain: libc::c_int,
+    wb: *mut libc::c_char,
+    log_hist: libc::c_int,
+    options: ProcessingOptions,
+    control: Control<'_>,
+) -> crate::Result<x3f_return_t> {
+    unsafe {
+        dump_histogram_impl(
+            x3f,
+            outfilename,
+            encoding,
+            crop,
+            fix_bad,
+            denoise,
+            apply_sgain,
+            wb,
+            log_hist,
+            Some((options, control)),
+        )
+    }
+}
+
+unsafe fn dump_histogram_impl(
+    x3f: *mut x3f_t,
+    outfilename: *mut libc::c_char,
+    encoding: x3f_color_encoding_t,
+    crop: libc::c_int,
+    fix_bad: libc::c_int,
+    denoise: libc::c_int,
+    apply_sgain: libc::c_int,
+    wb: *mut libc::c_char,
+    log_hist: libc::c_int,
+    options: Option<(ProcessingOptions, Control<'_>)>,
+) -> crate::Result<x3f_return_t> {
+    let f_out = unsafe { libc::fopen(outfilename, c"wb".as_ptr()) };
+    if f_out.is_null() {
+        return Ok(x3f_return_e_X3F_OUTFILE_ERROR);
+    }
+
+    let mut image: x3f_area16_t = unsafe { mem::zeroed() };
+    let ok = if let Some((options, control)) = options {
+        match unsafe {
+            get_image_controlled(
+                x3f,
+                &mut image,
+                ptr::null_mut(),
+                encoding,
+                crop,
+                fix_bad,
+                denoise,
+                apply_sgain,
+                wb,
+                options,
+                control,
+            )
+        } {
+            Ok(_) => 1,
+            Err(error) => {
+                unsafe { libc::fclose(f_out) };
+                return Err(error);
+            }
+        }
+    } else {
+        unsafe {
+            x3f_get_image(
+                x3f,
+                &mut image,
+                ptr::null_mut(),
+                encoding,
+                crop,
+                fix_bad,
+                denoise,
+                apply_sgain,
+                wb,
+            )
+        }
     };
     if ok == 0 || image.channels < 3 {
         unsafe { libc::fclose(f_out) };
-        return x3f_return_e_X3F_ARGUMENT_ERROR;
+        unsafe { libc::free(image.buf) };
+        return Ok(x3f_return_e_X3F_ARGUMENT_ERROR);
     }
 
     // 3 × 65536 u32 bins.
@@ -146,7 +230,7 @@ pub unsafe extern "C" fn x3f_dump_raw_data_as_histogram(
     unsafe { libc::fclose(f_out) };
     unsafe { libc::free(image.buf) };
 
-    x3f_return_e_X3F_OK
+    Ok(x3f_return_e_X3F_OK)
 }
 
 #[used]

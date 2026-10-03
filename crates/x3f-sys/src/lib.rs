@@ -52,6 +52,7 @@ mod _wasm_c_shim_anchors {
 // (`process::run_denoising` and the Quattro passes in `quattro`) on every
 // target. No C/C++ and no FFI boundary — see the module header.
 mod denoise;
+pub use denoise::DenoiseBackend;
 
 // Native Rust replacement for `x3f_expand_quattro`. The legacy C symbol of
 // the same name in `src/x3f_process.c` resolves to this `#[no_mangle] extern
@@ -151,6 +152,8 @@ pub use matrix::{
 // substitute a stub returning `X3F_ARGUMENT_ERROR`.
 #[cfg(not(target_arch = "wasm32"))]
 mod histogram;
+#[cfg(not(target_arch = "wasm32"))]
+pub use histogram::dump_histogram_controlled;
 #[cfg(not(target_arch = "wasm32"))]
 pub use histogram::x3f_dump_raw_data_as_histogram;
 

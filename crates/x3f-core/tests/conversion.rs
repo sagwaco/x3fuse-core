@@ -48,6 +48,119 @@ fn assert_same_bytes(left: &Path, right: &Path) {
     }
 }
 
+fn loaded_reader(file: &Path) -> x3f_core::Reader {
+    let mut reader = x3f_core::Reader::open(file).unwrap();
+    reader.load_property_list().unwrap();
+    reader.load_camf().unwrap();
+    reader.load_raw().unwrap();
+    reader
+}
+
+#[cfg(not(feature = "gpu"))]
+#[test]
+fn forced_gpu_errors_reach_every_public_processing_path() {
+    use x3f_core::{prepare_scene_linear, DenoiseBackend, SceneLinearOptions};
+    let files = fixtures();
+    if files.is_empty() {
+        eprintln!("skip: set X3F_TEST_FILES for forced-GPU API error coverage");
+        return;
+    }
+    let output = std::env::temp_dir().join(format!("x3f-gpu-errors-{}", std::process::id()));
+    std::fs::create_dir_all(&output).unwrap();
+    let options = ProcessOptions {
+        denoise_backend: DenoiseBackend::Gpu,
+        ..ProcessOptions::default()
+    };
+    let cancel = AtomicBool::new(false);
+    let assert_gpu_error = |error: Error| {
+        assert!(
+            matches!(error, Error::Gpu(ref message) if message.contains("no GPU denoiser")),
+            "{error:?}"
+        );
+    };
+    for (index, file) in files.iter().enumerate() {
+        match loaded_reader(file).get_image(&options) {
+            Ok(_) => panic!("forced GPU succeeded in a CPU-only build"),
+            Err(error) => assert_gpu_error(error),
+        }
+        match prepare_scene_linear(
+            file,
+            &SceneLinearOptions {
+                denoise_backend: DenoiseBackend::Gpu,
+                ..SceneLinearOptions::default()
+            },
+            &cancel,
+            |_| {},
+        ) {
+            Ok(_) => panic!("forced GPU succeeded in a CPU-only build"),
+            Err(error) => assert_gpu_error(error),
+        }
+        assert_gpu_error(
+            loaded_reader(file)
+                .dump_histogram(
+                    output.join(format!("histogram-{index}.csv")),
+                    &options,
+                    false,
+                )
+                .unwrap_err(),
+        );
+        for format in [OutputFormat::Dng, OutputFormat::Tiff] {
+            let path = output.join(format!("{index}-{format:?}"));
+            let error = convert_file(file, &path, format, &options, &cancel, |_| {}).unwrap_err();
+            assert_gpu_error(error);
+            assert!(!path.exists(), "failed conversion published an output");
+        }
+    }
+    std::fs::remove_dir_all(output).unwrap();
+}
+
+#[test]
+fn histogram_ignores_dng_highlight_and_tiff_cineon_options() {
+    let files = fixtures();
+    if files.is_empty() {
+        eprintln!("skip: set X3F_TEST_FILES for histogram compatibility coverage");
+        return;
+    }
+    let output = std::env::temp_dir().join(format!("x3f-histogram-options-{}", std::process::id()));
+    std::fs::create_dir_all(&output).unwrap();
+    let base = ProcessOptions {
+        color_encoding: x3f_core::ColorEncoding::None,
+        denoise_backend: x3f_core::DenoiseBackend::Cpu,
+        denoise_intensity: 0,
+        ..ProcessOptions::default()
+    };
+    for (index, file) in files.iter().enumerate() {
+        let reference = output.join(format!("{index}-reference.csv"));
+        loaded_reader(file)
+            .dump_histogram(&reference, &base, false)
+            .unwrap();
+        for (name, options) in [
+            (
+                "recovery",
+                ProcessOptions {
+                    dng_highlight_recovery: true,
+                    dng_highlight_mapping: DngHighlightMapping::Shoulder,
+                    ..base.clone()
+                },
+            ),
+            (
+                "cineon",
+                ProcessOptions {
+                    cineon: true,
+                    ..base.clone()
+                },
+            ),
+        ] {
+            let path = output.join(format!("{index}-{name}.csv"));
+            loaded_reader(file)
+                .dump_histogram(&path, &options, false)
+                .unwrap();
+            assert_same_bytes(&reference, &path);
+        }
+    }
+    std::fs::remove_dir_all(output).unwrap();
+}
+
 #[test]
 fn concurrent_conversions_match_serial_for_per_file_options() {
     let files = fixtures();

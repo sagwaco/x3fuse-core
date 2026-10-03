@@ -24,11 +24,15 @@ The version is set once in the workspace and inherited everywhere else:
 | --- | --- |
 | Root `Cargo.toml` → `[workspace.package] version` | source of truth |
 | Root `Cargo.toml` → `[workspace.dependencies]` `x3f-sys` / `x3f-core` pins | bumped to match |
-| `crates/x3f-sys/Cargo.toml` → `version` | **hardcoded** — the one crate not on `version.workspace` |
-| `crates/x3f-core`, `crates/x3f-cli`, `crates/x3f-ffi-c` | `version.workspace = true` (inherited) |
+| All four crate manifests | `version.workspace = true` (inherited) |
 
 `Cargo.lock` is `.gitignore`d in this repo, so a version-bump commit
-touches only the two `Cargo.toml` files above.
+touches the root `Cargo.toml`.
+
+The GPU-denoising update targets **0.2.0**, because it adds fields to the public
+Rust options structs and variants to public errors. Update exhaustive callers
+before adopting it; do not release these changes as a 0.1.x patch. C ABI layouts
+and legacy flag syntax stay unchanged.
 
 ## Cutting a release with the script
 

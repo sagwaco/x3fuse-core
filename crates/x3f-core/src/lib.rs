@@ -35,6 +35,7 @@ use std::ptr::NonNull;
 
 use thiserror::Error;
 use x3f_sys as sys;
+pub use x3f_sys::DenoiseBackend;
 // Shadow the external libc crate with x3f-sys's compat shim. On every
 // target except wasm32-unknown-unknown this is `pub use libc::*;`; on
 // wasm32 it provides Rust-native equivalents for the few libc symbols
@@ -136,8 +137,12 @@ pub struct ProcessOptions {
     /// `-no-denoise`), `10` is full strength (the legacy default), and
     /// intermediate values linearly attenuate each sensor's NLM sigma
     /// (`scale = intensity / 10`). Values above 10 are clamped. Backed by the
-    /// pure-Rust Non-Local Means in `x3f-sys/src/denoise.rs` on every target.
+    /// Non-Local Means with portable Rust and optional native GPU backends.
     pub denoise_intensity: u8,
+    /// Select GPU acceleration or portable CPU execution (default: Auto).
+    /// Enable the `gpu` Cargo feature for native acceleration. Auto falls back
+    /// to CPU when unavailable; Gpu fails instead. WASM always uses CPU in Auto.
+    pub denoise_backend: DenoiseBackend,
     /// Directory of pre-rendered DNG `OpcodeList3` blobs (Sigma's per-
     /// model / per-aperture flat-fielding gain maps). When set, the DNG
     /// writer looks up the blob matching the camera's model and aperture
@@ -193,6 +198,7 @@ impl Default for ProcessOptions {
             wb: None,
             compress: false,
             denoise_intensity: 10,
+            denoise_backend: DenoiseBackend::Auto,
             opcodes_dir: None,
             dng_highlight_recovery: false,
             dng_highlight_mapping: DngHighlightMapping::default(),
@@ -207,6 +213,9 @@ pub enum Error {
     /// The caller requested cancellation; no final output should be published.
     #[error("conversion cancelled")]
     Cancelled,
+    /// GPU denoising was explicitly requested but could not complete.
+    #[error("GPU denoising unavailable: {0}")]
+    Gpu(String),
     /// The input or requested conversion is invalid.
     #[error("invalid X3F data: {0}")]
     InvalidData(String),
@@ -276,6 +285,7 @@ impl From<sys::Error> for Error {
     fn from(error: sys::Error) -> Self {
         match error {
             sys::Error::Cancelled => Self::Cancelled,
+            sys::Error::Gpu(message) => Self::Gpu(message),
             sys::Error::InvalidData(message) => Self::InvalidData(message.to_string()),
             other => Self::InvalidData(other.to_string()),
         }
@@ -611,6 +621,25 @@ impl Reader {
         let cwb = wb_cstring(opts.wb.as_deref())?;
         let sgain = self.resolve_sgain(opts.apply_sgain);
         // SAFETY: see dump_dng.
+        #[cfg(not(target_arch = "wasm32"))]
+        let r = unsafe {
+            sys::dump_histogram_controlled(
+                self.x3f.as_ptr(),
+                cpath.as_ptr() as *mut _,
+                opts.color_encoding.to_raw(),
+                opts.crop as i32,
+                opts.fix_bad as i32,
+                opts.denoise_intensity.min(10) as i32,
+                sgain,
+                cwb_ptr(&cwb),
+                log_exposure as i32,
+                // Histogram output retains its legacy processing behavior;
+                // DNG highlight and TIFF Cineon options do not apply here.
+                sys::ProcessingOptions::default(),
+                sys::Control::none().with_denoise_backend(opts.denoise_backend),
+            )
+        }?;
+        #[cfg(target_arch = "wasm32")]
         let r = unsafe {
             sys::x3f_dump_raw_data_as_histogram(
                 self.x3f.as_ptr(),
@@ -669,6 +698,13 @@ pub(crate) fn cwb_ptr(cwb: &Option<CString>) -> *mut std::os::raw::c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_errors_remain_distinct_from_invalid_raw_data() {
+        let error = Error::from(sys::Error::Gpu("device lost".into()));
+        assert!(matches!(&error, Error::Gpu(message) if message == "device lost"));
+        assert_eq!(error.to_string(), "GPU denoising unavailable: device lost");
+    }
 
     #[test]
     fn dng_highlight_mapping_defaults_to_linear_without_enabling_recovery() {

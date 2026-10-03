@@ -322,7 +322,7 @@ pub(crate) unsafe extern "C" fn x3f_expand_quattro(
             expanded,
             active_exp,
             scale,
-            Control::none(),
+            Control::none().with_denoise_backend(crate::DenoiseBackend::Cpu),
         )
     };
 }

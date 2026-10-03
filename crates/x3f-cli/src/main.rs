@@ -50,6 +50,7 @@ struct Args {
     /// Denoise strength, 0..=10. 0 disables denoise (legacy `-no-denoise`),
     /// 10 is full strength (legacy default).
     denoise_intensity: u8,
+    denoise_backend: x3f_core::DenoiseBackend,
     apply_sgain: Option<bool>,
     file_type: FileType,
     color_encoding: ColorEncoding,
@@ -81,6 +82,7 @@ impl Default for Args {
             crop: true,
             fix_bad: true,
             denoise_intensity: 10,
+            denoise_backend: x3f_core::DenoiseBackend::Auto,
             apply_sgain: None,
             file_type: FileType::Dng,
             color_encoding: ColorEncoding::Srgb,
@@ -129,6 +131,7 @@ fn usage(progname: &str) -> ! {
          \x20  -qtop           Dump Quattro top layer without preprocessing\n\
          \x20  -no-crop        Do not crop to active area\n\
          \x20  -no-denoise     Disable NLM denoise (same as -denoise 0)\n\
+         \x20  -denoise-backend <auto|cpu|gpu>  Select execution backend\n\
          \x20  -denoise <0-10> NLM denoise intensity. 0 = off,\n\
          \x20                  10 = full strength (default). Intermediate\n\
          \x20                  values linearly scale the NLM sigma.\n\
@@ -286,6 +289,11 @@ fn parse_args(argv: &[String]) -> Args {
             "-no-crop" => args.crop = false,
             "-no-fix-bad" => args.fix_bad = false,
             "-no-denoise" => args.denoise_intensity = 0,
+            "-denoise-backend" => {
+                i += 1;
+                let v = argv.get(i).unwrap_or_else(|| usage(progname));
+                args.denoise_backend = v.parse().unwrap_or_else(|_| usage(progname));
+            }
             "-denoise" => {
                 i += 1;
                 let v = argv.get(i).unwrap_or_else(|| usage(progname));
@@ -470,6 +478,7 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
         crop: args.crop,
         fix_bad: args.fix_bad,
         denoise_intensity: args.denoise_intensity,
+        denoise_backend: args.denoise_backend,
         apply_sgain: args.apply_sgain,
         wb: args.wb.clone(),
         compress: args.compress,
@@ -741,6 +750,21 @@ mod tests {
         assert_eq!(parse(&["-denoise", "10", "in.X3F"]).denoise_intensity, 10);
         // `-no-denoise` is the alias for the off end of the scale.
         assert_eq!(parse(&["-no-denoise", "in.X3F"]).denoise_intensity, 0);
+    }
+
+    #[test]
+    fn denoise_backend_is_per_conversion() {
+        use x3f_core::DenoiseBackend;
+        assert_eq!(parse(&["in.X3F"]).denoise_backend, DenoiseBackend::Auto);
+        assert_eq!(
+            parse(&["-denoise-backend", "cpu", "in.X3F"]).denoise_backend,
+            DenoiseBackend::Cpu
+        );
+        assert_eq!(
+            parse(&["-denoise-backend", "gpu", "in.X3F"]).denoise_backend,
+            DenoiseBackend::Gpu
+        );
+        assert!("opencl".parse::<DenoiseBackend>().is_err());
     }
 
     #[test]

@@ -15,6 +15,8 @@ pub struct SceneLinearOptions {
     pub apply_sgain: Option<bool>,
     /// Existing sensor NLM intensity, 0 through 10 (default 10).
     pub denoise_intensity: u8,
+    /// Select GPU acceleration or portable CPU execution (default: Auto).
+    pub denoise_backend: crate::DenoiseBackend,
     /// Reconstruct clipped sensor layers (default false).
     pub highlight_recovery: bool,
 }
@@ -25,6 +27,7 @@ impl Default for SceneLinearOptions {
             fix_bad: true,
             apply_sgain: None,
             denoise_intensity: 10,
+            denoise_backend: crate::DenoiseBackend::Auto,
             highlight_recovery: false,
         }
     }
@@ -135,7 +138,7 @@ pub fn prepare_scene_linear(
     cancel: &AtomicBool,
     mut on_stage: impl FnMut(ConversionStage),
 ) -> Result<SceneLinearImage, Error> {
-    let control = Control::new(cancel);
+    let control = Control::new(cancel).with_denoise_backend(options.denoise_backend);
     control.check()?;
     if options.denoise_intensity > 10 {
         return Err(Error::InvalidData(

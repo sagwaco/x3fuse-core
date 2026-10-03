@@ -69,6 +69,10 @@ jobs:
       # the full suite locally, point X3F_TEST_FILES at a corpus directory.
       - name: cargo test
         run: cargo test --workspace
+      - name: CPU-only denoising fallback
+        run: cargo test -p x3f-sys --no-default-features denoise::
+      - name: CPU-only core API tests (camera cases require X3F_TEST_FILES)
+        run: cargo test -p x3f-core --no-default-features
       - name: smoke test (x3f_extract --help)
         run: cargo run --release --bin x3f_extract -- -help || true
       - name: stage release binary
@@ -131,8 +135,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: build x3f-ffi-c (staticlib + cdylib)
-        run: cargo build --release -p x3f-ffi-c --target ${{ matrix.target }}
+      - name: build x3f-ffi-c (GPU feature must remain CPU-only on WASM)
+        run: cargo build --release -p x3f-ffi-c --target ${{ matrix.target }} --features x3f-core/gpu
       - name: verify .wasm + .a + header are produced
         run: |
           set -euxo pipefail
@@ -192,6 +196,10 @@ jobs:
           echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
       - name: run wasm runtime smoke (skips silently if no corpus)
         run: cargo test --release -p x3f-core --test wasm_runtime_smoke -- --nocapture
+      - name: run portable denoising tests under WASM
+        env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime run
+        run: cargo test --release -p x3f-sys --target wasm32-wasip1 --features gpu denoise:: -- --skip cancellation_preserves_sensor_buffer_without_cancelling_another_call
 
   # M9a: build the contributor mdbook so docs drift surfaces as a CI
   # failure rather than as a stale on-disk render. We pin a known-good
