@@ -129,11 +129,34 @@ baseline. The updated Merrill TIFF pins are in the contributor guide.
 
 The release workspace suite passes 296 tests, with six intentionally ignored,
 using the local corpus. Strict workspace Clippy, formatting,
-and the documentation build. The portable WASM/Wasmtime run passes 24 Merrill
+and the documentation build also pass. The portable WASM/Wasmtime run passes 24 Merrill
 kernel tests; its external corpus is not mounted. Independent Opus review
 verified source-color dispatch, matrix composition, shared EXIF parsing and
 error propagation. Missing/invalid JPEG EXIF falls back before rendering, and
 spatial-row tests check the exact output length.
+
+The next missing filter is now reconstructed in the external evidence archive:
+the raster despeckler matches 66,876 native classifications, 2,597 finite
+all-neighbor replacements (including zero extrema), and four complete wrapper
+cases containing 9,936 detected sites. The wrapper checks preserve padding,
+independent channel gains and adjacent defects. Native replacement runs in
+place in list order; using an unchanged neighbor snapshot changes 7,556 channel
+samples in those cases.
+
+Typed CAMF access matters here: all 53 files store integer
+`DespAdjust={10,10,5}`, which the native float getter ignores. Direct native
+calls return the supplied default `{15,15,5}` for every file, while positive
+float-table and missing-key controls behave as expected. Both adjustment
+vectors have separate controlled wheel tests; the integer table values are
+not the native production thresholds.
+
+Controlled copies of the SD1 wheel neighborhood are repaired by the native
+despeckler. This does not observe its input or correction during the real Sigma
+export. Native stage dispatch places it after float ApplyGains, optional radial
+shading, list/cluster repair and highlight restoration, then before row/column
+offset correction and denoising. The current normalized uint16 buffer cannot
+recover those inputs exactly. The reconstructed filter is therefore retained
+as executable evidence until those preceding stages are integrated.
 
 ## Remaining differences
 
