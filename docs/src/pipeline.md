@@ -53,51 +53,41 @@ resolves a directory entry and dispatches by section type:
 
 [`crates/x3f-sys/src/process.rs`](../../crates/x3f-sys/src/process.rs)
 + [`crates/x3f-sys/src/highlight.rs`](../../crates/x3f-sys/src/highlight.rs).
-The `convert_data` function is the hot loop. In order:
+The ordinary rendered-image path runs in this order. The
+[Merrill alignment notes](./spp-alignment.md) distinguish the recovered Sigma
+stages from the remaining legacy algorithms.
 
-1. **black-level subtraction** — driven by `DarkShieldTop` /
-   `DarkShieldBottom` and the left/right `DarkShieldColRange` columns;
-   per-camera firmware-bug workarounds (DP2 → skip Bottom; sd Quattro
-   H → skip Bottom; Merrill family → skip Right) are preserved
-   verbatim.
-2. **white-level normalisation** + per-pixel `out = scale*(raw -
-   black) + bias` clamp. Intermediate encoding ranges are proportional
-   to `WhiteBalanceGains * DigitalISOGain`, normalized so the largest
-   range fits the intermediate buffer. This makes equal intermediate
-   channel values neutral, as required by Quattro's Yis4T detail
-   reconstruction and denoising. Each channel's range is also used in
-   the inverse normalization, so this does not apply digital gain to
-   normalized raw values or discard highlight headroom. Actual digital
-   brightening happens at stage 7, or through DNG color metadata and
-   `BaselineExposure`.
-3. **spatial gain (lens shading) correction** —
-   [`crates/x3f-sys/src/spatial_gain.rs`](../../crates/x3f-sys/src/spatial_gain.rs).
-   Reads `IncludeBlocks` and the four nearest neighbours in
-   (1/aperture, lens-position) space, builds bilinear weights, and
-   assembles per-channel `mgain[]` tables.
-4. **bad-pixel interpolation** — iterative neighbour-averaging from
-   `BadPixels` / `BadPixelsF20` / `Jpeg_BadClusters` /
-   `HighlightPixelsInfo` / `BadPixelsLumaF23` /
-   `BadPixelsChromaF23` / the hardcoded sd Quattro AF pixel grid.
-5. **WB-conditional radial color shading** (Merrill only) —
-   `pix[B] *= 1 + a·rr⁴ + b·rr²` and `pix[T] *= 1 + c·rr⁴ + d·rr²`
-   from `WhiteBalanceColorShadingFactor`.
-6. **white balance** — multiplies from `WhiteBalanceGains` /
-   `DP1_WhiteBalanceGains`.
-7. **color-matrix transform** — sensor RGB → sRGB / AdobeRGB /
-   ProPhoto / linear via the M6a matrix kernel. `get_conv` scales the
-   matrix by `CaptureISO/SensorISO` and folds the per-channel CAMF
-   `DigitalISOGain` in as a column scale (`conv_matrix · diag(g)`,
-   Merrill bodies skip-listed in `x3f_get_digital_iso_gain`), so the
-   digital part of ISO brightening happens after highlight recovery
-   has seen honest sensor data.
-8. **highlight recovery** — the chroma LUT, RepairPix, and
-   matrix-pathology gate ported in M6e4. Active research area: see
-   the project memory entries on Foveon highlight handling.
-9. **gamma LUT application** — sRGB / AdobeRGB-2.2 / ProPhoto-1.8 (D65
-   → D50 Bradford for ProPhoto).
+1. **Black level** — ordinary Merrill RGB uses a 1% trimmed mean of
+   `DarkShieldTop`. Other paths retain the combined shield means and camera
+   firmware workarounds. Stored CAMF rectangle endpoints are inclusive.
+2. **Intermediate encoding** — write `round(scale*(raw-black)+bias)` to the
+   uint16 buffer, with channel ranges proportional to WB and applicable digital
+   gain. Original sensor spans are retained separately for Merrill RGB so its
+   later tone input can be reconstructed in sensor-count units.
+3. **WB-dependent radial shading** — Merrill C0/C2 corrections from
+   `WhiteBalanceColorShadingFactor`, still applied in the integer intermediate.
+4. **Bad pixels** — interpolate the camera-specific bad-pixel and cluster lists.
+5. **Denoise or Quattro expansion** — portable/GPU NLM according to the caller's
+   options. This is not Sigma's native tiled filter pipeline.
+6. **RGB highlight handling and spatial gain** — build the normalized chroma
+   LUT; per pixel, recover highlights, optionally run RepairPix, apply the
+   matrix-pathology gate, and evaluate spatial gain. This ordering still differs
+   from Sigma's preprocessing-time highlight restoration.
+7. **Camera color** — Merrill RGB restores gained counts and applies selected
+   WB correction, float32 ISO scaling/remaps and color-mode compensation.
+   It then applies native ColorDQ chroma correction and the residual stage's
+   `[0,32766]` bounds with neutral residual gain.
+   Remaining render paths retain `get_conv`'s sensor-to-XYZ-to-output matrix
+   and per-channel digital ISO column scaling.
+8. **Tone and output color** — Merrill applies its recovered tone LUT, Q12
+   target-profile matrix, then the 65,536-entry integer gamma LUT. Other paths
+   retain the interpolated gamma/Cineon LUT. The tone stage is excluded from
+   DNG and scene-linear output.
+9. **File output** — TIFF embeds the actual RGB transfer profile and camera
+   orientation. Raw/undefined encodings have no named-space profile. PPM stores
+   samples without TIFF metadata.
 
-The DNG path replaces stages 7–9 with highlight handling in sensor BMT
+The DNG path replaces stages 6–9 with highlight handling in sensor BMT
 space. Recovery is opt-in through `-dng-highlight-recovery`. On Merrill
 and older sensors, reliable nearby layer ratios propose reconstruction of
 one or two clipped layers. Local proposals must also agree with the

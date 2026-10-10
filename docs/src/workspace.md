@@ -61,6 +61,7 @@ mirror of what used to be in `src/`:
 | `io.rs` | `x3f_io.c` directory walker, header parse, cleanup, getters | M4c, M5e |
 | `load.rs` | `x3f_load_data` + section loaders + CAMF decoders | M4d |
 | `matrix.rs` | `x3f_matrix.c` (3×3 mul, color-space matrices, gamma LUT) | M6a |
+| `merrill.rs` | Reconstructed Sigma Merrill tone and RGB output kernels | SPP alignment |
 | `meta.rs` | `x3f_meta.c` (CAMF / property accessors) | M4a |
 | `print_meta.rs` | `x3f_print_meta.c` (tier-2-MD5-pinned text dump) | M4b |
 | `process.rs` | `x3f_process.c` master pipeline (preprocess, convert, expand, denoise) | M6e1–10 |

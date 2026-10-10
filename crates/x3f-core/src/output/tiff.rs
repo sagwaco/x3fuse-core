@@ -6,7 +6,7 @@
 //!
 //! - 3×16-bit RGB (or 1×16-bit MINISBLACK if the processed image is single-
 //!   channel — used for `-qtop`/`-unprocessed` Quattro top-layer dumps).
-//! - 32 rows per strip, contiguous planar config, top-left orientation.
+//! - 32 rows per strip, contiguous planar config, caller-supplied orientation.
 //! - 72 DPI in both axes (RESUNIT_INCH).
 //! - When `compress=true`, deflate with horizontal predictor=2.
 //!
@@ -44,7 +44,14 @@ pub fn write(
     compress: bool,
     icc_profile: Option<&[u8]>,
 ) -> io::Result<()> {
-    write_controlled(image, out, compress, icc_profile, x3f_sys::Control::none())
+    write_controlled(
+        image,
+        out,
+        compress,
+        icc_profile,
+        1,
+        x3f_sys::Control::none(),
+    )
 }
 
 pub(crate) fn write_controlled(
@@ -52,6 +59,7 @@ pub(crate) fn write_controlled(
     out: impl AsRef<Path>,
     compress: bool,
     icc_profile: Option<&[u8]>,
+    orientation: u16,
     control: x3f_sys::Control<'_>,
 ) -> io::Result<()> {
     write_samples(
@@ -61,6 +69,7 @@ pub(crate) fn write_controlled(
             columns: image.columns,
             channels: image.channels,
             row_stride: image.row_stride,
+            orientation,
         },
         out.as_ref(),
         compress,
@@ -83,6 +92,7 @@ pub fn write_cancellable(
         out.as_ref(),
         compress,
         icc_profile,
+        1,
         x3f_sys::Control::new(cancel),
     )
 }
@@ -109,6 +119,7 @@ pub fn write_rgb16(
             columns: width,
             channels: 3,
             row_stride: stride,
+            orientation: 1,
         },
         out.as_ref(),
         compress,
@@ -124,6 +135,7 @@ struct ImageView<'a> {
     columns: u32,
     channels: u32,
     row_stride: u32,
+    orientation: u16,
 }
 
 fn write_samples(
@@ -139,6 +151,7 @@ fn write_samples(
     if image.rows == 0
         || image.columns == 0
         || !matches!(image.channels, 1 | 3)
+        || !(1..=8).contains(&image.orientation)
         || samples.is_none_or(|n| n > image.row_stride as usize)
         || length.is_none_or(|n| n != image.data.len())
     {
@@ -211,6 +224,11 @@ where
         .new_image::<C>(image.columns, image.rows)
         .map_err(to_io)?;
     img.rows_per_strip(32).map_err(to_io)?;
+    if image.orientation != 1 {
+        img.encoder()
+            .write_tag(Tag::Orientation, image.orientation)
+            .map_err(to_io)?;
+    }
     img.encoder()
         .write_tag(Tag::ResolutionUnit, ResolutionUnit::Inch.to_u16())
         .map_err(to_io)?;
@@ -301,6 +319,39 @@ mod tests {
             DecodingResult::U16(v) => v,
             other => panic!("unexpected decode result: {other:?}"),
         }
+    }
+
+    #[test]
+    fn processed_tiff_records_orientation_and_profile_without_rotating_samples() {
+        let path = std::env::temp_dir().join(format!(
+            "x3f-oriented-tiff-{}-{}.tif",
+            std::process::id(),
+            counter()
+        ));
+        let image = fake_image(3, 2, 3, 0);
+        let profile =
+            crate::icc::processed_profile(crate::ColorEncoding::ProPhotoRgb, false).unwrap();
+        write_controlled(
+            &image,
+            &path,
+            false,
+            Some(&profile),
+            6,
+            x3f_sys::Control::none(),
+        )
+        .unwrap();
+        let mut dec = Decoder::new(File::open(&path).unwrap()).unwrap();
+        assert_eq!(dec.get_tag_u32(Tag::Orientation).unwrap(), 6);
+        assert_eq!(
+            dec.get_tag_u8_vec(Tag::Unknown(ICC_PROFILE_TAG)).unwrap(),
+            profile
+        );
+        assert_eq!(dec.dimensions().unwrap(), (3, 2));
+        match dec.read_image().unwrap() {
+            DecodingResult::U16(pixels) => assert_eq!(pixels, image.data),
+            _ => panic!("expected RGB16"),
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -414,6 +465,7 @@ mod tests {
                     columns: image.columns,
                     channels: image.channels,
                     row_stride: image.row_stride,
+                    orientation: 1,
                 },
                 3,
                 None,

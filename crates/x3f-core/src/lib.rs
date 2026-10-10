@@ -574,23 +574,21 @@ impl Reader {
     pub fn dump_tiff(&self, out: impl AsRef<Path>, opts: &ProcessOptions) -> Result<(), Error> {
         let out = out.as_ref();
         let image = self.get_image(opts)?;
-        // Embed an ICC profile only in cineon mode — non-cineon output
-        // already has the encoding's gamma curve baked in, and renderers
-        // default to sRGB which matches the historical behaviour. The
-        // cineon ICC declares the chosen primaries with a *linear* TRC
-        // so colour-managed readers leave the log encoding intact (the
-        // file is meant to look flat in viewers; the colourist supplies
-        // their own log→linear input transform when grading).
-        let icc = if opts.cineon {
-            icc::cineon_log_profile(opts.color_encoding)
-        } else {
-            None
-        };
-        output::tiff::write(&image, out, opts.compress, icc.as_deref()).map_err(|source| {
-            Error::Io {
-                path: out.display().to_string(),
-                source,
-            }
+        let icc = icc::processed_profile(opts.color_encoding, opts.cineon);
+        let orientation = output::dng::exif::CaptureMetadata::from_reader(self)
+            .orientation
+            .unwrap_or(1);
+        output::tiff::write_controlled(
+            &image,
+            out,
+            opts.compress,
+            icc.as_deref(),
+            orientation,
+            sys::Control::none(),
+        )
+        .map_err(|source| Error::Io {
+            path: out.display().to_string(),
+            source,
         })
     }
 

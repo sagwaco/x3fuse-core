@@ -104,10 +104,7 @@ pub fn convert_file(
             )?,
             OutputFormat::Tiff => {
                 let image = reader.get_image_with_control(options, control)?;
-                let profile = options
-                    .cineon
-                    .then(|| crate::icc::cineon_log_profile(options.color_encoding))
-                    .flatten();
+                let profile = crate::icc::processed_profile(options.color_encoding, options.cineon);
                 on_stage(ConversionStage::Write);
                 control.check()?;
                 crate::output::tiff::write_controlled(
@@ -115,6 +112,9 @@ pub fn convert_file(
                     output,
                     options.compress,
                     profile.as_deref(),
+                    crate::output::dng::exif::CaptureMetadata::from_reader(&reader)
+                        .orientation
+                        .unwrap_or(1),
                     control,
                 )
                 .map_err(|error| output_error(output, error))?;

@@ -55,6 +55,20 @@ pub fn cineon_log_profile(encoding: ColorEncoding) -> Option<Vec<u8>> {
 /// encoded pixels, unlike the legacy Cineon profile's identity transfer curve.
 /// Returns None for camera-native or undefined color encodings.
 pub fn color_icc_profile(encoding: ColorEncoding) -> Option<Vec<u8>> {
+    encoded_profile(encoding, false)
+}
+
+// The sensor renderer and SPP use pure 2.2/1.8 powers for Adobe/ProPhoto;
+// editor exports use the standard transfers exposed by color_icc_profile.
+pub(crate) fn processed_profile(encoding: ColorEncoding, cineon: bool) -> Option<Vec<u8>> {
+    if cineon {
+        cineon_log_profile(encoding)
+    } else {
+        encoded_profile(encoding, true)
+    }
+}
+
+fn encoded_profile(encoding: ColorEncoding, sensor_render: bool) -> Option<Vec<u8>> {
     let (primaries, name) = match encoding {
         ColorEncoding::Srgb => (&SRGB_PRIMARIES, "x3f sRGB"),
         ColorEncoding::AdobeRgb => (&ADOBE_RGB_PRIMARIES, "x3f Adobe RGB (1998)"),
@@ -74,7 +88,9 @@ pub fn color_icc_profile(encoding: ColorEncoding) -> Option<Vec<u8>> {
         let linear = match encoding {
             ColorEncoding::Srgb if encoded <= 0.04045 => encoded / 12.92,
             ColorEncoding::Srgb => ((encoded + 0.055) / 1.055).powf(2.4),
+            ColorEncoding::AdobeRgb if sensor_render => encoded.powf(2.2),
             ColorEncoding::AdobeRgb => encoded.powf(563.0 / 256.0),
+            ColorEncoding::ProPhotoRgb if sensor_render => encoded.powf(1.8),
             ColorEncoding::ProPhotoRgb if encoded <= 16.0 / 512.0 => encoded / 16.0,
             ColorEncoding::ProPhotoRgb => encoded.powf(1.8),
             _ => unreachable!(),
@@ -414,6 +430,32 @@ mod tests {
             assert!((1..4096).all(|i| sample(i) >= sample(i - 1)));
         }
         assert!(color_icc_profile(ColorEncoding::None).is_none());
+    }
+
+    #[test]
+    fn processed_profiles_describe_the_sensor_render_transfer() {
+        for (encoding, gamma) in [
+            (ColorEncoding::AdobeRgb, 2.2),
+            (ColorEncoding::ProPhotoRgb, 1.8),
+        ] {
+            let profile = processed_profile(encoding, false).unwrap();
+            let off = find_tag_offset(&profile, b"rTRC").unwrap() as usize;
+            for index in [32, 100, 1024, 2048, 4095] {
+                let pos = off + 12 + 2 * index;
+                let value = u16::from_be_bytes([profile[pos], profile[pos + 1]]);
+                let expected = ((index as f64 / 4095.0).powf(gamma) * 65535.0).round() as u16;
+                assert_eq!(value, expected);
+            }
+            assert_eq!(
+                processed_profile(encoding, true),
+                cineon_log_profile(encoding)
+            );
+        }
+        assert_eq!(
+            processed_profile(ColorEncoding::Srgb, false),
+            Some(srgb_icc_profile())
+        );
+        assert!(processed_profile(ColorEncoding::Unprocessed, false).is_none());
     }
 
     #[test]

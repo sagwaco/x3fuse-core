@@ -133,6 +133,7 @@ pub use load::{load_data, load_image_block, x3f_err, x3f_load_data, x3f_load_ima
 // pattern as the M4 ports: C source removed from cc-rs, bindgen forward
 // declarations blocklisted, Rust definitions re-exported.
 mod matrix;
+mod merrill;
 pub use matrix::{
     x3f_3x1_comp_mul, x3f_3x1_invert, x3f_3x1_print, x3f_3x3_3x1_mul, x3f_3x3_3x3_mul,
     x3f_3x3_diag, x3f_3x3_identity, x3f_3x3_inverse, x3f_3x3_ones, x3f_3x3_print,
