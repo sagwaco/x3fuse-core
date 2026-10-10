@@ -89,8 +89,7 @@ pub(crate) fn color_dq_noise_scale(
     luma_noise: f64,
 ) -> Result<f32> {
     let invalid = || Error::InvalidData("unsupported Merrill ColorDQ noise settings");
-    if iso_rows.is_empty()
-        || iso_rows.len() >= 20
+    if iso_rows.len() >= 20
         || !luma_noise.is_finite()
         || !iso_rows
             .iter()
@@ -99,7 +98,10 @@ pub(crate) fn color_dq_noise_scale(
     {
         return Err(invalid());
     }
-    let base = if iso_rows.iter().all(|r| r[7] == iso_rows[0][7]) {
+    let base = if iso_rows.is_empty() {
+        // Ordinary HI/MED/LOW fallback tables all have column 7 = 4 (@0xbf798/0xbf904/0xbfa70).
+        4.0
+    } else if iso_rows.iter().all(|r| r[7] == iso_rows[0][7]) {
         iso_rows[0][7]
     } else {
         let iso = estimated_iso
@@ -536,7 +538,11 @@ mod tests {
             color_dq_noise_scale(&rows, Some(&sliders), None, 0.5).unwrap(),
             12.0
         );
-        assert!(color_dq_noise_scale(&[], None, None, 0.5).is_err());
+        assert_eq!(color_dq_noise_scale(&[], None, None, 0.5).unwrap(), 4.0);
+        assert_eq!(
+            color_dq_noise_scale(&[], Some(&sliders), None, 0.5).unwrap(),
+            12.0
+        );
         assert!(color_dq_noise_scale(&rows, Some(&sliders[..4]), None, 0.5).is_err());
         rows[1][0] = 50.0;
         assert!(color_dq_noise_scale(&rows, None, None, 0.5).is_err());

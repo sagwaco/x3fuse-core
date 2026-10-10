@@ -2320,6 +2320,7 @@ unsafe fn get_conv_controlled(
 
 struct MerrillRender {
     black: [f64; 3],
+    spatial: Option<[crate::spatial_gain::MerrillSpatialTable; 3]>,
     matrix: [f64; 9],
     color_dq: crate::merrill::ColorDq,
     luts: crate::merrill::RenderLuts,
@@ -2409,6 +2410,7 @@ unsafe fn make_merrill_render(
     x3f: *mut x3f_t,
     wb: *mut libc::c_char,
     encoding: x3f_color_encoding_t,
+    apply_sgain: bool,
     control: Control<'_>,
 ) -> crate::Result<MerrillRender> {
     use crate::merrill::{RenderLuts, ToneParams, ToneSettings};
@@ -2434,6 +2436,13 @@ unsafe fn make_merrill_render(
         ));
     }
     let black = unsafe { merrill_trimmed_black(&shield, control) }?;
+    let exif = unsafe { merrill_exif(x3f, control) }?;
+    let spatial = unsafe { merrill_spatial_tables(x3f, apply_sgain, exif.f_number, control) }?;
+    if spatial.is_some() && (raw.rows < 2 || raw.columns == 0) {
+        return Err(crate::Error::InvalidData(
+            "invalid Merrill spatial image size",
+        ));
+    }
     let span: [f64; 3] = std::array::from_fn(|c| f64::from(max_raw[c]) - black[c]);
     if span.iter().any(|v| !v.is_finite() || *v <= 0.0) {
         return Err(crate::Error::InvalidData("invalid Merrill sensor range"));
@@ -2529,10 +2538,12 @@ unsafe fn make_merrill_render(
     if !(1..=16).contains(&depth) {
         return Err(crate::Error::InvalidData("invalid Merrill image depth"));
     }
-    let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
-    let target = merrill_render_matrix(encoding, identity, None, [1.0; 3], 1.0).ok_or(
-        crate::Error::InvalidData("unsupported Merrill RGB encoding"),
-    )?;
+    let source_color = exif.color_space.ok_or(crate::Error::InvalidData(
+        "missing Merrill EXIF source color space",
+    ))?;
+    let target = merrill_output_matrix(encoding, source_color).ok_or(crate::Error::InvalidData(
+        "unsupported Merrill RGB encoding",
+    ))?;
     let native_target = match encoding {
         x3f_color_encoding_e_SRGB => 2,
         x3f_color_encoding_e_ARGB => 3,
@@ -2555,10 +2566,122 @@ unsafe fn make_merrill_render(
     )?;
     Ok(MerrillRender {
         black,
+        spatial,
         matrix,
         color_dq,
         luts,
     })
+}
+
+unsafe fn merrill_spatial_tables(
+    x3f: *mut x3f_t,
+    enabled: bool,
+    f_number: Option<(u32, u32)>,
+    control: Control<'_>,
+) -> crate::Result<Option<[crate::spatial_gain::MerrillSpatialTable; 3]>> {
+    let mut skip = 0;
+    unsafe {
+        x3f_get_camf_unsigned(x3f, c"SkipStepFlags".as_ptr() as *mut _, &mut skip);
+    }
+    if !enabled || skip & (1 << 4) != 0 {
+        return Ok(None);
+    }
+    // Native preprocess @0xa5b74 divides the request rational in f64, then casts at 0xa6618.
+    let (numerator, denominator) = match f_number.filter(|(_, d)| *d != 0) {
+        Some(value) => value,
+        None => {
+            let mut property = ptr::null_mut();
+            if unsafe { x3f_get_prop_entry(x3f, c"APERTURE".as_ptr().cast_mut(), &mut property) }
+                == 0
+                || property.is_null()
+            {
+                return Err(crate::Error::InvalidData(
+                    "missing Merrill spatial aperture",
+                ));
+            }
+            unsafe { CStr::from_ptr(property) }
+                .to_str()
+                .ok()
+                .and_then(merrill_prop_aperture)
+                .ok_or(crate::Error::InvalidData(
+                    "invalid Merrill spatial aperture",
+                ))?
+        }
+    };
+    let aperture = (f64::from(numerator) / f64::from(denominator)) as f32;
+    unsafe { crate::spatial_gain::merrill_spatial_gain(x3f, aperture, control) }
+}
+
+fn merrill_prop_aperture(value: &str) -> Option<(u32, u32)> {
+    let value = value.trim();
+    if value.contains('.') {
+        // Managed fillAdjustParamFromFileInfoX3F @0x1014df3c8..448.
+        let numerator = f64::from(value.parse::<f32>().ok()? * 100000.0).round_ties_even();
+        (numerator.is_finite() && numerator > 0.0 && numerator <= u32::MAX as f64)
+            .then_some((numerator as u32, 100000))
+    } else if let Some((n, d)) = value.split_once('/') {
+        let (n, d) = (n.trim().parse::<u32>().ok()?, d.trim().parse::<u32>().ok()?);
+        (n > 0 && d > 0).then_some((n, d))
+    } else {
+        let numerator = value.parse::<u32>().ok()?.checked_mul(100000)?;
+        (numerator > 0).then_some((numerator, 100000))
+    }
+}
+
+unsafe fn merrill_exif(
+    x3f: *mut x3f_t,
+    control: Control<'_>,
+) -> crate::Result<crate::jpeg_exif::JpegExif> {
+    control.check()?;
+    let entry = unsafe { x3f_get_thumb_jpeg(x3f) };
+    if entry.is_null() {
+        return Err(crate::Error::InvalidData("missing Merrill JPEG EXIF"));
+    }
+    if unsafe { (*entry).header.data_subsection.image_data.data.is_null() } {
+        unsafe { crate::load_data(x3f, entry, control) }?;
+    }
+    let image = unsafe { &(*entry).header.data_subsection.image_data };
+    if image.data.is_null() || image.data_size == 0 {
+        return Err(crate::Error::InvalidData("empty Merrill JPEG EXIF"));
+    }
+    let jpeg =
+        unsafe { std::slice::from_raw_parts(image.data.cast::<u8>(), image.data_size as usize) };
+    crate::jpeg_exif::parse_jpeg_exif(jpeg)
+        .ok_or(crate::Error::InvalidData("invalid Merrill JPEG EXIF"))
+}
+
+fn merrill_output_matrix(
+    encoding: x3f_color_encoding_t,
+    exif_color_space: u16,
+) -> Option<[f64; 9]> {
+    let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    let target = merrill_render_matrix(encoding, identity, None, [1.0; 3], 1.0)?;
+    if exif_color_space == 1 {
+        return Some(target);
+    }
+    if encoding == x3f_color_encoding_e_ARGB {
+        return Some(identity);
+    }
+    // Native CalculateInverse(C3) @0xac604, verified by direct library call.
+    let inverse = [
+        1.3982606199511893,
+        -0.39828280643279224,
+        -5.6444684264386543e-5,
+        5.7053088178776595e-5,
+        1.0000033459087134,
+        3.4094961680870946e-5,
+        8.7362994382552355e-5,
+        -0.04294260086663016,
+        1.0427079091680009,
+    ];
+    Some(std::array::from_fn(|i| {
+        let (r, c) = (i / 3, i % 3);
+        let mut value = 0.0;
+        for k in 0..3 {
+            value = target[3 * r + k].mul_add(inverse[3 * k + c], value);
+        }
+        value
+    }))
 }
 
 fn merrill_setup_or_legacy(
@@ -2662,33 +2785,49 @@ unsafe fn convert_row(
     row: i32,
     row_data: &mut [u16],
     stats: *mut chroma_lut_apply_stats_t,
-) {
+) -> crate::Result<()> {
     // Hoist the conv_matrix and LUT into typed slices/array refs once
     // per row so the inner loop sees an inlinable native helper instead
     // of an extern "C" indirect call per pixel × per matrix mul.
     let m: &[f64; 9] = unsafe { &*(ctx.conv_matrix as *const [f64; 9]) };
     let lut: &[f64] = unsafe { std::slice::from_raw_parts(ctx.lut, LUTSIZE as usize) };
+    let mut spatial = ctx
+        .merrill
+        .and_then(|render| render.spatial.as_ref())
+        .map(|tables| {
+            crate::spatial_gain::MerrillSpatialRow::new(
+                tables,
+                row as usize,
+                ctx.rows as usize,
+                ctx.cols as usize,
+            )
+        })
+        .transpose()?;
 
     for col in 0..ctx.cols {
         let off = col as usize * ctx.channels;
 
         let mut sat_ratio = [0.0_f64; 3];
-        let mut sg = [0.0_f64; 3];
+        // shortcut: native interpolation still runs after legacy preprocessing;
+        // move it to ApplyGains when the float front end replaces normalized u16.
+        let mut sg = spatial.as_mut().map_or([1.0; 3], |row| row.next().unwrap());
         for color in 0..3 {
             let v = row_data[off + color] as f64;
             sat_ratio[color] =
                 (v - ctx.black[color]) / (ctx.white[color] as f64 - ctx.black[color]);
-            sg[color] = unsafe {
-                x3f_calc_spatial_gain(
-                    ctx.sgain,
-                    ctx.sgain_num,
-                    row,
-                    col,
-                    color as i32,
-                    ctx.rows,
-                    ctx.cols,
-                )
-            };
+            if ctx.merrill.is_none() {
+                sg[color] = unsafe {
+                    x3f_calc_spatial_gain(
+                        ctx.sgain,
+                        ctx.sgain_num,
+                        row,
+                        col,
+                        color as i32,
+                        ctx.rows,
+                        ctx.cols,
+                    )
+                };
+            }
         }
 
         // CLUT recovers scene-derived chroma where the bin's donor
@@ -2781,6 +2920,7 @@ unsafe fn convert_row(
             row_data[off + color] = lut_lookup_native(lut, scaled);
         }
     }
+    Ok(())
 }
 
 #[no_mangle]
@@ -2804,6 +2944,7 @@ pub unsafe extern "C" fn convert_data(
             CINEON.with(|c| c.get()),
             None,
         )
+        .is_ok() as libc::c_int
     }
 }
 
@@ -2817,12 +2958,14 @@ unsafe fn convert_data_controlled(
     control: Control<'_>,
     cineon: bool,
     merrill: Option<MerrillRender>,
-) -> libc::c_int {
+) -> crate::Result<()> {
     let max_out: u16 = 65535; // TODO: should be possible to adjust
 
     let img = unsafe { &mut *image };
     if img.channels < 3 {
-        return 0;
+        return Err(crate::Error::InvalidData(
+            "RGB conversion needs three channels",
+        ));
     }
 
     let mut conv_matrix = [0.0_f64; 9];
@@ -2856,12 +2999,14 @@ unsafe fn convert_data_controlled(
         }
     };
     if matrix_ok == 0 {
-        return 0;
+        return Err(crate::Error::InvalidData(
+            "could not prepare RGB calibration",
+        ));
     }
 
     // Spatial gain (M6d) — corr table on the stack, MAXCORR=6 slots.
     let mut sgain: [x3f_spatial_gain_corr_t; MAX_CORR] = unsafe { std::mem::zeroed() };
-    let sgain_num = if apply_sgain != 0 {
+    let sgain_num = if apply_sgain != 0 && merrill.is_none() {
         let n = unsafe { x3f_get_spatial_gain(x3f, wb, sgain.as_mut_ptr()) };
         if n == 0 {
             unsafe {
@@ -2978,26 +3123,24 @@ unsafe fn convert_data_controlled(
     let total_u16 = (img.rows as usize) * row_stride;
     let data = unsafe { std::slice::from_raw_parts_mut(img.data, total_u16) };
 
-    if trace_clut {
+    let result = if trace_clut {
         // Serial path — `clut_stats` accumulator is not Sync.
         let stats_ptr = &mut clut_stats as *mut _;
-        for (row, row_data) in data.chunks_mut(row_stride).enumerate() {
-            if control.check().is_err() {
-                break;
-            }
-            unsafe { convert_row(&ctx, row as i32, row_data, stats_ptr) };
-        }
+        data.chunks_mut(row_stride)
+            .enumerate()
+            .try_for_each(|(row, row_data)| {
+                control.check()?;
+                unsafe { convert_row(&ctx, row as i32, row_data, stats_ptr) }
+            })
     } else {
         use rayon::prelude::*;
         data.par_chunks_mut(row_stride)
             .enumerate()
-            .for_each(|(row, row_data)| {
-                if control.check().is_err() {
-                    return;
-                }
-                unsafe { convert_row(&ctx, row as i32, row_data, ptr::null_mut()) };
-            });
-    }
+            .try_for_each(|(row, row_data)| {
+                control.check()?;
+                unsafe { convert_row(&ctx, row as i32, row_data, ptr::null_mut()) }
+            })
+    };
 
     if !sat_map.is_null() {
         unsafe { libc::free(sat_map as *mut libc::c_void) };
@@ -3006,6 +3149,7 @@ unsafe fn convert_data_controlled(
     if trace_clut {
         unsafe { chroma_lut_apply_stats_print(&clut_stats, c"tiff".as_ptr()) };
     }
+    control.check().and(result)?;
 
     il.black[0] = 0.0;
     il.black[1] = 0.0;
@@ -3014,7 +3158,7 @@ unsafe fn convert_data_controlled(
     il.white[1] = max_out as u32;
     il.white[2] = max_out as u32;
 
-    control.check().is_ok() as libc::c_int
+    Ok(())
 }
 
 // `env_atof` / `env_present` aliases — these helpers live in
@@ -4379,7 +4523,9 @@ unsafe fn get_image_impl(
             .is_some();
     // Validate before render-specific black/gain preprocessing mutates samples.
     let merrill = if merrill_rgb {
-        merrill_setup_or_legacy(unsafe { make_merrill_render(x3f, wb, encoding, control) })?
+        merrill_setup_or_legacy(unsafe {
+            make_merrill_render(x3f, wb, encoding, apply_sgain != 0, control)
+        })?
     } else {
         None
     };
@@ -4461,8 +4607,8 @@ unsafe fn get_image_impl(
         };
     }
 
-    if encoding != x3f_color_encoding_e_NONE
-        && unsafe {
+    if encoding != x3f_color_encoding_e_NONE {
+        unsafe {
             convert_data_controlled(
                 x3f,
                 &mut original_image,
@@ -4474,10 +4620,7 @@ unsafe fn get_image_impl(
                 cineon,
                 merrill,
             )
-        } == 0
-    {
-        control.check()?;
-        return Err(crate::Error::InvalidData("could not convert image colors"));
+        }?;
     }
 
     if !ilevels.is_null() {
@@ -4927,6 +5070,47 @@ mod tests {
             *entries[5].matrix_decoded.cast::<u32>() = 1 << 22;
             assert_eq!(merrill_color_dq(&mut x3f).unwrap().apply(input), expected);
 
+            // Neither disabled spatial gain nor native bit 4 needs aperture
+            // or legacy gain metadata; this fixture deliberately has neither.
+            assert!(
+                merrill_spatial_tables(&mut x3f, true, Some((8, 1)), Control::none())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(matches!(
+                merrill_spatial_tables(&mut x3f, true, Some((8, 0)), Control::none()),
+                Err(crate::Error::InvalidData(
+                    "missing Merrill spatial aperture"
+                ))
+            ));
+            assert!(
+                merrill_spatial_tables(&mut x3f, false, None, Control::none())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(matches!(
+                merrill_spatial_tables(&mut x3f, true, None, Control::none()),
+                Err(crate::Error::InvalidData(
+                    "missing Merrill spatial aperture"
+                ))
+            ));
+            *entries[5].matrix_decoded.cast::<u32>() = 1 << 4;
+            assert!(
+                merrill_spatial_tables(&mut x3f, true, None, Control::none())
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(merrill_color_dq(&mut x3f).unwrap().apply(input), expected);
+            entries[5].name_address = c"CAMFSkipStepFlags".as_ptr() as *mut _;
+            assert!(matches!(
+                merrill_spatial_tables(&mut x3f, true, None, Control::none()),
+                Err(crate::Error::InvalidData(
+                    "missing Merrill spatial aperture"
+                ))
+            ));
+            entries[5].name_address = c"SkipStepFlags".as_ptr() as *mut _;
+            *entries[5].matrix_decoded.cast::<u32>() = 1 << 22;
+
             // A readable table with the wrong row width is unsupported.
             for i in 0..2 {
                 dims[i][1].size = 12;
@@ -4940,6 +5124,17 @@ mod tests {
             assert!(merrill_color_dq(&mut x3f).is_err());
             (*entries[1].matrix_dim_entry).size = 5;
             entries[1].matrix_elements = 65;
+
+            // Missing or unreadable ISO matrices use the ordinary native
+            // fallback column (4 at every ISO in HI/MED/LOW).
+            entries[0].name_address = c"MissingISO".as_ptr() as *mut _;
+            assert_eq!(merrill_color_dq(&mut x3f).unwrap().apply(input), expected);
+            entries[0].name_address = c"ISONoiseSettings".as_ptr() as *mut _;
+            entries[0].matrix_dim = 1;
+            entries[0].matrix_elements = 2;
+            assert_eq!(merrill_color_dq(&mut x3f).unwrap().apply(input), expected);
+            entries[0].matrix_dim = 2;
+            entries[0].matrix_elements = 26;
 
             // Missing or unreadable slider matrices use the native all-one
             // column. This differs from a readable matrix of the wrong shape.
@@ -4969,6 +5164,69 @@ mod tests {
     }
 
     #[test]
+    fn merrill_prop_aperture_preserves_managed_rounding() {
+        use super::merrill_prop_aperture as parse;
+        assert_eq!(parse("2.82843"), Some((282843, 100000)));
+        assert_eq!(parse("2.800005"), Some((280000, 100000)));
+        assert_eq!(parse("2.800015"), Some((280002, 100000)));
+        assert_eq!(parse("8"), Some((800000, 100000)));
+        assert_eq!(parse(" 28 / 10 "), Some((28, 10)));
+        for value in [
+            "",
+            "NaN",
+            "inf",
+            "0",
+            "-2.8",
+            "8/0",
+            "2/3/4",
+            "4294967295",
+            "1.0e30",
+        ] {
+            assert_eq!(parse(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn merrill_output_profiles_use_native_source_branch() {
+        use super::*;
+        let q12 = |encoding, source| {
+            merrill_output_matrix(encoding, source)
+                .unwrap()
+                .map(|v| v.mul_add(4096.0, 0.5) as i32)
+        };
+        // Native C3 inverse call and Stage4 right-multiply @0xac608..0xac6b0.
+        assert_eq!(
+            q12(x3f_color_encoding_e_SRGB, 65535),
+            [5727, -1630, 0, 0, 4096, 0, 0, -175, 4271]
+        );
+        assert_eq!(
+            q12(x3f_color_encoding_e_PPRGB, 65535),
+            [3032, 464, 601, 564, 3412, 120, 97, 302, 3697]
+        );
+        assert_eq!(
+            q12(x3f_color_encoding_e_ARGB, 65535),
+            [4096, 0, 0, 0, 4096, 0, 0, 0, 4096]
+        );
+        assert_eq!(
+            q12(x3f_color_encoding_e_SRGB, 1),
+            [4096, 0, 0, 0, 4096, 0, 0, 0, 4096]
+        );
+        assert_eq!(
+            q12(x3f_color_encoding_e_ARGB, 1),
+            [2929, 1167, 0, 0, 4096, 0, 0, 169, 3928]
+        );
+        assert_eq!(
+            q12(x3f_color_encoding_e_PPRGB, 1),
+            [2168, 1352, 576, 403, 3578, 115, 69, 482, 3546]
+        );
+        assert_eq!(
+            q12(x3f_color_encoding_e_PPRGB, 0),
+            q12(x3f_color_encoding_e_PPRGB, 65535)
+        );
+        assert!(merrill_output_matrix(x3f_color_encoding_e_NONE, 1).is_none());
+    }
+
+    #[test]
     fn merrill_render_conditions_counts_before_signed_output_conversion() {
         use crate::merrill::{RenderLuts, ToneParams, ToneSettings};
         let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
@@ -4990,6 +5248,7 @@ mod tests {
         let expected = luts.render([0.0, 32766.0, 1000.0]);
         let mut render = super::MerrillRender {
             black: [0.0; 3],
+            spatial: None,
             matrix: identity,
             color_dq: crate::merrill::ColorDq::new([0.1; 3]).unwrap(),
             luts,
@@ -5026,6 +5285,40 @@ mod tests {
     }
 
     #[test]
+    fn merrill_missing_or_invalid_exif_selects_legacy_before_rendering() {
+        use super::*;
+        let mut x3f: x3f_t = unsafe { std::mem::zeroed() };
+        let check = |x3f: &mut x3f_t, expected| {
+            let result = unsafe { merrill_exif(x3f, Control::none()) };
+            assert!(
+                matches!(&result, Err(crate::Error::InvalidData(reason)) if *reason == expected)
+            );
+            let setup = result.map(|_| unreachable!("invalid EXIF must reject native setup"));
+            assert!(merrill_setup_or_legacy(setup).unwrap().is_none());
+        };
+        check(&mut x3f, "missing Merrill JPEG EXIF");
+
+        let mut jpeg = [0xff_u8, 0xd8, 0xff, 0xd9];
+        let mut section: x3f_directory_entry_t = unsafe { std::mem::zeroed() };
+        section.header.identifier = u32::from_le_bytes(*b"SECi");
+        section.header.data_subsection.image_data.type_format = 0x0002_0012;
+        section.header.data_subsection.image_data.data = jpeg.as_mut_ptr().cast();
+        section.header.data_subsection.image_data.data_size = jpeg.len() as u32;
+        x3f.directory_section.num_directory_entries = 1;
+        x3f.directory_section.directory_entry = &mut section;
+        check(&mut x3f, "invalid Merrill JPEG EXIF");
+        unsafe {
+            (*x3f.directory_section.directory_entry)
+                .header
+                .data_subsection
+                .image_data
+                .data_size = 0;
+        }
+        check(&mut x3f, "empty Merrill JPEG EXIF");
+        assert_eq!(jpeg, [0xff, 0xd8, 0xff, 0xd9]);
+    }
+
+    #[test]
     fn merrill_missing_black_calibration_falls_back_before_touching_samples() {
         use super::*;
         let mut pixels = [100, 200, 300];
@@ -5050,6 +5343,7 @@ mod tests {
                 &mut x3f,
                 c"Sunlight".as_ptr() as *mut _,
                 x3f_color_encoding_e_SRGB,
+                true,
                 Control::none(),
             )
         };

@@ -22,14 +22,28 @@ calibration too.
 | Working units | Per-channel saturation ratios | Carry original `maxRaw-black` across preprocessing; reconstruct gained counts using `WB/0.55` for SD1 Merrill and `2*WB` for DP Merrill, followed by calibration. Existing intermediate quantization still limits equivalence. |
 | ColorDQ | Absent | Native signed LUT construction and two-pass chroma correction, after camera color. Strength is `ColorDQCamRGB * min(noise74, ISOgain)`; the verified corpus has constant ISO/slider columns, so no estimated noise level is guessed. |
 | Tone | No Sigma tone curve | `TCColorModeSettings`, mode contrast, ImageDepth saturation, logistic/Bézier curve and inverse-sRGB normalization. `X3F_EV` changes tone exposure. Other creative controls are neutral. |
-| Output color | One combined floating-point matrix before gamma | Camera color precedes tone; the native profile matrix follows tone, quantized to Q12 with native signed rounding and integer arithmetic. |
+| Spatial gain | Lens-position interpolation and double bilinear lookup | Native DP aperture/focus and SD1 chief-ray-angle table construction, float32 vertical interpolation over `y/(height-1)`, and incremental double horizontal interpolation over `width/(columns-1)`. Native skip bit 4 and the caller’s spatial-gain option disable it. Application remains at the existing conversion stage. |
+| Output color | One combined floating-point matrix before gamma; assumed sRGB source | Camera color precedes tone. EXIF ColorSpace 1 selects the sRGB source; other present values select Adobe. Native target conversion right-multiplies the Adobe matrix inverse for that source; matching source/target skips conversion. Q12 signed rounding and integer arithmetic follow. |
 | Gamma | 1024 interpolated floating-point samples | Native 65,536-entry rounded integer LUT sampled at `i/65536`; sRGB transfer or pure 2.2/1.8 power. |
 | TIFF interpretation | Ordinary exports lacked ICC and orientation | Embed a profile matching the actual transfer and preserve camera orientation in the TIFF tag. Stored pixels remain in sensor orientation; Sigma physically rotates its export. |
 
 `crates/x3f-sys/src/merrill.rs` contains the scalar output kernels;
-`process.rs` supplies CAMF calibration and count-domain inputs. The processing
+`process.rs` supplies CAMF calibration and count-domain inputs. The shared
+`jpeg_exif.rs` reader supplies the embedded EXIF F-number and source color space;
+DNG metadata uses the same parser. The processing
 code preserves per-conversion cancellation and does not load the Sigma library
 at runtime. Native execution is used only by the external verification harness.
+
+Spatial aperture follows the managed request: embedded EXIF FNumber takes
+precedence, with PROP APERTURE used only when that rational is absent or has
+a zero denominator. Decimal PROP values use a float32 product by 100000 and
+ties-to-even integer rounding. Native processing divides the resulting unsigned
+rational in double precision, then converts to float32. Direct PROP values differ
+from CAMF CaptureAperture on 36 of the 53 files; EXIF FNumber agrees with the
+CAMF value at float32 precision on all 53. Missing source ColorSpace selects
+legacy rendering because the managed missing-tag default is not fully verified.
+The parser currently accepts a single SHORT ColorSpace value, as present in the
+corpus; other native tag forms also conservatively select legacy rendering.
 
 The native setup is validated before preprocessing changes any samples. Unsupported
 calibration or tone settings produce a warning and select the existing renderer;
@@ -68,37 +82,58 @@ slider column 7 equal to one. Three files select Monochrome and retain legacy
 processing; the ordinary color reconstruction does not cover that branch.
 All 53 pass the full-resolution RGB16 render check with the expected ICC and
 orientation metadata, unchanged source hashes, and no unexpected setup fallback.
-This is a conversion check; only the retained Sigma reference measures RGB error.
+This is a conversion check; the two retained Sigma exports measure RGB error.
 
-Validation also passes 287 release workspace tests with the corpus (six ignored),
-the eight native-kernel tests under WASM/Wasmtime, workspace Clippy, formatting,
-and the documentation build. All three DNG reference hashes are unchanged;
-Quattro TIFF pixel bytes are unchanged, with an intentional ICC metadata update.
+Native spatial-table validation covers all 53 files: 2,486,389 float32 entries
+match the supplied library exactly. A separate image-overload ApplyGains oracle
+matches 7,947 channel samples and row padding across eleven cases. Production
+uses its spatial interpolation, while float black/gain arithmetic remains future
+work. Rust tests retain native table hashes and three spatial pixel-row hashes.
 
-The `_P2M0358.X3F` reference is a real Sigma export in RAW adjustment mode,
-original size, ProPhoto RGB, TIFF16. Comparison covers all 14,751,744 oriented
-pixels, without resizing, color fitting, or histogram matching. The candidate
-uses `-tiff -color ProPhotoRGB -no-denoise`; Sigma's native denoise request has
-not been captured, so this is a rendering comparison rather than matched
-denoise parity. Final measurements and reproducible commands are retained in
-the x3f-docs alignment evidence.
+The two real Sigma references are `_P2M0358.X3F` (DP2 Merrill) and
+`sigma_sd1_merrill_15.x3f` (SD1 Merrill), exported in RAW adjustment mode,
+original size, ProPhoto RGB, TIFF16. Each comparison covers 14,751,744 oriented
+pixels, without resizing, color fitting, or histogram matching. Both candidates
+use the same source, profile and size. The CPU column enables x3fuse’s default
+NLM; it does not claim the same denoise algorithm or strength as Sigma.
 
-| `_P2M0358` ProPhoto RGB16 | Mean absolute error | PSNR |
+| Reference / renderer | MAE | PSNR |
 | --- | --- | --- |
-| Previous renderer | 26.70% | 10.76 dB |
-| Recovered calibration, ColorDQ, tone and output stages | 1.48% | 34.15 dB |
+| DP2, previous renderer, no denoise | 26.70% | 10.76 dB |
+| DP2, recovered renderer, no denoise | 1.15% | 35.43 dB |
+| DP2, recovered renderer, CPU NLM | 0.46% | 40.68 dB |
+| SD1, previous renderer, no denoise | 13.65% | 15.12 dB |
+| SD1, recovered renderer, no denoise | 5.21% | 22.38 dB |
+| SD1, recovered renderer, CPU NLM | 1.07% | 36.42 dB |
 
-The initial 34.90 dB intermediate result used fallback tone parameters because
-the CAMF dimensions were read in the wrong order. The corrected reader uses
-`[rows, 7]` tone tables and `[rows, 13]` noise tables. Source agreement governs
-the implementation; the better intermediate score is not a reason to retain
-the incorrect table interpretation. This is one measured image, not a corpus
-color-accuracy claim.
+These results identify candidate binary SHA-256
+`f854e77821bb05c6a2c355f9d73284620bbda52046dbe9404566c003d827bba0`.
+The earlier DP2 34.15 dB checkpoint assumed an sRGB source despite its Adobe
+EXIF tag. Its earlier 34.90 dB intermediate also used fallback tone parameters
+because CAMF dimensions were reversed. Both are superseded; source agreement,
+rather than the best score from an intermediate configuration, governs changes.
 
-A second reference for SD1 Merrill is prepared but has not been exported:
-the locked macOS session prevented access to Sigma's window. Its count gain is
-verified from shipped code and exercised by the corpus sweep; no SD1 RGB-error
-measurement is claimed.
+SD1’s visible Sigma noise controls were at the middle of five detents, with
+Highlight Control 1.0. Their native numeric request values remain unknown.
+CPU NLM removes most shadow speckle, but one severe isolated wheel-pixel defect
+remains. At full sensor coordinate (4171,2349), raw C0 is 203 versus neighboring
+values 12–23; that site is absent from `BadPixelsF20`. All three packed
+`BadClustersF20` expanded regions also exclude it, verified from native geometry
+and a direct library execution with synthetic pixels. Native raster despeckling
+remains a candidate for its correction; actual Sigma stage pixels are unobserved.
+These are two measured scenes, not a corpus-wide color-accuracy claim.
+
+All three DNG reference hashes remain unchanged. Quattro TIFF is byte-identical
+to the preceding alignment checkpoint; its pixel bytes also match the original
+baseline. The updated Merrill TIFF pins are in the contributor guide.
+
+The release workspace suite passes 296 tests, with six intentionally ignored,
+using the local corpus. Strict workspace Clippy, formatting,
+and the documentation build. The portable WASM/Wasmtime run passes 24 Merrill
+kernel tests; its external corpus is not mounted. Independent Opus review
+verified source-color dispatch, matrix composition, shared EXIF parsing and
+error propagation. Missing/invalid JPEG EXIF falls back before rendering, and
+spatial-row tests check the exact output length.
 
 ## Remaining differences
 
@@ -113,9 +148,10 @@ measurement is claimed.
 - MED/LOW black-rectangle overrides and the separate monochrome/sepia branches
   are not covered by the full-resolution ordinary-color reference.
 - ColorDQ setups requiring an unknown native EstimatedISO or an unresolved
-  slider input fall back to legacy rendering. Missing ISO calibration and the
-  `SkipStepFlags` denoise-bypass branch also fall back, rather than assuming
-  they share the verified ordinary path's range conditioning.
+  slider input fall back to legacy rendering. Missing or unreadable ISO tables
+  now use the verified ordinary HI/MED/LOW fallback column (four at every row).
+  Readable malformed tables and the `SkipStepFlags` denoise-bypass branch still
+  fall back rather than assuming ordinary range conditioning applies.
 - The exact Bézier implementation currently accepts effective tone saturation
   in `[1,16384]` to bound its cubic work. For 12-bit Merrill this includes the
   ordinary -2 EV setting; larger extents select legacy rendering with a warning.

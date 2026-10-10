@@ -26,6 +26,8 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 // `libc::*` call sites resolve through the shim on wasm32 without
 // touching their bodies.
 pub mod control;
+#[doc(hidden)] // Shared implementation detail for x3f-core's metadata writer.
+pub mod jpeg_exif;
 pub mod sysabi;
 pub use control::{Control, Error, Result};
 mod parse;

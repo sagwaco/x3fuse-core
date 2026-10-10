@@ -133,8 +133,8 @@ x3f_extract -tiff -no-denoise <input>   # TIFF column
 
 | Input | DNG | TIFF |
 | ----- | --- | ---- |
-| SD1M (`sigma_sd1_merrill_15.x3f`) | `a2427c1db46066d7201f7499d46bb02d` | `ea0904f99efe59afa59163cc1b9201b8` |
-| DP2 Merrill (`_SDI8040.X3F`) | `94c64ebc524077d4f51e96df868d9271` | `98c925ffa8faedc6d225699183323332` |
+| SD1M (`sigma_sd1_merrill_15.x3f`) | `a2427c1db46066d7201f7499d46bb02d` | `c20dd796e38ad0b2a71d842ecb823458` |
+| DP2 Merrill (`_SDI8040.X3F`) | `94c64ebc524077d4f51e96df868d9271` | `a8a9596e60290f167e40b88e894dd47d` |
 | Quattro (`_SDI8284.X3F`) | `7259dd2e0b4c5cde7e4e5c2531defa9f` | `a3abbaa4928994c7209fe6a87ef5f4bc` |
 
 These must match across a change unless the change is an _intentional_
@@ -142,7 +142,8 @@ algorithm change — in which case re-pin this table in the same commit
 and call the change out in the commit message.
 
 The October 2026 [Merrill RGB alignment](./spp-alignment.md) intentionally
-changes Merrill TIFF pixels through source-derived calibration, ColorDQ, tone
+changes Merrill TIFF pixels through source-derived calibration, spatial tables,
+EXIF source-color selection, ColorDQ, tone
 and output stages. Processed TIFF exports also gain ICC profiles and camera
 orientation metadata for every camera; Quattro TIFF pixel bytes remain unchanged.
 The three DNG files remain byte-identical, including their embedded previews.

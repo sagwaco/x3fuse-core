@@ -30,6 +30,387 @@ use crate::*;
 // libc compat — see `sysabi.rs`.
 use crate::sysabi as libc;
 
+/// Merrill's float32 spatial tables, before per-image interpolation.
+/// Native ConvertGains / InterpFStop / GenerateSpatialGainTables: 0xaf750..0xb1ce4.
+#[derive(Clone, Debug)]
+pub(crate) struct MerrillSpatialTable {
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+    pub(crate) values: Vec<f32>,
+}
+
+fn invalid_merrill_spatial() -> Error {
+    Error::InvalidData("unsupported Merrill spatial gain calibration")
+}
+
+impl MerrillSpatialTable {
+    fn validate(&self) -> Result<()> {
+        if self.cols < 2
+            || self.rows == 0
+            || self.rows.checked_mul(self.cols) != Some(self.values.len())
+            || self.values.iter().any(|v| !v.is_finite())
+        {
+            return Err(invalid_merrill_spatial());
+        }
+        Ok(())
+    }
+
+    fn blend(mut self, other: Self, a: f64, b: f64, fused: bool) -> Result<Self> {
+        if self.rows != other.rows || self.cols != other.cols || !a.is_finite() || !b.is_finite() {
+            return Err(invalid_merrill_spatial());
+        }
+        for (x, y) in self.values.iter_mut().zip(other.values) {
+            let low = (f64::from(*x) * a) as f32;
+            *x = if fused {
+                (b as f32).mul_add(y, low)
+            } else {
+                low + (f64::from(y) * b) as f32
+            };
+        }
+        self.validate()?;
+        Ok(self)
+    }
+}
+
+/// The image overload of ApplyGains interpolates vertically in f32, then
+/// advances each horizontal knot in f64 using width/(table_columns-1).
+pub(crate) struct MerrillSpatialRow {
+    rows: [Vec<f32>; 3],
+    span: [f64; 3],
+    edge: [f64; 3],
+    value: [f64; 3],
+    slope: [f64; 3],
+    knot: [usize; 3],
+    column: usize,
+    columns: usize,
+}
+
+impl MerrillSpatialRow {
+    pub(crate) fn new(
+        tables: &[MerrillSpatialTable; 3],
+        row: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        if rows < 2 || row >= rows || cols == 0 {
+            return Err(invalid_merrill_spatial());
+        }
+        let mut result = Self {
+            rows: std::array::from_fn(|_| Vec::new()),
+            span: [0.0; 3],
+            edge: [0.0; 3],
+            value: [0.0; 3],
+            slope: [0.0; 3],
+            knot: [0; 3],
+            column: 0,
+            columns: cols,
+        };
+        for (c, table) in tables.iter().enumerate() {
+            // Tables are validated once when built. Check dimensions here so
+            // synthetic/test callers cannot turn row interpolation into OOB reads.
+            if table.cols < 2
+                || table.rows == 0
+                || table.rows.checked_mul(table.cols) != Some(table.values.len())
+            {
+                return Err(invalid_merrill_spatial());
+            }
+            let position = (row as f32 / (rows - 1) as f32) * (table.rows - 1) as f32;
+            let low = position.floor() as usize;
+            let high = position.ceil() as usize;
+            if high >= table.rows {
+                return Err(invalid_merrill_spatial());
+            }
+            let fraction = position - low as f32;
+            result.rows[c]
+                .try_reserve_exact(table.cols)
+                .map_err(|_| Error::Allocation)?;
+            for x in 0..table.cols {
+                let a = table.values[low * table.cols + x];
+                let b = table.values[high * table.cols + x];
+                result.rows[c].push(fraction.mul_add(b - a, a));
+            }
+            result.span[c] = cols as f64 / (table.cols - 1) as f64;
+            result.edge[c] = result.span[c];
+            result.value[c] = f64::from(result.rows[c][0]);
+            result.slope[c] = f64::from(result.rows[c][1] - result.rows[c][0]) / result.span[c];
+        }
+        Ok(result)
+    }
+}
+
+impl Iterator for MerrillSpatialRow {
+    type Item = [f64; 3];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.column == self.columns {
+            return None;
+        }
+        for c in 0..3 {
+            // Native increments once, including when the table is wider than
+            // the raster; replacing this with direct bilinear lookup changes it.
+            if self.column as f64 >= self.edge[c] {
+                self.knot[c] += 1;
+                let k = self.knot[c];
+                self.value[c] = f64::from(self.rows[c][k]);
+                self.slope[c] = f64::from(self.rows[c][k + 1] - self.rows[c][k]) / self.span[c];
+                self.edge[c] += self.span[c];
+            }
+        }
+        let result = self.value;
+        for c in 0..3 {
+            self.value[c] += self.slope[c];
+        }
+        self.column += 1;
+        Some(result)
+    }
+}
+
+unsafe fn merrill_camf_entry<'a>(x3f: *mut x3f_t, name: &CStr) -> Option<&'a camf_entry_t> {
+    let de = unsafe { x3f_get_camf(x3f) };
+    if de.is_null() {
+        return None;
+    }
+    let table = unsafe { (*de).header.data_subsection.camf.entry_table };
+    if table.element.is_null() || table.size == 0 {
+        return None;
+    }
+    unsafe { std::slice::from_raw_parts(table.element, table.size as usize) }
+        .iter()
+        .find(|e| !e.name_address.is_null() && unsafe { CStr::from_ptr(e.name_address) } == name)
+}
+
+unsafe fn merrill_gain_table(
+    x3f: *mut x3f_t,
+    name: &CStr,
+    channel: &CStr,
+) -> Result<MerrillSpatialTable> {
+    let mut key = [0; 32];
+    let len = format_into(&mut key, "GainsTable", channel.to_bytes());
+    let key = CStr::from_bytes_with_nul(&key[..=len]).unwrap();
+    let mut target = ptr::null_mut();
+    if unsafe {
+        x3f_get_camf_property(
+            x3f,
+            name.as_ptr().cast_mut(),
+            key.as_ptr().cast_mut(),
+            &mut target,
+        )
+    } == 0
+        || target.is_null()
+    {
+        return Err(invalid_merrill_spatial());
+    }
+    let entry = unsafe { merrill_camf_entry(x3f, CStr::from_ptr(target)) }
+        .ok_or_else(invalid_merrill_spatial)?;
+    if entry.id != 0x4d62_4d43 || entry.matrix_type != 5 || entry.matrix_dim != 2 {
+        return Err(invalid_merrill_spatial());
+    }
+    let (mut data, mut rows, mut cols, mut minimum, mut delta) =
+        (ptr::null_mut(), -1, -1, 0.0, 0.0);
+    if unsafe {
+        get_merrill_type_gains_table(
+            x3f,
+            name.as_ptr().cast_mut(),
+            channel,
+            &mut data,
+            &mut rows,
+            &mut cols,
+            &mut minimum,
+            &mut delta,
+        )
+    } == 0
+        || rows < 1
+        || cols < 2
+        || !minimum.is_finite()
+        || !delta.is_finite()
+        || minimum == 0.0
+        || delta == 0.0
+    {
+        return Err(invalid_merrill_spatial());
+    }
+    let len = (rows as usize)
+        .checked_mul(cols as usize)
+        .ok_or(Error::Allocation)?;
+    if data.is_null() || len > isize::MAX as usize / mem::size_of::<u32>() {
+        return Err(invalid_merrill_spatial());
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(len)
+        .map_err(|_| Error::Allocation)?;
+    for &byte in bytes {
+        if byte > 255 {
+            return Err(invalid_merrill_spatial());
+        }
+        // ConvertGains @0xaf9c4 rounds the product before adding the f32 minimum.
+        values.push(minimum as f32 + (delta * f64::from(byte)) as f32);
+    }
+    let result = MerrillSpatialTable {
+        rows: rows as usize,
+        cols: cols as usize,
+        values,
+    };
+    result.validate()?;
+    Ok(result)
+}
+
+fn merrill_aperture_table(
+    aperture: f32,
+    stops: &[f64],
+    squared: bool,
+    mut get: impl FnMut(usize) -> Result<MerrillSpatialTable>,
+) -> Result<MerrillSpatialTable> {
+    if !aperture.is_finite()
+        || aperture <= 0.0
+        || stops.len() < 2
+        || stops.iter().any(|x| !x.is_finite() || *x <= 0.0)
+        || stops.windows(2).any(|p| p[0] >= p[1])
+    {
+        return Err(invalid_merrill_spatial());
+    }
+    let f = f64::from(aperture);
+    if f <= stops[0] {
+        return get(0);
+    }
+    if squared && f >= stops[stops.len() - 1] {
+        return get(stops.len() - 1);
+    }
+    let high = stops
+        .iter()
+        .position(|x| *x >= f)
+        .unwrap_or(stops.len() - 1);
+    let a = if squared {
+        let upper = stops[high] * stops[high];
+        (upper - f64::from(aperture * aperture)) / (upper - stops[high - 1] * stops[high - 1])
+    } else {
+        (1.0 / f - 1.0 / stops[high]) / (1.0 / stops[high - 1] - 1.0 / stops[high])
+    };
+    get(high - 1)?.blend(get(high)?, a, f64::from((1.0 - a) as f32), true)
+}
+
+fn merrill_cra_weights(aperture: f32, cra: f32) -> (&'static str, f64, f64) {
+    let q = 0.5 / f64::from(aperture);
+    let phi = |a: f64, b: f64, low: f32| {
+        ((q + a).min(b) + f64::from(((a - q) as f32).max(low)))
+            .mul_add(0.5, 0.0)
+            .atan()
+    };
+    let p50 = phi(
+        f64::from_bits(0x3fc3_c50a_f08f_bd56),
+        f64::from_bits(0x3fdd_7343_4719_bb36),
+        f32::from_bits(0xbd28_cf0c),
+    );
+    let t = (std::f64::consts::PI / p50) * f64::from(cra / 180.0);
+    if aperture >= 2.0 && t >= 1.0 {
+        let r = phi(
+            f64::from_bits(0x3fcf_a730_ea29_9de5),
+            f64::from_bits(0x3fdd_23b6_93fe_1ec4),
+            f32::from_bits(0xbd34_fbe9),
+        ) / p50;
+        ("85", (r - t) / (r - 1.0), (t - 1.0) / (r - 1.0))
+    } else {
+        let r = phi(
+            f64::from_bits(0x3f8a_cf4e_4e15_9df0),
+            f64::from_bits(0x3fd4_17db_677f_f305),
+            f32::from_bits(0xbccc_8007),
+        ) / p50;
+        ("30", (t - r) / (1.0 - r), (1.0 - t) / (1.0 - r))
+    }
+}
+
+/// Exact table construction for the supported Merrill CAMF layouts. `aperture`
+/// is the as-shot F-number rounded to f32 by native preprocess @0xa6618.
+/// None means the native table-family selector found no applicable calibration.
+/// SkipStepFlags bit4 and the caller's spatial-gain option are handled by caller.
+pub(crate) unsafe fn merrill_spatial_gain(
+    x3f: *mut x3f_t,
+    aperture: f32,
+    control: Control<'_>,
+) -> Result<Option<[MerrillSpatialTable; 3]>> {
+    control.check()?;
+    if !aperture.is_finite() || aperture <= 0.0 {
+        return Err(invalid_merrill_spatial());
+    }
+    let mut cra = 0.0;
+    unsafe {
+        x3f_get_camf_float(x3f, c"ChiefRayAngle".as_ptr().cast_mut(), &mut cra);
+    }
+    if !cra.is_finite() {
+        return Err(invalid_merrill_spatial());
+    }
+    let cra = cra as f32;
+    let mut stops = Vec::new();
+    let (family, a, b) = if cra > 0.0 {
+        let (mut names, mut values, mut count) = (ptr::null_mut(), ptr::null_mut(), 0);
+        if unsafe {
+            x3f_get_camf_property_list(
+                x3f,
+                c"SpatialGainsProps_1.4_30".as_ptr().cast_mut(),
+                &mut names,
+                &mut values,
+                &mut count,
+            )
+        } == 0
+            || count == 0
+        {
+            return Ok(None);
+        }
+        stops.extend([1.4, 2.0, 2.8, 8.0]);
+        merrill_cra_weights(aperture, cra)
+    } else {
+        let (mut data, mut count) = (ptr::null_mut(), 0);
+        if unsafe {
+            x3f_get_camf_matrix_var(
+                x3f,
+                c"SpatialGain_Fstop".as_ptr().cast_mut(),
+                &mut count,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                matrix_type_t_M_FLOAT,
+                &mut data,
+            )
+        } == 0
+        {
+            if unsafe { merrill_camf_entry(x3f, c"SpatialGain_Fstop") }.is_some() {
+                return Err(invalid_merrill_spatial());
+            }
+            return Ok(None);
+        }
+        if !(2..=10).contains(&count) {
+            return Err(invalid_merrill_spatial());
+        }
+        stops.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(data.cast::<f64>(), count as usize)
+        });
+        let mut focus = 0;
+        unsafe {
+            x3f_get_camf_unsigned(x3f, c"ScaleENC".as_ptr().cast_mut(), &mut focus);
+        }
+        let a = (31.0 - f64::from(focus as i32)) / 31.0;
+        ("MOD", a, 1.0 - a)
+    };
+    let mut tables = Vec::new();
+    for channel in [c"R", c"G", c"B"] {
+        control.check()?;
+        let get = |focus: &str| {
+            merrill_aperture_table(aperture, &stops, cra > 0.0, |i| {
+                let label = if cra > 0.0 {
+                    ["1.4", "2.0", "2.8", "8.0"][i].to_owned()
+                } else {
+                    i.to_string()
+                };
+                let name =
+                    std::ffi::CString::new(format!("SpatialGainsProps_{label}_{focus}")).unwrap();
+                unsafe { merrill_gain_table(x3f, &name, channel) }
+            })
+        };
+        tables.push(get(if cra > 0.0 { "50" } else { "INF" })?.blend(get(family)?, a, b, false)?);
+    }
+    control.check()?;
+    Ok(Some(tables.try_into().unwrap()))
+}
+
 #[derive(Clone)]
 struct MerrillSpatialGain {
     name: *mut libc::c_char,
@@ -858,6 +1239,249 @@ static _A_CALC_SGAIN: unsafe extern "C" fn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn constant_table(value: f32) -> MerrillSpatialTable {
+        MerrillSpatialTable {
+            rows: 1,
+            cols: 2,
+            values: vec![value; 2],
+        }
+    }
+
+    fn float_hash(values: impl IntoIterator<Item = f32>) -> u64 {
+        values
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .fold(0xcbf29ce484222325, |h, v| {
+                (h ^ u64::from(v)).wrapping_mul(0x100000001b3)
+            })
+    }
+
+    #[test]
+    fn merrill_spatial_aperture_endpoints_and_extrapolation() {
+        let stops = [2.0, 4.0, 8.0];
+        let get = |i| Ok(constant_table([1.0, 2.0, 4.0][i]));
+        assert_eq!(
+            merrill_aperture_table(1.0, &stops, false, get)
+                .unwrap()
+                .values,
+            [1.0; 2]
+        );
+        assert_eq!(
+            merrill_aperture_table(4.0, &stops, false, get)
+                .unwrap()
+                .values,
+            [2.0; 2]
+        );
+        // DP extrapolates the final reciprocal-aperture interval; CRA clamps.
+        assert_eq!(
+            merrill_aperture_table(16.0, &stops, false, get)
+                .unwrap()
+                .values,
+            [5.0; 2]
+        );
+        assert_eq!(
+            merrill_aperture_table(16.0, &stops, true, get)
+                .unwrap()
+                .values,
+            [4.0; 2]
+        );
+        for stops in [
+            &[2.0][..],
+            &[2.0, 2.0],
+            &[4.0, 2.0],
+            &[0.0, 4.0],
+            &[2.0, f64::NAN],
+        ] {
+            assert!(merrill_aperture_table(2.8, stops, false, get).is_err());
+        }
+        for aperture in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(merrill_aperture_table(aperture, &stops, false, get).is_err());
+        }
+        assert!(constant_table(1.0)
+            .blend(
+                MerrillSpatialTable {
+                    rows: 2,
+                    cols: 2,
+                    values: vec![1.0; 4]
+                },
+                0.5,
+                0.5,
+                true
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn merrill_spatial_missing_and_malformed_camf_are_distinct() {
+        unsafe {
+            let mut values = [2.8_f64, 4.0, 8.0];
+            let mut dim: camf_dim_entry_t = std::mem::zeroed();
+            dim.size = 3;
+            let mut entry: camf_entry_t = std::mem::zeroed();
+            entry.id = u32::from_le_bytes(*b"CMbM");
+            entry.name_address = c"Other".as_ptr().cast_mut();
+            entry.matrix_type = 3;
+            entry.matrix_dim = 1;
+            entry.matrix_dim_entry = &mut dim;
+            entry.matrix_elements = 3;
+            entry.matrix_decoded_type = matrix_type_t_M_FLOAT;
+            entry.matrix_decoded = values.as_mut_ptr().cast();
+            let mut section: x3f_directory_entry_t = std::mem::zeroed();
+            section.header.identifier = u32::from_le_bytes(*b"SECc");
+            section.header.data_subsection.camf.entry_table = camf_entry_table_t {
+                size: 1,
+                element: &mut entry,
+            };
+            let mut x3f: x3f_t = std::mem::zeroed();
+            x3f.directory_section.num_directory_entries = 1;
+            x3f.directory_section.directory_entry = &mut section;
+            assert!(merrill_spatial_gain(&mut x3f, 4.0, Control::none())
+                .unwrap()
+                .is_none());
+            let entry_ptr = section.header.data_subsection.camf.entry_table.element;
+            (*entry_ptr).name_address = c"SpatialGain_Fstop".as_ptr().cast_mut();
+            (*entry_ptr).matrix_elements = 2;
+            assert!(matches!(
+                merrill_spatial_gain(&mut x3f, 4.0, Control::none()),
+                Err(Error::InvalidData(_))
+            ));
+            (*entry_ptr).matrix_elements = 3;
+            (*entry_ptr).matrix_decoded_type = matrix_type_t_M_UINT;
+            assert!(matches!(
+                merrill_spatial_gain(&mut x3f, 4.0, Control::none()),
+                Err(Error::InvalidData(_))
+            ));
+            (*entry_ptr).matrix_decoded_type = matrix_type_t_M_FLOAT;
+            // A valid selector with missing channel tables is malformed rather
+            // than a partially applied correction.
+            assert!(matches!(
+                merrill_spatial_gain(&mut x3f, 4.0, Control::none()),
+                Err(Error::InvalidData(_))
+            ));
+            let cancelled = std::sync::atomic::AtomicBool::new(true);
+            assert!(matches!(
+                merrill_spatial_gain(&mut x3f, 4.0, Control::new(&cancelled)),
+                Err(Error::Cancelled)
+            ));
+        }
+    }
+
+    #[test]
+    fn merrill_spatial_row_matches_native_apply_gains() {
+        // Original exported image ApplyGains, SHA256 037419dc...6ce5e6.
+        // Retained oracle: spp-rgb-trace/float-preprocess/check_apply_gains.cpp.
+        let tables = std::array::from_fn(|c| {
+            let (cols, rows) = (3 + 2 * c, 3 + c);
+            MerrillSpatialTable {
+                rows,
+                cols,
+                values: (0..cols * rows)
+                    .map(|i| 0.8_f32 + ((i * 7 + c * 3) % 17) as f32 * 0.071_f32)
+                    .collect(),
+            }
+        });
+        for (width, expected) in [
+            (9, 0x975b9335a4245ddf),
+            (37, 0x7951b2f5927245f1),
+            (97, 0xb63b750844e59ce2),
+        ] {
+            let height = 13;
+            let stride = width * 3 + 7;
+            let mut pixels = vec![-12345.25_f32; stride * height];
+            for y in 0..height {
+                assert_eq!(
+                    MerrillSpatialRow::new(&tables, y, height, width)
+                        .unwrap()
+                        .count(),
+                    width
+                );
+                for (x, spatial) in MerrillSpatialRow::new(&tables, y, height, width)
+                    .unwrap()
+                    .enumerate()
+                {
+                    for c in 0..3 {
+                        let raw =
+                            (((x * 191 + y * 131 + c * 977) % 8192) as i32 - 128) as f32 * 0.75;
+                        let black = [128.125, 255.3, -64.75][c];
+                        let gain = [2.21234567, 0.98765432, 4.4433322][c];
+                        pixels[y * stride + 3 * x + c] =
+                            ((f64::from(raw) - black) * (gain * spatial[c])) as f32;
+                    }
+                }
+            }
+            assert_eq!(float_hash(pixels), expected, "width {width}");
+        }
+        assert!(MerrillSpatialRow::new(&tables, 0, 1, 9).is_err());
+        assert!(MerrillSpatialRow::new(&tables, 13, 13, 9).is_err());
+        assert!(MerrillSpatialRow::new(&tables, 0, 13, 0).is_err());
+        let broken = std::array::from_fn(|_| MerrillSpatialTable {
+            rows: 2,
+            cols: 3,
+            values: vec![1.0; 5],
+        });
+        assert!(MerrillSpatialRow::new(&broken, 0, 13, 9).is_err());
+    }
+
+    #[test]
+    fn merrill_spatial_real_camf_matches_native_tables() {
+        // The supplied aperture here is explicitly CAMF CaptureAperture. This
+        // checks table math, independently of managed SPP's aperture selection.
+        let root = std::env::var_os("X3F_TEST_FILES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../x3f_test_files")
+            });
+        let mut checked = 0;
+        for line in include_str!("../tests/fixtures/merrill-spatial-native.tsv")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let fields: Vec<_> = line.split('\t').collect();
+            assert_eq!(fields.len(), 4);
+            let name = fields[0];
+            let expected: [u64; 3] =
+                std::array::from_fn(|c| u64::from_str_radix(fields[c + 1], 16).unwrap());
+            let path = root.join(name);
+            if !path.exists() {
+                continue;
+            }
+            let path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            unsafe {
+                let file = libc::fopen(path.as_ptr(), c"rb".as_ptr());
+                assert!(!file.is_null());
+                let x3f = x3f_new_from_file(file.cast());
+                assert!(!x3f.is_null());
+                assert_eq!(x3f_load_data(x3f, x3f_get_camf(x3f)), x3f_return_e_X3F_OK);
+                let mut aperture = 0.0;
+                assert_ne!(
+                    x3f_get_camf_float(x3f, c"CaptureAperture".as_ptr().cast_mut(), &mut aperture),
+                    0
+                );
+                let tables = merrill_spatial_gain(x3f, aperture as f32, Control::none())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    tables
+                        .each_ref()
+                        .map(|t| float_hash(t.values.iter().copied())),
+                    expected,
+                    "{name}"
+                );
+                assert_eq!(
+                    tables.each_ref().map(|t| [t.cols, t.rows]),
+                    [[241, 161], [78, 52], [78, 52]]
+                );
+                x3f_delete(x3f);
+                libc::fclose(file);
+            }
+            checked += 1;
+        }
+        eprintln!(
+            "Merrill native table oracle: {checked}/53 corpus fixtures present at {}",
+            root.display()
+        );
+    }
 
     #[test]
     fn lens_position_at_infinity_returns_focal_length() {

@@ -71,8 +71,10 @@ stages from the remaining legacy algorithms.
    options. This is not Sigma's native tiled filter pipeline.
 6. **RGB highlight handling and spatial gain** — build the normalized chroma
    LUT; per pixel, recover highlights, optionally run RepairPix, apply the
-   matrix-pathology gate, and evaluate spatial gain. This ordering still differs
-   from Sigma's preprocessing-time highlight restoration.
+   matrix-pathology gate, and evaluate spatial gain. Merrill uses the recovered
+   aperture/focus or chief-ray-angle tables and native pixel interpolation;
+   EXIF FNumber supplies aperture, with the managed PROP fallback. This ordering
+   still differs from Sigma's preprocessing-time gain and highlight restoration.
 7. **Camera color** — Merrill RGB restores gained counts and applies selected
    WB correction, float32 ISO scaling/remaps and color-mode compensation.
    It then applies native ColorDQ chroma correction and the residual stage's
@@ -80,7 +82,9 @@ stages from the remaining legacy algorithms.
    Remaining render paths retain `get_conv`'s sensor-to-XYZ-to-output matrix
    and per-channel digital ISO column scaling.
 8. **Tone and output color** — Merrill applies its recovered tone LUT, Q12
-   target-profile matrix, then the 65,536-entry integer gamma LUT. Other paths
+   output matrix selected by EXIF source ColorSpace and requested target, then
+   the 65,536-entry integer gamma LUT. Adobe-source conversion includes the
+   native Adobe matrix inverse. Other paths
    retain the interpolated gamma/Cineon LUT. The tone stage is excluded from
    DNG and scene-linear output.
 9. **File output** — TIFF embeds the actual RGB transfer profile and camera
