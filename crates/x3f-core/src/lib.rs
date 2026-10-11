@@ -143,6 +143,15 @@ pub struct ProcessOptions {
     /// Enable the `gpu` Cargo feature for native acceleration. Auto falls back
     /// to CPU when unavailable; Gpu fails instead. WASM always uses CPU in Auto.
     pub denoise_backend: DenoiseBackend,
+    /// Use scene-derived chroma-LUT recovery for sRGB, Adobe RGB or ProPhoto RGB.
+    /// `None` (default) enables it unless `X3F_NO_CHROMA_LUT` is present;
+    /// `Some(true)` or `Some(false)` overrides that environment setting for
+    /// this conversion. Disabling the LUT retains the prior-based recovery
+    /// and matrix-pathology gate; it does not select Sigma's native recovery.
+    /// Ignored by DNG, scene-linear, `ColorEncoding::None`, unprocessed and
+    /// Cineon output. `X3F_NO_CHROMA_LUT` still controls the separate DNG
+    /// recovery LUT, including camera-space (`None`) output.
+    pub rgb_chroma_lut: Option<bool>,
     /// Directory of pre-rendered DNG `OpcodeList3` blobs (Sigma's per-
     /// model / per-aperture flat-fielding gain maps). When set, the DNG
     /// writer looks up the blob matching the camera's model and aperture
@@ -199,6 +208,7 @@ impl Default for ProcessOptions {
             compress: false,
             denoise_intensity: 10,
             denoise_backend: DenoiseBackend::Auto,
+            rgb_chroma_lut: None,
             opcodes_dir: None,
             dng_highlight_recovery: false,
             dng_highlight_mapping: DngHighlightMapping::default(),
@@ -631,9 +641,11 @@ impl Reader {
                 sgain,
                 cwb_ptr(&cwb),
                 log_exposure as i32,
-                // Histogram output retains its legacy processing behavior;
-                // DNG highlight and TIFF Cineon options do not apply here.
-                sys::ProcessingOptions::default(),
+                // DNG highlight and TIFF Cineon options do not apply to histograms.
+                sys::ProcessingOptions {
+                    rgb_chroma_lut: opts.rgb_chroma_lut,
+                    ..sys::ProcessingOptions::default()
+                },
                 sys::Control::none().with_denoise_backend(opts.denoise_backend),
             )
         }?;

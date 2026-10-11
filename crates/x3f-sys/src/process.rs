@@ -2943,6 +2943,7 @@ pub unsafe extern "C" fn convert_data(
             Control::none(),
             CINEON.with(|c| c.get()),
             None,
+            None,
         )
         .is_ok() as libc::c_int
     }
@@ -2957,6 +2958,7 @@ unsafe fn convert_data_controlled(
     wb: *mut libc::c_char,
     control: Control<'_>,
     cineon: bool,
+    rgb_chroma_lut: Option<bool>,
     merrill: Option<MerrillRender>,
 ) -> crate::Result<()> {
     let max_out: u16 = 65535; // TODO: should be possible to adjust
@@ -3035,7 +3037,8 @@ unsafe fn convert_data_controlled(
     // off in cineon mode — it bakes scene-derived chroma recovery into
     // the pixels, which fights the colour-grader's input transform.
     let mut clut: chroma_lut_t = unsafe { std::mem::zeroed() };
-    let mut use_clut = !cineon && !env_present("X3F_NO_CHROMA_LUT");
+    let mut use_clut =
+        !cineon && rgb_chroma_lut.unwrap_or_else(|| !env_present("X3F_NO_CHROMA_LUT"));
     if use_clut {
         unsafe { chroma_lut_init_defaults(&mut clut) };
         if unsafe {
@@ -4271,6 +4274,7 @@ pub unsafe extern "C" fn x3f_get_image(
         dng_highlight_recovery: DNG_HIGHLIGHT_RECOVERY.with(|c| c.get()),
         dng_shoulder: DNG_HIGHLIGHT_MAPPING.with(|c| c.get()) == DngMapping::Shoulder,
         cineon: CINEON.with(|c| c.get()),
+        rgb_chroma_lut: None,
     };
     match unsafe {
         get_image_controlled(
@@ -4302,6 +4306,8 @@ pub struct ProcessingOptions {
     pub dng_highlight_recovery: bool,
     pub dng_shoulder: bool,
     pub cineon: bool,
+    /// Per-conversion RGB override; None preserves X3F_NO_CHROMA_LUT behavior.
+    pub rgb_chroma_lut: Option<bool>,
 }
 
 /// Encoding metadata belonging to the returned image, never to a worker thread.
@@ -4618,6 +4624,7 @@ unsafe fn get_image_impl(
                 wb,
                 control,
                 cineon,
+                options.rgb_chroma_lut,
                 merrill,
             )
         }?;

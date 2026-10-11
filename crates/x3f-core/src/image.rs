@@ -141,6 +141,7 @@ impl Reader {
                     dng_highlight_recovery: opts.dng_highlight_recovery,
                     dng_shoulder: opts.dng_highlight_mapping.to_raw() == 1,
                     cineon: opts.cineon,
+                    rgb_chroma_lut: opts.rgb_chroma_lut,
                 },
                 control,
             )

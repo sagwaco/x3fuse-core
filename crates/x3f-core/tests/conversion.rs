@@ -202,6 +202,25 @@ fn concurrent_conversions_match_serial_for_per_file_options() {
             },
         ));
     }
+    // Append so the four baseline cases above keep their existing indices.
+    // This fixture actually changes with the LUT; the first two Quattros do not.
+    let clipped = files[0].with_file_name("CLIPPED_IMAGE_MERRILL.X3F");
+    let lut_start = jobs.len();
+    if clipped.is_file() {
+        for enabled in [true, false] {
+            jobs.push((
+                &clipped,
+                OutputFormat::Tiff,
+                ProcessOptions {
+                    denoise_intensity: 0,
+                    rgb_chroma_lut: Some(enabled),
+                    ..ProcessOptions::default()
+                },
+            ));
+        }
+    } else {
+        eprintln!("skip: CLIPPED_IMAGE_MERRILL.X3F missing for concurrent LUT overrides");
+    }
     let cancel = AtomicBool::new(false);
     for (index, (file, format, options)) in jobs.iter().enumerate() {
         convert_file(
@@ -213,6 +232,13 @@ fn concurrent_conversions_match_serial_for_per_file_options() {
             |_| {},
         )
         .unwrap();
+    }
+    if clipped.is_file() {
+        assert!(
+            std::fs::read(output.join(format!("serial-{lut_start}"))).unwrap()
+                != std::fs::read(output.join(format!("serial-{}", lut_start + 1))).unwrap(),
+            "concurrent LUT fixture must exercise different pixels"
+        );
     }
     // The inner row-parallel processing must safely share these same workers
     // with another Reader using different highlight and Cineon options.

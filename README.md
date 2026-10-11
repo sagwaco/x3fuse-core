@@ -89,6 +89,7 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 | `-no-crop`                | do not crop to the active image area                                               |
 | `-no-sgain` / `-sgain`    | disable / force spatial-gain (lens color) compensation                             |
 | `-no-fix-bad`             | do not fix bad pixels                                                              |
+| `-chroma-lut` / `-no-chroma-lut` | enable / disable scene-derived RGB highlight LUT; override `X3F_NO_CHROMA_LUT` |
 | `-wb <PRESET>`            | select a white-balance preset                                                      |
 | `-unprocessed`            | dump RAW with no preprocessing                                                     |
 | `-qtop`                   | dump the Quattro top layer, unprocessed                                            |
@@ -109,6 +110,9 @@ x3f_extract -dng input.X3F
 # 16-bit sRGB TIFF
 x3f_extract -tiff -color sRGB input.X3F
 
+# Explicitly retain scene-derived chroma-LUT highlight recovery for RGB
+x3f_extract -tiff -chroma-lut input.X3F
+
 # Deflate-compressed TIFF into an output directory
 x3f_extract -tiff -compress -o out/ input.X3F
 
@@ -122,12 +126,20 @@ x3f_extract -v -dng -denoise-backend gpu input.X3F
 x3f_extract -meta input.X3F
 ```
 
+## RGB highlight recovery
+
+For rendered RGB, `-chroma-lut` and `-no-chroma-lut` explicitly enable or disable
+the scene-derived LUT, overriding `X3F_NO_CHROMA_LUT`. The default remains on
+unless that environment variable is present. Disabling the LUT retains the
+prior recovery and matrix gate; it does not select native Sigma recovery. These
+RGB options do not affect DNG or Cineon output.
+
 ## DNG output
 
-Foveon sensors have no demosaicing step, so DNGs are written as **Linear DNGs** (`PhotometricInterpretation = LinearRaw`). To render consistently across RAW engines (Adobe Camera Raw / Lightroom, LibRaw / RawTherapee, Capture One, and Apple's RAW engine) the writer bakes per-channel saturation into the raster and tags a uniform `BlackLevel = 0` / `WhiteLevel = 65535`, and never relies on optional hints like `BaselineExposure`.
+Foveon sensors have no demosaicing step, so DNGs are written as **Linear DNGs** (`PhotometricInterpretation = LinearRaw`). The writer bakes per-channel saturation into the raster and tags a uniform `BlackLevel = 0` / `WhiteLevel = 65535`. `BaselineExposure` carries ISO brightening and any linear highlight-headroom compensation; readers that ignore it can show a darker image.
 
 - **`-compress`**: lossless compression. TIFF uses Deflate/ZIP; DNG uses **lossless JPEG** (`Compression = 7`), the only 16-bit integer raw compression the spec allows and the one every engine decodes. Compressed output is bit-identical to uncompressed.
-- **`-dng-highlight-recovery`**: reconstructs clipped channels from a scene-derived chroma LUT and folds recovered highlights back under `WhiteLevel` via a soft shoulder baked into the raster (published as `LinearResponseLimit`).
+- **`-dng-highlight-recovery`**: reconstructs clipped channels and preserves recovered headroom linearly by default. Add `-dng-highlight-mapping shoulder` to bake the legacy soft shoulder into the raster.
 
 See the [conversion pipeline](docs/src/pipeline.md) chapter for the full DNG writer design.
 

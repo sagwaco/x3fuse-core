@@ -51,6 +51,7 @@ struct Args {
     /// 10 is full strength (legacy default).
     denoise_intensity: u8,
     denoise_backend: x3f_core::DenoiseBackend,
+    rgb_chroma_lut: Option<bool>,
     apply_sgain: Option<bool>,
     file_type: FileType,
     color_encoding: ColorEncoding,
@@ -83,6 +84,7 @@ impl Default for Args {
             fix_bad: true,
             denoise_intensity: 10,
             denoise_backend: x3f_core::DenoiseBackend::Auto,
+            rgb_chroma_lut: None,
             apply_sgain: None,
             file_type: FileType::Dng,
             color_encoding: ColorEncoding::Srgb,
@@ -137,6 +139,14 @@ fn usage(progname: &str) -> ! {
          \x20                  values linearly scale the NLM sigma.\n\
          \x20  -no-sgain       Do not apply spatial gain (color compensation)\n\
          \x20  -no-fix-bad     Do not fix bad pixels\n\
+         \x20  -chroma-lut     Enable scene-derived RGB highlight recovery\n\
+         \x20  -no-chroma-lut  Disable that LUT; retain prior recovery and gate\n\
+         \x20                  Both override X3F_NO_CHROMA_LUT for rendered\n\
+         \x20                  sRGB/AdobeRGB/ProPhotoRGB output.\n\
+         \x20                  Default: LUT on unless the environment disables it.\n\
+         \x20                  DNG, -color none, raw and Cineon ignore these flags.\n\
+         \x20                  The environment still controls the separate DNG\n\
+         \x20                  recovery LUT, including -color none output.\n\
          \x20  -sgain          Apply spatial gain (default except for Quattro)\n\
          \x20  -wb <WB>        Select white balance preset\n\
          \x20  -compress       Enable lossless compression (DNG: lossless\n\
@@ -288,6 +298,8 @@ fn parse_args(argv: &[String]) -> Args {
             }
             "-no-crop" => args.crop = false,
             "-no-fix-bad" => args.fix_bad = false,
+            "-chroma-lut" => args.rgb_chroma_lut = Some(true),
+            "-no-chroma-lut" => args.rgb_chroma_lut = Some(false),
             "-no-denoise" => args.denoise_intensity = 0,
             "-denoise-backend" => {
                 i += 1;
@@ -479,6 +491,7 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
         fix_bad: args.fix_bad,
         denoise_intensity: args.denoise_intensity,
         denoise_backend: args.denoise_backend,
+        rgb_chroma_lut: args.rgb_chroma_lut,
         apply_sgain: args.apply_sgain,
         wb: args.wb.clone(),
         compress: args.compress,
@@ -590,6 +603,19 @@ mod tests {
         assert!(!a.dng_highlight_recovery);
         assert_eq!(a.dng_highlight_mapping, DngHighlightMapping::Linear);
         assert_eq!(a.files, vec![PathBuf::from("in.X3F")]);
+    }
+
+    #[test]
+    fn rgb_chroma_lut_override_is_explicit_and_last_wins() {
+        assert_eq!(parse(&["in.X3F"]).rgb_chroma_lut, None);
+        for (flags, expected) in [
+            (vec!["-chroma-lut", "in.X3F"], true),
+            (vec!["-no-chroma-lut", "in.X3F"], false),
+            (vec!["-chroma-lut", "-no-chroma-lut", "in.X3F"], false),
+            (vec!["-no-chroma-lut", "-chroma-lut", "in.X3F"], true),
+        ] {
+            assert_eq!(parse(&flags).rgb_chroma_lut, Some(expected));
+        }
     }
 
     #[test]

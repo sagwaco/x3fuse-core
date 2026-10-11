@@ -13,6 +13,13 @@ partial pipeline reconstruction. DNG, scene-linear, Cineon and Quattro rendering
 retain their existing processing. DNG's embedded preview retains its existing
 calibration too.
 
+Scene-derived chroma-LUT recovery remains selectable through `-chroma-lut` /
+`-no-chroma-lut`, or `ProcessOptions::rgb_chroma_lut`. The per-conversion choice
+overrides `X3F_NO_CHROMA_LUT`; the default preserves current rendering. LUT-off
+still uses the existing prior recovery and matrix gate, not the native Sigma
+highlight stage. Native alignment retains the LUT alternative so callers can
+choose their preferred highlight recovery.
+
 | Stage | Previous behavior | Verified Sigma behavior and implementation |
 | --- | --- | --- |
 | Black level | Mean of several shielded regions | Merrill RGB uses the channel-wise 1% trimmed signed mean of `DarkShieldTop`. CAMF right/bottom are inclusive: native `GetRectFromCamfile` adds one before its half-open loops. |
@@ -95,7 +102,9 @@ The two real Sigma references are `_P2M0358.X3F` (DP2 Merrill) and
 original size, ProPhoto RGB, TIFF16. Each comparison covers 14,751,744 oriented
 pixels, without resizing, color fitting, or histogram matching. Both candidates
 use the same source, profile and size. The CPU column enables x3fuse’s default
-NLM; it does not claim the same denoise algorithm or strength as Sigma.
+NLM; it does not claim the same denoise algorithm or strength as Sigma. Candidate
+exports use the default enabled RGB chroma LUT with research environment
+overrides cleared.
 
 | Reference / renderer | MAE | PSNR |
 | --- | --- | --- |
@@ -127,13 +136,18 @@ All three DNG reference hashes remain unchanged. Quattro TIFF is byte-identical
 to the preceding alignment checkpoint; its pixel bytes also match the original
 baseline. The updated Merrill TIFF pins are in the contributor guide.
 
-The release workspace suite passes 296 tests, with six intentionally ignored,
+The release workspace suite passes 298 tests, with six intentionally ignored,
 using the local corpus. Strict workspace Clippy, formatting,
 and the documentation build also pass. The portable WASM/Wasmtime run passes 24 Merrill
 kernel tests; its external corpus is not mounted. Independent Opus review
 verified source-color dispatch, matrix composition, shared EXIF parsing and
 error propagation. Missing/invalid JPEG EXIF falls back before rendering, and
 spatial-row tests check the exact output length.
+
+The RGB LUT selector additionally passes TIFF, PPM and histogram checks on
+`CLIPPED_IMAGE_MERRILL.X3F`, where enabled and disabled output differ. Explicit
+choices override the environment; DNG and Cineon ignore them. Concurrent API
+conversions with both choices match their serial outputs on that same fixture.
 
 The next missing filter is now reconstructed in the external evidence archive:
 the raster despeckler matches 66,876 native classifications, 2,597 finite
@@ -158,10 +172,41 @@ offset correction and denoising. The current normalized uint16 buffer cannot
 recover those inputs exactly. The reconstructed filter is therefore retained
 as executable evidence until those preceding stages are integrated.
 
+The [native highlight follow-up](https://github.com/sagwaco/x3f-docs/tree/main/spp-rgb-trace/followup-native-highlight)
+is executable evidence, not yet part of production rendering. It reproduces
+40 complete image-wrapper cases: 174,231 float channel samples,
+mutated saturation maps, scratch guards and row padding match bit for bit.
+Cases include 15 empty donor tables, negative finite samples, and variation of
+the unused matrix/vector/slider arguments. The routine removes isolated camera
+marks, builds a 256-bin C2/C1 donor table, repairs marked C2 and blends channels
+toward the original C0. Even an empty donor table can still trigger bright-pixel
+neutralization. Native `Full2Map` and `RLE2Map` checks cover 27 synthetic cases
+and all 53 CAMFs, matching 2,557,513,728 decoded map bytes in total.
+
+The donor and repair bounds are the inclusive `ValidPixRect`, not the visible
+active rectangle. Its horizontal limits come from `DarkShieldColRange`; its
+vertical limits expand the active rectangle, relative to the keep origin, by
+32 rows for HI and 16 otherwise. The threshold comes from typed float
+`ExpEstimate` and `ExpNet`; the forwarded Highlight Control argument is unused
+by this particular kernel. Skip bit 11 bypasses the whole routine. Missing both
+map forms for any channel sets bits 11–13, also bypassing its neutralization.
+
+The [float-front-end follow-up](https://github.com/sagwaco/x3f-docs/tree/main/spp-rgb-trace/followup-float-front)
+extends listed bad-pixel repair to all 256 neighbor masks: 35,840 standalone
+native cases and eight ordered mixed lists containing 1,044 records match
+exactly, including badness thresholds and override masks. Radial shading also
+uses `ValidPixRect` and integer half-extents; its recovered equations remain
+static evidence, without a direct native radial oracle. Applying them to the
+current biased uint16 buffer would still multiply the normalization bias and
+retain earlier quantization. These checks establish prerequisites for the
+float pipeline; they do not enable the native filters in production.
+
 ## Remaining differences
 
 - The front end still stores normalized uint16 intermediates. Sigma uses float
   gained counts; reversing normalization cannot restore lost precision.
+  Native bad-red detection, packed-cluster arithmetic and the request field
+  controlling listed-repair badness still need resolution before integration.
 - Highlight restoration still uses the existing normalized LUT/gate model,
   after denoise. Sigma restores camera-marked C2 and blends toward original C0
   before denoise, using CAMF saturation maps and different donor rules.
