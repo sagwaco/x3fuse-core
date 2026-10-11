@@ -1981,6 +1981,130 @@ fn merrill_temperature_gain(gain: [f64; 3]) -> [f64; 3] {
     }
 }
 
+/// GatherParams @0xb3464..0xb3498 request gain, in native order:
+/// `baseGain = process 2.0.0.0/2.0.1.0/2.0.2.0 ? wb / 0.55 : wb + wb`
+/// (per channel; the division is one fdiv, not a multiply by the
+/// reciprocal), then
+/// `gain = ((baseGain * FNumberGainFact) * TempGainFact) * SensorAdjustmentGainFact`
+/// with the shared missing/wrong-shape default 1 and the native
+/// temperature validity guard.
+unsafe fn merrill_request_gain(
+    x3f: *mut x3f_t,
+    wb: *mut libc::c_char,
+    control: Control<'_>,
+) -> Option<[f64; 3]> {
+    let mut wb_gain = [0.0; 3];
+    if unsafe {
+        x3f_get_camf_matrix_for_wb(
+            x3f,
+            c"WhiteBalanceGains".as_ptr() as *mut _,
+            wb,
+            3,
+            0,
+            wb_gain.as_mut_ptr(),
+        )
+    } == 0
+    {
+        if !wb.is_null() && unsafe { CStr::from_ptr(wb) }.to_bytes() == b"Sunlight" {
+            return unsafe { merrill_request_gain(x3f, c"Daylight".as_ptr() as *mut _, control) };
+        }
+        return None;
+    }
+    // Same model-based process selection as merrill_count_scale: the
+    // corpus derivation maps SD1 Merrill to process 2.0.x (divide) and
+    // DP1/2/3 Merrill to 2.1.x (double).
+    if !matches!(unsafe { (*x3f).header.version }, 0x0002_0003 | 0x0003_0000) {
+        return None;
+    }
+    let mut model = ptr::null_mut();
+    if unsafe { x3f_get_prop_entry(x3f, c"CAMMODEL".as_ptr().cast_mut(), &mut model) } == 0
+        || model.is_null()
+    {
+        return None;
+    }
+    let divide = match unsafe { CStr::from_ptr(model) }.to_bytes() {
+        b"SIGMA SD1 Merrill" => true,
+        b"SIGMA DP1 Merrill" | b"SIGMA DP2 Merrill" | b"SIGMA DP3 Merrill" => false,
+        _ => return None,
+    };
+    let base: [f64; 3] = if divide {
+        std::array::from_fn(|c| wb_gain[c] / 0.55)
+    } else {
+        std::array::from_fn(|c| wb_gain[c] + wb_gain[c])
+    };
+    let mut fnumber = [1.0; 3];
+    let mut temperature = [1.0; 3];
+    let mut sensor = [1.0; 3];
+    unsafe {
+        if x3f_get_camf_float_vector(
+            x3f,
+            c"FNumberGainFact".as_ptr() as *mut _,
+            fnumber.as_mut_ptr(),
+        ) == 0
+        {
+            x3f_get_camf_float_vector(
+                x3f,
+                c"FnumberGainFact".as_ptr() as *mut _,
+                fnumber.as_mut_ptr(),
+            );
+        }
+        x3f_get_camf_float_vector(
+            x3f,
+            c"TempGainFact".as_ptr() as *mut _,
+            temperature.as_mut_ptr(),
+        );
+        x3f_get_camf_float_vector(
+            x3f,
+            c"SensorAdjustmentGainFact".as_ptr() as *mut _,
+            sensor.as_mut_ptr(),
+        );
+    }
+    let temperature = merrill_temperature_gain(temperature);
+    Some(std::array::from_fn(|c| {
+        ((base[c] * fnumber[c]) * temperature[c]) * sensor[c]
+    }))
+}
+
+pub(crate) unsafe fn merrill_float_gain_front(
+    x3f: *mut x3f_t,
+    wb: *mut libc::c_char,
+    apply_sgain: bool,
+    control: Control<'_>,
+) -> crate::Result<crate::float_front::FloatFront> {
+    let mut raw: x3f_area16_t = unsafe { std::mem::zeroed() };
+    let mut shield: x3f_area16_t = unsafe { std::mem::zeroed() };
+    if unsafe {
+        x3f_image_area(x3f, &mut raw) == 0
+            || x3f_crop_area_camf(
+                x3f,
+                c"DarkShieldTop".as_ptr() as *mut _,
+                &mut raw,
+                1,
+                &mut shield,
+            ) == 0
+    } {
+        return Err(crate::Error::InvalidData(
+            "missing Merrill float black calibration",
+        ));
+    }
+    let black = unsafe { merrill_trimmed_black(&shield, control) }?;
+    let exif = unsafe { merrill_exif(x3f, control) }?;
+    let spatial = unsafe { merrill_spatial_tables(x3f, apply_sgain, exif.f_number, control) }?;
+    let gain = unsafe { merrill_request_gain(x3f, wb, control) }.ok_or(
+        crate::Error::InvalidData("missing Merrill float request gain"),
+    )?;
+    let tables = spatial.map(|tables| {
+        std::array::from_fn(|c| {
+            crate::float_front::GainTable::new(
+                tables[c].values.clone(),
+                tables[c].cols,
+                tables[c].rows,
+            )
+        })
+    });
+    crate::float_front::FloatFront::new(black, gain, tables)
+}
+
 unsafe fn merrill_wb_gain(x3f: *mut x3f_t, wb: *mut libc::c_char) -> Option<[f64; 3]> {
     let mut gain = [0.0; 3];
     if unsafe {
@@ -4535,6 +4659,42 @@ unsafe fn get_image_impl(
     } else {
         None
     };
+    // Research trace: X3F_FLOAT_FRONT_TRACE prints the ordered float
+    // stage (native ApplyGains over decoded sensor counts) before
+    // normalization mutates the raster. Default conversions never run
+    // this path.
+    if merrill_rgb && std::env::var_os("X3F_FLOAT_FRONT_TRACE").is_some() {
+        unsafe {
+            let mut trace: x3f_area16_t = std::mem::zeroed();
+            if x3f_image_area(x3f, &mut trace) != 0 {
+                if let Ok(front) = merrill_float_gain_front(x3f, wb, apply_sgain != 0, control) {
+                    let decoded = std::slice::from_raw_parts(
+                        trace.data,
+                        trace.rows as usize * trace.row_stride as usize,
+                    );
+                    if let Ok(gained) = front.apply(
+                        decoded,
+                        trace.columns as usize,
+                        trace.rows as usize,
+                        trace.row_stride as usize,
+                        control,
+                    ) {
+                        let black = front.black();
+                        let gain = front.gain();
+                        eprintln!(
+                            "X3F float front: {}x{} black={:x?} gain={:x?} spatial={} fnv1a={:016x}",
+                            trace.columns,
+                            trace.rows,
+                            [black[0].to_bits(), black[1].to_bits(), black[2].to_bits()],
+                            [gain[0].to_bits(), gain[1].to_bits(), gain[2].to_bits()],
+                            front.spatial().is_some(),
+                            crate::float_front::fnv1a_f32(&gained)
+                        );
+                    }
+                }
+            }
+        }
+    }
     let capture = dng_recovery && encoding == x3f_color_encoding_e_NONE && !cineon;
     if unsafe {
         preprocess_data_impl(
@@ -5935,5 +6095,103 @@ mod tests {
             assert!(v <= 1.0 + 1e-12);
             prev = v;
         }
+    }
+
+    /// The ordered float frontend stage (ApplyGains over decoded sensor
+    /// counts) on the two retained SPP reference files. The fixture pins
+    /// the derived DarkShieldTop black, the GatherParams request gain,
+    /// the spatial tables and the gained raster hash. The native agreement
+    /// is compositional: the kernel matches the archived native oracle
+    /// bit-for-bit, the tables match all 53 native tables, and the gain
+    /// order is the reviewed GatherParams @0xb3464 chain. Skips when the
+    /// corpus is absent.
+    #[test]
+    fn merrill_float_gain_front_matches_reference_fixtures() {
+        use crate::process::merrill_float_gain_front;
+        use crate::{
+            x3f_area16_t, x3f_delete, x3f_get_camf, x3f_get_raw, x3f_image_area, x3f_load_data,
+            x3f_new_from_file, x3f_return_e_X3F_OK, Control,
+        };
+        let root = std::env::var_os("X3F_TEST_FILES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../x3f_test_files")
+            });
+        let mut checked = 0;
+        for line in include_str!("../tests/fixtures/merrill-float-front.tsv")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let fields: Vec<_> = line.split('\t').collect();
+            assert_eq!(fields.len(), 7, "{line}");
+            let name = fields[0];
+            let cols: usize = fields[1].parse().unwrap();
+            let rows: usize = fields[2].parse().unwrap();
+            let black: [u64; 3] = std::array::from_fn(|c| {
+                u64::from_str_radix(fields[3].split(',').nth(c).unwrap(), 16).unwrap()
+            });
+            let gain: [u64; 3] = std::array::from_fn(|c| {
+                u64::from_str_radix(fields[4].split(',').nth(c).unwrap(), 16).unwrap()
+            });
+            let spatial: bool = fields[5] == "1";
+            let expected: u64 = u64::from_str_radix(fields[6], 16).unwrap();
+            let path = root.join(name);
+            if !path.exists() {
+                continue;
+            }
+            let path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            unsafe {
+                let file = libc::fopen(path.as_ptr(), c"rb".as_ptr());
+                assert!(!file.is_null());
+                let x3f = x3f_new_from_file(file.cast());
+                assert!(!x3f.is_null());
+                assert_eq!(x3f_load_data(x3f, x3f_get_camf(x3f)), x3f_return_e_X3F_OK);
+                let prop = crate::x3f_get_prop(x3f);
+                if !prop.is_null() {
+                    assert_eq!(x3f_load_data(x3f, prop), x3f_return_e_X3F_OK);
+                }
+                assert_eq!(x3f_load_data(x3f, x3f_get_raw(x3f)), x3f_return_e_X3F_OK);
+                let front = merrill_float_gain_front(
+                    x3f,
+                    // get_image_impl resolves a null WB name through the
+                    // property list; the fixture reproduces that choice.
+                    crate::x3f_get_wb(x3f),
+                    true,
+                    Control::none(),
+                )
+                .unwrap();
+                assert_eq!(front.black().map(f64::to_bits), black, "{name} black");
+                assert_eq!(front.gain().map(f64::to_bits), gain, "{name} gain");
+                assert_eq!(front.spatial().is_some(), spatial, "{name} spatial");
+                let mut area: x3f_area16_t = std::mem::zeroed();
+                assert_ne!(x3f_image_area(x3f, &mut area), 0);
+                assert_eq!((area.columns as usize, area.rows as usize), (cols, rows));
+                let decoded = std::slice::from_raw_parts(
+                    area.data,
+                    area.rows as usize * area.row_stride as usize,
+                );
+                let gained = front
+                    .apply(
+                        decoded,
+                        area.columns as usize,
+                        area.rows as usize,
+                        area.row_stride as usize,
+                        Control::none(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    crate::float_front::fnv1a_f32(&gained),
+                    expected,
+                    "{name} fnv"
+                );
+                x3f_delete(x3f);
+                libc::fclose(file);
+            }
+            checked += 1;
+        }
+        eprintln!(
+            "Merrill float front oracle: {checked}/2 corpus fixtures present at {}",
+            root.display()
+        );
     }
 }

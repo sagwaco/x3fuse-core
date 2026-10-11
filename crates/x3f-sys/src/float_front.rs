@@ -10,6 +10,9 @@
 //! wires this kernel into the conversion path; production still uses
 //! the normalized uint16 frontend.
 
+use crate::control::{Error, Result};
+use crate::Control;
+
 /// One channel of the spatial gain table. `values` is row-major with
 /// `rows` rows and `columns` knots per row. The CAMF builders in
 /// `spatial_gain.rs` produce this layout.
@@ -32,6 +35,105 @@ impl GainTable {
             columns,
             rows,
         }
+    }
+}
+
+/// FNV-1a over the little-endian bytes of the f32 raster. Matches the
+/// archived native-oracle hashes (`followup-float-preprocess`).
+pub(crate) fn fnv1a_f32(values: &[f32]) -> u64 {
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4) };
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// The ordered Merrill float frontend, stage 1: ApplyGains.
+///
+/// `black` is the per-channel DarkShieldTop trimmed mean, `gain` is the
+/// GatherParams request gain (native order: `((baseGain * FNumberGainFact)
+/// * TempGainFact) * SensorAdjustmentGainFact`, where `baseGain` is
+/// `wb + wb` or `wb / 0.55` by process version), and `spatial` holds the
+/// three native spatial gain tables or `None` to select the global gain
+/// alone (the native all-three gate).
+#[derive(Clone, Debug)]
+pub struct FloatFront {
+    black: [f64; 3],
+    gain: [f64; 3],
+    spatial: Option<[GainTable; 3]>,
+}
+
+impl FloatFront {
+    pub fn new(black: [f64; 3], gain: [f64; 3], spatial: Option<[GainTable; 3]>) -> Result<Self> {
+        let valid = |v: [f64; 3]| v.iter().all(|v| v.is_finite());
+        if let Some(tables) = spatial.as_ref() {
+            if tables.iter().any(|t| t.columns < 2 || t.rows < 2) {
+                return Err(Error::InvalidData("invalid Merrill float spatial tables"));
+            }
+        }
+        if !valid(black) || !valid(gain) {
+            return Err(Error::InvalidData(
+                "invalid Merrill float front calibration",
+            ));
+        }
+        Ok(Self {
+            black,
+            gain,
+            spatial,
+        })
+    }
+
+    pub fn black(&self) -> [f64; 3] {
+        self.black
+    }
+
+    pub fn gain(&self) -> [f64; 3] {
+        self.gain
+    }
+
+    pub fn spatial(&self) -> Option<&[GainTable; 3]> {
+        self.spatial.as_ref()
+    }
+
+    /// Apply stage 1 over decoded sensor counts. `decoded` holds
+    /// interleaved RGB u16 samples with `row_stride` u16 elements per row;
+    /// the u16 to f32 conversion is exact. The result is an owned f32
+    /// raster with the same layout, gained but not normalized.
+    ///
+    /// Cancellation is checked once before the single native pass; the
+    /// native ApplyGains has no intra-stage cancellation point.
+    pub fn apply(
+        &self,
+        decoded: &[u16],
+        width: usize,
+        height: usize,
+        row_stride: usize,
+        control: Control<'_>,
+    ) -> Result<Vec<f32>> {
+        control.check()?;
+        if height == 0 || width == 0 {
+            return Err(Error::InvalidData("empty Merrill float image"));
+        }
+        if self.spatial.is_some() && height < 2 {
+            return Err(Error::InvalidData("invalid Merrill float image size"));
+        }
+        if row_stride < width * 3 || decoded.len() < row_stride * (height - 1) + width * 3 {
+            return Err(Error::InvalidData("invalid Merrill float image layout"));
+        }
+        let mut data = Vec::with_capacity(decoded.len());
+        // u16 to f32 is exact: every u16 value is representable in f32.
+        data.extend(decoded.iter().map(|&v| f32::from(v)));
+        let refs: [Option<&GainTable>; 3] = match &self.spatial {
+            None => [None, None, None],
+            Some(t) => [Some(&t[0]), Some(&t[1]), Some(&t[2])],
+        };
+        apply_gains(
+            &mut data, width, height, row_stride, self.black, self.gain, refs,
+        );
+        Ok(data)
     }
 }
 
@@ -136,14 +238,7 @@ mod tests {
     ];
 
     fn fnv1a(values: &[f32]) -> u64 {
-        let bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(values.as_ptr() as _, values.len() * 4) };
-        let mut hash = 0xcbf29ce484222325_u64;
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        hash
+        super::fnv1a_f32(values)
     }
 
     fn synthetic_tables() -> [GainTable; 3] {
