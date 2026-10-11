@@ -180,6 +180,7 @@ pub use image::{
 // in (1/aperture, lens-position) space, builds bilinear weights, and
 // either keeps the raw tables for on-the-fly combination via
 // `x3f_calc_spatial_gain` or pre-interpolates a dense table per channel.
+pub mod cr_offset;
 pub mod float_front;
 mod spatial_gain;
 pub use spatial_gain::{

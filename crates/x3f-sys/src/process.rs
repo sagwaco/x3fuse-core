@@ -2638,6 +2638,58 @@ pub(crate) unsafe fn merrill_despeckle(
     )?))
 }
 
+/// Stage 6 inputs: the typed CaptureISO scalar, the ApplyGains
+/// request gains and the translated active rect (Keep-local, the same
+/// rect the despeckle stage uses).
+pub(crate) struct MerrillCrOffset {
+    pub iso: f32,
+    pub gains: [f64; 3],
+    pub rect: [i32; 4],
+}
+
+/// Stage 6 of the ordered float frontend: row/column chroma offset
+/// correction. Reads the typed CaptureISO scalar (default 0), the
+/// ApplyGains request gain triple and the translated active rect.
+/// Skips when SkipStepFlags bit 14 is set (the native bit gates both
+/// this state and despeckle) or the gain triple cannot be derived.
+pub(crate) unsafe fn merrill_cr_offset(
+    x3f: *mut x3f_t,
+    wb: *mut libc::c_char,
+    control: Control<'_>,
+) -> crate::Result<Option<MerrillCrOffset>> {
+    control.check()?;
+    let mut skip = 0_u32;
+    unsafe {
+        x3f_get_camf_unsigned(x3f, c"SkipStepFlags".as_ptr().cast_mut(), &mut skip);
+    }
+    if skip & (1 << 14) != 0 {
+        return Ok(None);
+    }
+    let Some(gains) = (unsafe { merrill_request_gain(x3f, wb, control) }) else {
+        return Ok(None);
+    };
+    let iso = unsafe {
+        let mut value = 0.0_f64;
+        x3f_get_camf_float(x3f, c"CaptureISO".as_ptr().cast_mut(), &mut value);
+        value as f32
+    };
+    // ActiveImageArea translated by KeepImageArea left/top, the same
+    // Keep-local rect the despeckle stage uses (0xa5e44).
+    let (active, keep, _col_range) = unsafe { merrill_rects(x3f)? };
+    let rect = [
+        active[0] - keep[0],
+        active[1] - keep[1],
+        active[2] - keep[0],
+        active[3] - keep[1],
+    ];
+    if rect.iter().any(|&v| v < 0) {
+        return Err(crate::Error::InvalidData(
+            "invalid Merrill offset rectangle",
+        ));
+    }
+    Ok(Some(MerrillCrOffset { iso, gains, rect }))
+}
+
 unsafe fn merrill_wb_gain(x3f: *mut x3f_t, wb: *mut libc::c_char) -> Option<[f64; 3]> {
     let mut gain = [0.0; 3];
     if unsafe {
@@ -5313,8 +5365,32 @@ unsafe fn get_image_impl(
                                 despeckle_fnv = crate::float_front::fnv1a_f32(&gained);
                             }
                         }
+                        // Stage 6: row/column chroma offset correction
+                        // from the detected speckle pipeline's request
+                        // gains, CaptureISO and translated active
+                        // rect. SkipStepFlags bit 14 gates it with
+                        // despeckle.
+                        let mut offset_note = "none";
+                        let mut offset_stats = crate::cr_offset::OffsetStats::default();
+                        let mut offset_fnv = despeckle_fnv;
+                        if let Ok(Some(offset)) = merrill_cr_offset(x3f, wb, control) {
+                            if let Ok(stats) = crate::cr_offset::correct(
+                                &mut gained,
+                                trace.columns as usize,
+                                trace.rows as usize,
+                                trace.row_stride as usize,
+                                offset.iso,
+                                offset.gains,
+                                offset.rect,
+                                control,
+                            ) {
+                                offset_note = "applied";
+                                offset_stats = stats;
+                                offset_fnv = crate::float_front::fnv1a_f32(&gained);
+                            }
+                        }
                         eprintln!(
-                            "X3F float front: {}x{} black={:x?} gain={:x?} spatial={} fnv1a={:016x} radial={} radial_fnv1a={:016x} listed={} listed_count={} listed_fnv1a={:016x} highlight={} donors={} removed={} occupied={} dense={} lut={} highlight_fnv1a={:016x} despeckle={} despeckle_records={} despeckle_fnv1a={:016x}",
+                            "X3F float front: {}x{} black={:x?} gain={:x?} spatial={} fnv1a={:016x} radial={} radial_fnv1a={:016x} listed={} listed_count={} listed_fnv1a={:016x} highlight={} donors={} removed={} occupied={} dense={} lut={} highlight_fnv1a={:016x} despeckle={} despeckle_records={} despeckle_fnv1a={:016x} offset={} offset_patches={} offset_accepted={} offset_rows={} offset_fnv1a={:016x}",
                             trace.columns,
                             trace.rows,
                             [black[0].to_bits(), black[1].to_bits(), black[2].to_bits()],
@@ -5335,7 +5411,12 @@ unsafe fn get_image_impl(
                             highlight_fnv,
                             despeckle_note,
                             despeckle_records,
-                            despeckle_fnv
+                            despeckle_fnv,
+                            offset_note,
+                            offset_stats.patches,
+                            offset_stats.accepted,
+                            offset_stats.rows,
+                            offset_fnv
                         );
                     }
                 }
@@ -6755,8 +6836,9 @@ mod tests {
     #[test]
     fn merrill_float_gain_front_matches_reference_fixtures() {
         use crate::process::{
-            merrill_despeckle, merrill_float_gain_front, merrill_highlight_restoration,
-            merrill_listed_repair, merrill_radial_shading, merrill_rects,
+            merrill_cr_offset, merrill_despeckle, merrill_float_gain_front,
+            merrill_highlight_restoration, merrill_listed_repair, merrill_radial_shading,
+            merrill_rects,
         };
         use crate::{
             x3f_area16_t, x3f_delete, x3f_get_camf, x3f_get_raw, x3f_image_area, x3f_load_data,
@@ -6773,7 +6855,7 @@ mod tests {
             .filter(|line| !line.starts_with('#'))
         {
             let fields: Vec<_> = line.split('\t').collect();
-            assert_eq!(fields.len(), 19, "{line}");
+            assert_eq!(fields.len(), 23, "{line}");
             let name = fields[0];
             let cols: usize = fields[1].parse().unwrap();
             let rows: usize = fields[2].parse().unwrap();
@@ -6795,6 +6877,10 @@ mod tests {
             let despeckle_expected: bool = fields[16] == "1";
             let despeckle_records: usize = fields[17].parse().unwrap();
             let despeckle_fnv: u64 = u64::from_str_radix(fields[18], 16).unwrap();
+            let offset_expected: bool = fields[19] == "1";
+            let offset_accepted: u32 = fields[20].parse().unwrap();
+            let offset_fnv: u64 = u64::from_str_radix(fields[21], 16).unwrap();
+            let offset_iso_bits: u32 = u32::from_str_radix(fields[22], 16).unwrap();
             let path = root.join(name);
             if !path.exists() {
                 continue;
@@ -6956,6 +7042,38 @@ mod tests {
                     crate::float_front::fnv1a_f32(&gained),
                     despeckle_fnv,
                     "{name} despeckle fnv"
+                );
+                // Stage 6: row/column chroma offset correction with
+                // the typed CaptureISO, the request gains and the
+                // translated active rect.
+                let offset = merrill_cr_offset(x3f, wb, Control::none()).unwrap();
+                assert_eq!(offset.is_some(), offset_expected, "{name} offset presence");
+                if let Some(offset) = offset {
+                    assert_eq!(
+                        offset.iso.to_bits(),
+                        offset_iso_bits,
+                        "{name} CaptureISO bits"
+                    );
+                    let stats = crate::cr_offset::correct(
+                        &mut gained,
+                        area.columns as usize,
+                        area.rows as usize,
+                        area.row_stride as usize,
+                        offset.iso,
+                        offset.gains,
+                        offset.rect,
+                        Control::none(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        stats.accepted, offset_accepted,
+                        "{name} offset accepted patches"
+                    );
+                }
+                assert_eq!(
+                    crate::float_front::fnv1a_f32(&gained),
+                    offset_fnv,
+                    "{name} offset fnv"
                 );
                 x3f_delete(x3f);
                 libc::fclose(file);
