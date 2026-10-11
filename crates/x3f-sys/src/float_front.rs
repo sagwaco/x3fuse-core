@@ -93,16 +93,16 @@ pub struct RadialShading {
 }
 
 impl RadialShading {
-    /// Build the stage from CAMF rectangles and coefficients. `active`
-    /// and `keep` are half-open `GetRectFromCamfile` rects; `col_range`
-    /// holds the four elements of the DarkShieldColRange 2x2 matrix.
-    pub fn new(
+    /// The inclusive ValidPixRect (0xa64c8..0xa6520), shared by the
+    /// radial and highlight stages: translated activeMinusKeep bounds,
+    /// HI 32 / non-HI 16 margin, DarkShieldColRange[1]+6 and [2]-8
+    /// horizontal bounds. The rect must carry a two-pixel halo.
+    pub fn valid_pix_rect(
         active: [i32; 4],
         keep: [i32; 4],
         col_range: [i32; 4],
-        coefficients: [f64; 4],
         resolution: &str,
-    ) -> Result<Self> {
+    ) -> [i32; 4] {
         // a5e50: 4-wide SIMD subtract, activeMinusKeep = active - keep.
         let minus_keep = [
             active[0] - keep[0],
@@ -120,6 +120,21 @@ impl RadialShading {
         let valid_bottom = scale.mul_add(32.0, minus_keep[3] as f32) as i32;
         let valid_left = col_range[1] + 6;
         let valid_right = col_range[2] - 8;
+        [valid_left, valid_top, valid_right, valid_bottom]
+    }
+
+    /// Build the stage from CAMF rectangles and coefficients. `active`
+    /// and `keep` are half-open `GetRectFromCamfile` rects; `col_range`
+    /// holds the four elements of the DarkShieldColRange 2x2 matrix.
+    pub fn new(
+        active: [i32; 4],
+        keep: [i32; 4],
+        col_range: [i32; 4],
+        coefficients: [f64; 4],
+        resolution: &str,
+    ) -> Result<Self> {
+        let [valid_left, valid_top, valid_right, valid_bottom] =
+            Self::valid_pix_rect(active, keep, col_range, resolution);
         // 0xa8234: (right - left) with +1 when negative (truncate toward
         // zero), then arithmetic shift by one.
         let truncate_half = |range: i32| {
@@ -395,6 +410,290 @@ impl ListedRepair {
             self.replace_one(data, width, height, row_stride, *record, override_mask);
         }
         Ok(())
+    }
+}
+
+/// Stage 4 of the ordered float frontend: native highlight restoration,
+/// the scalar reconstruction of `F20RestoreHighlights` (0x43000) and its
+/// `RepairPix` worker (0x42b6c). Verified bit-for-bit against the native
+/// export at the full wrapper boundary: 40 cases / 174,231 channel
+/// samples including saturation/dense maps, row padding and scratch
+/// guards (x3f-docs
+/// `followup-native-highlight/check_highlight.cpp`).
+///
+/// The saturation map is packed RGB bytes, `sat[3*(y*width+x)+channel]`,
+/// decoded from the camera RLE or Full entries. `dense` is one byte per
+/// pixel. `valid` is the inclusive ValidPixRect (the same rect the radial
+/// stage uses) and must carry a two-pixel lower/right halo.
+#[derive(Clone, Copy, Debug)]
+pub struct HighlightRestoration {
+    threshold: f64,
+}
+
+/// Statistics of one restoration pass, native counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HighlightStats {
+    pub donors: u32,
+    pub occupied: u32,
+    pub removed: u32,
+    pub dense_pixels: u32,
+    pub have_lut: bool,
+}
+
+/// One RLE saturation-map entry: alternating gap and run lengths. The
+/// trailing gap word is not consumed. `RLE2Map` at 0xaf4c0 takes a
+/// second size argument that the native ignores; this port drops it.
+pub fn decode_sat_map_rle(words: &[u32], sat: &mut [u8], channel: usize) {
+    // Native adds u32 positions without bounds; the caller validates the
+    // runs against the map size before this port decodes them.
+    let mut position = 0_u64;
+    let mut index = 0;
+    while index + 1 < words.len() {
+        let start = position + u64::from(words[index]);
+        let end = start + u64::from(words[index + 1]);
+        for pixel in start..end {
+            let pixel = pixel as usize;
+            if pixel < sat.len() / 3 {
+                sat[3 * pixel + channel] = 1;
+            }
+        }
+        position = end;
+        index += 2;
+    }
+}
+
+/// One Full saturation-map entry: 32 bits per word, most significant
+/// first, writing both zeros and ones. `Full2Map` at 0xaf5a4. The final
+/// word is ignored.
+pub fn decode_sat_map_full(words: &[u32], sat: &mut [u8], channel: usize) {
+    for (index, &word) in words.iter().enumerate().take(words.len().saturating_sub(1)) {
+        for bit in 0..32 {
+            let pixel = 32 * index + bit;
+            if pixel < sat.len() / 3 {
+                sat[3 * pixel + channel] = ((word >> (31 - bit)) & 1) as u8;
+            }
+        }
+    }
+}
+
+impl HighlightRestoration {
+    /// Native threshold at 0xa67f8..0xa68b0:
+    /// `e = max(ExpEstimate + ExpNet - 1.5, 0)`,
+    /// `mix = e > 1 ? 0 : 1 - e`, `threshold = fma(mix, 3000, 4000)`.
+    pub fn new(exp_estimate: f32, exp_net: f32) -> Self {
+        let e = (f64::from(exp_estimate) + f64::from(exp_net) - 1.5).max(0.0);
+        let mix = if e > 1.0 { 0.0 } else { 1.0 - e };
+        Self {
+            threshold: mix.mul_add(3000.0, 4000.0),
+        }
+    }
+
+    /// Direct threshold construction. Only the archived native-oracle
+    /// mode matrix supplies a raw threshold; production code derives
+    /// it through [`HighlightRestoration::new`].
+    #[cfg(test)]
+    fn from_threshold(threshold: f64) -> Self {
+        Self { threshold }
+    }
+
+    pub fn threshold(&self) -> f64 {
+        self.threshold
+    }
+
+    /// ARM64 FCVTZS followed by the native 0..255 clamp, including the
+    /// ratio 0/0 case: NaN maps to zero, negatives to zero, saturation
+    /// to 255.
+    fn bin(value: f32) -> usize {
+        if value.is_nan() || value < 0.0 {
+            0
+        } else if value >= 255.0 {
+            255
+        } else {
+            value as usize
+        }
+    }
+
+    /// Run the full stage in place. `sat` is the packed RGB saturation
+    /// map (cleaned in place); `dense` receives the dilation map.
+    #[allow(clippy::too_many_lines)]
+    pub fn restore(
+        &self,
+        data: &mut [f32],
+        width: usize,
+        height: usize,
+        row_stride: usize,
+        sat: &mut [u8],
+        dense: &mut [u8],
+        valid: [i32; 4],
+        control: Control<'_>,
+    ) -> Result<HighlightStats> {
+        control.check()?;
+        if width < 4 || height < 4 {
+            return Err(Error::InvalidData("invalid Merrill highlight image size"));
+        }
+        if sat.len() != width * height * 3 || dense.len() != width * height {
+            return Err(Error::InvalidData("invalid Merrill highlight map size"));
+        }
+        if row_stride < width * 3 || data.len() < row_stride * (height - 1) + width * 3 {
+            return Err(Error::InvalidData("invalid Merrill highlight image layout"));
+        }
+        let (left, top, right, bottom) = (valid[0], valid[1], valid[2], valid[3]);
+        if left < 0 || top < 0 || right < left || bottom < top {
+            return Err(Error::InvalidData("invalid Merrill highlight rectangle"));
+        }
+        // RepairPix reads a two-pixel lower/right halo in the dense map
+        // with no upper/right clamp of its own. The halo must be
+        // allocated: `right+2 <= width-1` and `bottom+2 <= height-1`.
+        // The corner shows why the right bound is strict: with
+        // `right+2 == width` the corner read is the flat index
+        // `(bottom+2)*width + width`, one past the dense buffer when
+        // `bottom+2 == height-1`.
+        if (right + 2) as usize >= width || (bottom + 2) as usize >= height {
+            return Err(Error::InvalidData("invalid Merrill highlight halo"));
+        }
+        let mut stats = HighlightStats::default();
+
+        // 1. Saturation cleanup (0x43064..0x431f0): scan interior
+        // rows/columns, keep a mark only if a same-channel eight-neighbor
+        // has one; isolated marks are removed. Boundary flags stay.
+        for y in 1..height - 1 {
+            for x in 1..width - 1 {
+                for c in 0..3 {
+                    let index = 3 * (y * width + x) + c;
+                    if sat[index] == 0 {
+                        continue;
+                    }
+                    let mut any = false;
+                    for dy in -1i32..=1 {
+                        for dx in -1i32..=1 {
+                            if dx == 0 && dy == 0 {
+                                continue;
+                            }
+                            let neighbor = 3
+                                * ((y as i32 + dy) as usize * width + (x as i32 + dx) as usize)
+                                + c;
+                            any |= sat[neighbor] != 0;
+                        }
+                    }
+                    if !any {
+                        stats.removed += 1;
+                    }
+                    sat[index] = u8::from(any);
+                }
+            }
+        }
+
+        // 2. Dense map (0x43250..0x433bc): zero, then dilate 5x5 around
+        // interior centers with at least two marked channels.
+        dense.fill(0);
+        for y in 2..height - 2 {
+            for x in 2..width - 2 {
+                let base = 3 * (y * width + x);
+                if u32::from(sat[base]) + u32::from(sat[base + 1]) + u32::from(sat[base + 2]) >= 2 {
+                    for dy in -2i32..=2 {
+                        for dx in -2i32..=2 {
+                            let index =
+                                ((y as i32 + dy) as usize) * width + (x as i32 + dx) as usize;
+                            dense[index] = 1;
+                        }
+                    }
+                }
+            }
+        }
+        stats.dense_pixels = dense.iter().filter(|&&v| v == 1).count() as u32;
+
+        // 3. Donor LUT (0x435e0..0x436b0) over the inclusive valid rect.
+        // A donor is unsaturated in C2 with float(C0+C1) strictly above
+        // 4000; accumulation is f32 in raster order.
+        let mut lut = [0.0_f32; 256];
+        let mut count = [0_u32; 256];
+        for y in top as usize..=bottom as usize {
+            let row = &data[y * row_stride..y * row_stride + width * 3];
+            for x in left as usize..=right as usize {
+                let pixel = &row[3 * x..3 * x + 3];
+                if sat[3 * (y * width + x) + 2] == 0 && pixel[0] + pixel[1] > 4000.0 {
+                    let a = pixel[0].max(1.0);
+                    let b = pixel[1].max(1.0);
+                    let c = pixel[2].max(1.0);
+                    let index = Self::bin((a * 255.0) / (a + b));
+                    lut[index] += c / b;
+                    count[index] += 1;
+                    stats.donors += 1;
+                }
+            }
+        }
+        let mut first = 256;
+        for index in 0..256 {
+            if lut[index] > 0.0 {
+                lut[index] /= count[index] as f32;
+                stats.occupied += 1;
+                if first == 256 {
+                    first = index;
+                }
+            }
+        }
+        stats.have_lut = first < 256;
+        if stats.have_lut {
+            // Forward fill: leading holes take the first occupied value,
+            // later zero bins the previous value. No interpolation.
+            let mut previous = lut[first];
+            for value in &mut lut {
+                if *value == 0.0 {
+                    *value = previous;
+                }
+                previous = *value;
+            }
+        }
+
+        // 4. RepairPix (0x42b6c) over the inclusive valid rect. The
+        // native runs eight workers with disjoint rows; the scalar port
+        // is row-serial, which changes no output (each pixel reads only
+        // its own value and the completed maps).
+        for y in top..=bottom {
+            control.check()?;
+            let y_index = y as usize;
+            let row = &mut data[y_index * row_stride..y_index * row_stride + width * 3];
+            for x in left..=right {
+                let x_index = x as usize;
+                let pixel = &mut row[3 * x_index..3 * x_index + 3];
+                let (a, b, original_c) = (pixel[0], pixel[1], pixel[2]);
+                let mut c = original_c;
+                // Hole filling: marked C2 with an existing LUT. This uses
+                // the original C0/C1 without the donor lower clamp; a
+                // zero denominator maps NaN to bin 0 and saturates to 255.
+                if stats.have_lut && sat[3 * (y_index * width + x_index) + 2] != 0 {
+                    let index = Self::bin((a * 255.0) / (a + b));
+                    c = (b * lut[index]).min(32767.0);
+                }
+                // Neutralization over the sorted current channels.
+                let mut sorted = [a, b, c];
+                sorted.sort_by(|p, q| p.partial_cmp(q).unwrap().reverse());
+                let hi = f64::from(sorted[0]);
+                let mid = f64::from(sorted[1]);
+                let lo = f64::from(sorted[2]);
+                let mut t = hi.mul_add(2.0 / 3.0, mid * (1.0 / 3.0));
+                t = lo.mul_add(0.0, t);
+                t = ((t - self.threshold) / 1000.0).clamp(0.0, 1.0);
+                let mut density = 0.0_f64;
+                if x_index >= 2 && y_index >= 2 {
+                    for dy in -2i32..=2 {
+                        for dx in -2i32..=2 {
+                            let index = ((y_index as i32 + dy) as usize) * width
+                                + (x_index as i32 + dx) as usize;
+                            density += f64::from(dense[index]);
+                        }
+                    }
+                    density *= 0.04;
+                }
+                let weight = (t.mul_add(t, density * density) * 0.5).sqrt();
+                let anchor = weight * f64::from(a);
+                let keep = 1.0 - weight;
+                pixel[0] = keep.mul_add(f64::from(a), anchor) as f32;
+                pixel[1] = keep.mul_add(f64::from(b), anchor) as f32;
+                pixel[2] = keep.mul_add(f64::from(c), anchor) as f32;
+            }
+        }
+        Ok(stats)
     }
 }
 
@@ -1021,5 +1320,368 @@ mod tests {
                 Control::none()
             )
             .is_err());
+    }
+
+    #[test]
+    fn sat_map_rle_decodes_runs_and_ignores_the_trailing_gap() {
+        let mut sat = vec![0_u8; 8 * 2 * 3];
+        // Alternating gap/run words; the trailing gap word is not consumed.
+        super::decode_sat_map_rle(&[2, 3, 1, 2, 5], &mut sat, 1);
+        let mut marked = vec![false; 16];
+        for pixel in 0..16 {
+            marked[pixel] = sat[3 * pixel + 1] != 0;
+        }
+        for pixel in [0_usize, 1, 5] {
+            assert!(!marked[pixel], "pixel {pixel} must stay clear");
+        }
+        for pixel in [2_usize, 3, 4, 6, 7] {
+            assert!(marked[pixel], "pixel {pixel} must be marked");
+        }
+        // Only the selected channel is written.
+        assert!(sat
+            .iter()
+            .enumerate()
+            .all(|(i, &v)| { v == 0 || i % 3 == 1 }));
+    }
+
+    #[test]
+    fn sat_map_full_decodes_words_most_significant_first() {
+        let mut sat = vec![0_u8; 64 * 3];
+        // 0xF0 repeats the pattern 11110000; the final word is ignored.
+        super::decode_sat_map_full(&[0xf0f0_f0f0, u32::MAX], &mut sat, 0);
+        for (pixel, expected) in [(0, 1), (4, 0), (7, 0), (8, 1), (31, 0), (32, 0), (63, 0)] {
+            assert_eq!(u32::from(sat[3 * pixel]), expected, "pixel {pixel}");
+        }
+    }
+
+    #[test]
+    fn highlight_restore_is_identity_below_threshold_without_marks() {
+        let restore = super::HighlightRestoration::new(0.0, 0.0);
+        // Native threshold: e = max(0+0-1.5,0) = 0, mix = 1,
+        // fma(1,3000,4000) = 7000.
+        assert_eq!(restore.threshold(), 7000.0);
+        let width = 8;
+        let height = 8;
+        let stride = width * 3;
+        let mut data = vec![0.0_f32; stride * height];
+        for row in 0..height {
+            for column in 0..width {
+                let pixel = &mut data[row * stride + 3 * column..row * stride + 3 * column + 3];
+                pixel.copy_from_slice(&[100.0 + row as f32, 200.0, 300.0]);
+            }
+        }
+        let original = data.clone();
+        let mut sat = vec![0_u8; width * height * 3];
+        let mut dense = vec![0_u8; width * height];
+        let stats = restore
+            .restore(
+                &mut data,
+                width,
+                height,
+                stride,
+                &mut sat,
+                &mut dense,
+                [1, 1, 5, 5],
+                Control::none(),
+            )
+            .unwrap();
+        // No donors (a+b below 4000), no marks: the LUT stays empty and
+        // every neutralization weight is zero, so the raster is the
+        // identity.
+        assert_eq!(stats.donors, 0);
+        assert_eq!(stats.removed, 0);
+        assert_eq!(stats.occupied, 0);
+        assert_eq!(stats.dense_pixels, 0);
+        assert!(!stats.have_lut);
+        assert_eq!(data, original);
+    }
+
+    #[test]
+    fn highlight_restore_fills_marked_c2_from_donors_and_neutralizes() {
+        let restore = super::HighlightRestoration::new(0.0, 0.0);
+        let width = 8;
+        let height = 8;
+        let stride = width * 3;
+        let mut data = vec![0.0_f32; stride * height];
+        // Donor: unsaturated with a+b = 8000 > 4000, so
+        // bin = trunc(6000*255/8000) = 191 and lut[191] = c/b = 0.5.
+        let donor = [6000.0_f32, 2000.0, 1000.0];
+        // Two adjacent marked pixels survive the cleanup pass (each keeps
+        // the other); a lone mark would be removed as isolated.
+        let marked = [6000.0_f32, 2000.0, 5000.0];
+        for (row, column, pixel) in [(1, 1, marked), (1, 2, marked), (2, 2, donor)] {
+            let base = row * stride + 3 * column;
+            data[base..base + 3].copy_from_slice(&pixel);
+        }
+        let mut sat = vec![0_u8; width * height * 3];
+        for (row, column) in [(1, 1), (1, 2)] {
+            sat[3 * (row * width + column) + 2] = 1;
+        }
+        let mut dense = vec![0_u8; width * height];
+        let stats = restore
+            .restore(
+                &mut data,
+                width,
+                height,
+                stride,
+                &mut sat,
+                &mut dense,
+                [1, 1, 5, 5],
+                Control::none(),
+            )
+            .unwrap();
+        assert_eq!(stats.donors, 1);
+        assert_eq!(stats.removed, 0);
+        assert_eq!(stats.occupied, 1);
+        // Only channel 2 is marked, so the 2-of-3 dilation stays empty.
+        assert_eq!(stats.dense_pixels, 0);
+        assert!(stats.have_lut);
+        // Hole filling replaces C2 with min(b*lut[191], 32767) = 1000;
+        // the sorted blend stays below the 7000 threshold, so the
+        // neutralization weight is zero and the write is the identity.
+        for (row, column) in [(1, 1), (1, 2)] {
+            let base = row * stride + 3 * column;
+            assert_eq!(
+                data[base..base + 3],
+                [6000.0, 2000.0, 1000.0],
+                "marked pixel ({row},{column})"
+            );
+        }
+        let donor_base = 2 * stride + 3 * 2;
+        assert_eq!(data[donor_base..donor_base + 3], donor);
+        // The cleanup pass kept both marks in place.
+        assert_eq!(sat[3 * (1 * width + 1) + 2], 1);
+        assert_eq!(sat[3 * (1 * width + 2) + 2], 1);
+    }
+
+    #[test]
+    fn highlight_restore_rejects_invalid_layout() {
+        let restore = super::HighlightRestoration::new(0.0, 0.0);
+        let mut data = vec![0.0_f32; 8 * 8 * 3];
+        // Map sizes must match the packed full image.
+        let mut short_sat = vec![0_u8; 7 * 8 * 3];
+        let mut dense = vec![0_u8; 8 * 8];
+        assert!(restore
+            .restore(
+                &mut data,
+                8,
+                8,
+                24,
+                &mut short_sat,
+                &mut dense,
+                [1, 1, 5, 5],
+                Control::none()
+            )
+            .is_err());
+        // RepairPix reads a two-pixel lower/right halo in the dense map;
+        // a rect touching the last row/column rejects.
+        let mut sat = vec![0_u8; 8 * 8 * 3];
+        assert!(restore
+            .restore(
+                &mut data,
+                8,
+                8,
+                24,
+                &mut sat,
+                &mut dense,
+                [1, 1, 6, 5],
+                Control::none()
+            )
+            .is_err());
+    }
+
+    /// Minimal MT19937 (std::mt19937) so the port reproduces the
+    /// archived native-oracle mode matrix inputs exactly.
+    struct Mt19937 {
+        state: [u32; 624],
+        index: usize,
+    }
+
+    impl Mt19937 {
+        fn new(seed: u32) -> Self {
+            let mut state = [0_u32; 624];
+            state[0] = seed;
+            for i in 1..624 {
+                let previous = state[i - 1];
+                state[i] = 1812433253_u32
+                    .wrapping_mul(previous ^ (previous >> 30))
+                    .wrapping_add(i as u32);
+            }
+            Self { state, index: 624 }
+        }
+
+        fn next(&mut self) -> u32 {
+            if self.index == 624 {
+                for i in 0..624 {
+                    let y =
+                        (self.state[i] & 0x8000_0000) | (self.state[(i + 1) % 624] & 0x7fff_ffff);
+                    self.state[i] = self.state[(i + 397) % 624]
+                        ^ (y >> 1)
+                        ^ if y & 1 != 0 { 0x9908_b0df } else { 0 };
+                }
+                self.index = 0;
+            }
+            let mut y = self.state[self.index];
+            self.index += 1;
+            y ^= y >> 11;
+            y ^= (y << 7) & 0x9d2c_5680;
+            y ^= (y << 15) & 0xefc6_0000;
+            y ^ (y >> 18)
+        }
+    }
+
+    /// The archived native-oracle mode matrix
+    /// (followup-native-highlight/check_highlight.cpp and
+    /// native-results.txt): 40 wrapper cases over eight flag/value
+    /// regimes and a threshold sweep, seed 0x43000. The archived run
+    /// compared every case bit-for-bit with the native
+    /// F20RestoreHighlights wrapper; these are its per-mode stats, so
+    /// this test pins the Rust kernel to that native-verified run
+    /// without the library. Rows: (donors, occupied, removed, dense).
+    #[test]
+    fn highlight_restore_matches_archived_native_mode_matrix() {
+        const EXPECTED: [(u32, u32, u32, u32); 40] = [
+            (0, 0, 0, 0),
+            (0, 0, 0, 0),
+            (500, 1, 0, 0),
+            (0, 0, 0, 0),
+            (764, 227, 41, 1408),
+            (1105, 245, 72, 0),
+            (1043, 240, 0, 468),
+            (485, 208, 4, 1456),
+            (0, 0, 0, 0),
+            (0, 0, 0, 0),
+            (748, 1, 0, 0),
+            (0, 0, 0, 0),
+            (748, 235, 45, 1279),
+            (1090, 242, 72, 0),
+            (729, 224, 0, 368),
+            (469, 203, 8, 1357),
+            (0, 0, 0, 0),
+            (0, 0, 0, 0),
+            (736, 1, 0, 0),
+            (0, 0, 0, 0),
+            (898, 244, 62, 1677),
+            (1305, 246, 75, 0),
+            (712, 225, 0, 345),
+            (381, 183, 5, 1256),
+            (0, 0, 0, 0),
+            (0, 0, 0, 0),
+            (594, 1, 0, 0),
+            (0, 0, 0, 0),
+            (758, 236, 49, 1324),
+            (1108, 244, 60, 0),
+            (1017, 237, 0, 456),
+            (562, 215, 8, 1643),
+            (0, 0, 0, 0),
+            (0, 0, 0, 0),
+            (575, 1, 0, 0),
+            (0, 0, 0, 0),
+            (738, 224, 53, 1219),
+            (1061, 243, 72, 0),
+            (836, 242, 0, 408),
+            (518, 209, 7, 1539),
+        ];
+        let mut random = Mt19937::new(0x43000);
+        let (mut donors, mut removed) = (0_u32, 0_u32);
+        let mut empty = 0_u32;
+        let mut samples = 0_usize;
+        for mode in 0..40_usize {
+            let width = 43 + mode % 7;
+            let height = 27 + mode % 11;
+            let stride = width * 3 + 9;
+            let mut data = vec![-12345.25_f32; stride * height];
+            let mut sat = vec![0_u8; width * height * 3];
+            let valid = [
+                (mode % 3) as i32,
+                (mode % 3) as i32,
+                width as i32 - 3,
+                height as i32 - 3,
+            ];
+            let threshold = 4000.0 + 750.0 * (mode % 5) as f64;
+            for y in 0..height {
+                for x in 0..width {
+                    for c in 0..3 {
+                        let mut v = ((random.next() % 100000) as i32 - 5000) as f32 * 0.125;
+                        // No donors (a+b below 4000), neutralization runs.
+                        if mode % 8 == 0 {
+                            v = if c == 2 { 9000.0 } else { 100.0 };
+                        }
+                        // Exact 4000 stays excluded (strictly above).
+                        if mode % 8 == 1 {
+                            v = [3000.0, 1000.0, 2000.0][c];
+                        }
+                        // One-bin filling and the 32767 cap.
+                        if mode % 8 == 2 {
+                            v = [3000.0, 1001.0, 200000.0][c];
+                        }
+                        // Division 0/0 and infinities with marked C2.
+                        if mode % 8 == 3 && x % 3 == 0 {
+                            v = [100.0, -100.0, 1500.0][c];
+                        }
+                        // Ratio 0/0 (NaN bin) while a donor LUT exists.
+                        if mode % 8 == 7 && x % 7 == 0 {
+                            v = if c == 2 { 1500.0 } else { 0.0 };
+                        }
+                        data[y * stride + 3 * x + c] = v;
+                        let flag = match mode % 8 {
+                            0 | 1 => 0,
+                            2 => u8::from(c == 2 && x >= width / 2),
+                            3 => u8::from(c == 2),
+                            4 => u8::from(random.next() % 3 == 0),
+                            // Isolated flags must clear in the cleanup.
+                            5 => u8::from(x % 8 == 3 && y % 8 == 3),
+                            6 => u8::from(c != 1 && x > width / 2 && y > height / 2),
+                            // Short-circuit: no extra draw when marked;
+                            // the flag is the raw %2 value, not a
+                            // comparison.
+                            _ => {
+                                if c == 2 && x % 7 == 0 {
+                                    1
+                                } else {
+                                    (random.next() % 2) as u8
+                                }
+                            }
+                        };
+                        sat[3 * (y * width + x) + c] = flag;
+                    }
+                }
+            }
+            let restore = super::HighlightRestoration::from_threshold(threshold);
+            let mut dense = vec![0_u8; width * height];
+            let mut working = data.clone();
+            let stats = restore
+                .restore(
+                    &mut working,
+                    width,
+                    height,
+                    stride,
+                    &mut sat,
+                    &mut dense,
+                    valid,
+                    Control::none(),
+                )
+                .unwrap();
+            assert_eq!(
+                (
+                    stats.donors,
+                    stats.occupied,
+                    stats.removed,
+                    stats.dense_pixels
+                ),
+                EXPECTED[mode],
+                "mode {mode} stats"
+            );
+            donors += stats.donors;
+            removed += stats.removed;
+            empty += u32::from(stats.donors == 0);
+            samples += width * height * 3;
+        }
+        // Archived wrapper totals: 40 cases / 174,231 channel samples,
+        // 15 empty-donor cases, 633 isolated marks removed, 19,480 donors.
+        assert_eq!(samples, 174_231);
+        assert_eq!(empty, 15);
+        assert_eq!(removed, 633);
+        assert_eq!(donors, 19_480);
     }
 }
