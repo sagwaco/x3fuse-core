@@ -272,7 +272,11 @@ unchanged; no new image-quality or full-pipeline parity result is claimed.
 ## Remaining differences
 
 - The front end still stores normalized uint16 intermediates. Sigma uses float
-  gained counts; reversing normalization cannot restore lost precision.
+  gained counts; reversing normalization cannot restore lost precision. The
+  verified float ApplyGains kernel now exists in core
+  (`crates/x3f-sys/src/float_front.rs`); its unit tests reproduce the archived
+  native oracle bit-for-bit, including the all-three-table gate. The ordered
+  wiring into the conversion path remains open.
   Red detection, listed/packed repair and badness arithmetic now have bounded
   executable evidence. Offset correction now has an independent SVD and passes
   disjoint wrapper checks. Integration must define deterministic accumulation
