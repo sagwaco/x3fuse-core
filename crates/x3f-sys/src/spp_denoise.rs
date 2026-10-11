@@ -27,6 +27,18 @@
 //! from the platform libm; Rust routes `f64::exp`, `f64::tanh` and
 //! `f64::cos` through the same system libm, so the oracle battery
 //! pins the values bit-for-bit on this platform.
+//!
+//! Stage 7c adds `compute_resample_params`, the port of the free
+//! function `ComputeResampleParams` (0x7ab70, the geometry builder
+//! both `TiledDenoise` resample passes call). The native probes the
+//! scale with a 64-entry position table, derives per-phase tent
+//! kernels, detects the phase period by comparing kernel anchors,
+//! and emits the kernel table, the phase count, the phase offsets
+//! and the leading tap. The geometry is reproduced in the native's
+//! exact operation order and pinned on every scale of the native
+//! battery; the kernel table is pinned bit-for-bit on the scales
+//! listed in the function documentation (the fractional-downscale
+//! table has an open one-ulp divergence, documented there).
 
 /// One `GetTanhLUT` result: the table size and the three channel
 /// tables in the native object order `{A, C, B}` (the object stores
@@ -128,6 +140,26 @@ pub struct FastBilateralCoeffs {
     pub weights: Vec<Vec<f32>>,
 }
 
+/// One `ComputeResampleParams` result: the separable resampling
+/// geometry for one scale.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResampleParams {
+    /// The kernel table, `kernel_x * kernel_y` float32 entries,
+    /// phase-major: phase `p` holds its taps at
+    /// `table[p * kernel_x .. (p + 1) * kernel_x]`.
+    pub table: Vec<f32>,
+    /// The tap count per phase.
+    pub kernel_x: u32,
+    /// The distinct phase count.
+    pub kernel_y: u32,
+    /// `kernel_y` source-start deltas between consecutive phases;
+    /// phase `p` starts at `tail + offsets[0..p]` summed.
+    pub offsets: Vec<u32>,
+    /// The first tap offset of phase 0 (`E[0]`, always negative or
+    /// zero in the verified domain).
+    pub tail: i32,
+}
+
 /// The `FastBilateral_F20::CalculateCoeff` histogram construction.
 /// `scaling` is the object field +0x18 (the request noise scaling,
 /// always nonzero when the native calls this), and `sigma_38`,
@@ -166,6 +198,165 @@ pub fn fast_bilateral_coeffs(
         weights.push(bin);
     }
     FastBilateralCoeffs { low, high, weights }
+}
+
+/// The `ComputeResampleParams` port (the free function at 0x7ab70).
+///
+/// The native probes the scale over 64 output positions: position
+/// `k` (1-based) maps to the source center
+/// `f32(f64(f32(k / scale)) + 0.5 * (1 - 1/scale))` (the final add
+/// is fused; the multiply is exact, so a plain add is identical).
+/// Around each center it lays a tent kernel over
+/// `count = ceil(window) + 2` taps starting at
+/// `floor(center - window / 2)`, where `window = 2 / scale` when
+/// scaling down and `2.0` when scaling up. Each downscaling tap
+/// weight clamps `|center - tap| * scale` to [0, 1] in f32, then
+/// computes `1 - clamped` in f64 and narrows once (the native
+/// multiplies by a constant 1.0 gain, a bit-exact no-op, omitted
+/// here); the upscaling weight is the f32 tent
+/// `1 - |center - tap|`, zero past 1. Every kernel is normalized
+/// by its own tap sum and accumulated into one average buffer.
+///
+/// The outputs come from that average and the per-position kernels:
+/// `kernel_x` is the nonzero span of the average, `kernel_y` the
+/// smallest probe index (1..=64) whose kernel matches probe 0 at
+/// the first nonzero average entry (the native compares
+/// `|w - anchor| / max(|w|, |anchor|)` in f32 against 1e-3f, or
+/// takes the first exact-zero match when the anchor is zero),
+/// `tail` the first probe's floor start, `offsets` the consecutive
+/// floor-start deltas, and `table` the normalized per-phase kernels
+/// cropped to the nonzero span.
+///
+/// Parity domain. The geometry (`kernel_x`, `kernel_y`, `tail`,
+/// `offsets`, and the crop) matches the native bit-for-bit on
+/// every scale of the native battery (16 recorded battery scales
+/// plus the 29 native sweep recordings of the stage 7c checkpoint). The kernel table is
+/// bit-for-bit on every scale whose tent products are exactly
+/// representable (0.0625, 0.125, 0.25, 0.5, 0.6), and on every
+/// upsampling scale tested (1.0, 1.5, 2.0, 3.0; the up path has no
+/// multiply by the scale). On the remaining downscaling scales
+/// (0.05, 0.4, 0.7, 0.375 and the other fractional eighths) the
+/// table differs from the native by scattered one-ulp entries.
+/// The investigation record (the stage 7c checkpoint in x3f-docs)
+/// rules out a rounding-mode difference (the runtime FPCR is
+/// round-to-nearest and forcing it reproduces the native table)
+/// and an instruction misreading (both the arm64 and x86_64 slices
+/// decode to this exact pipeline, and in-process hardware probes
+/// confirm the arithmetic). The native's tent weight for the
+/// differing taps is unreachable by any single-rounding variant of
+/// `1 - fl32(|d| * scale)`, so the native computes those products
+/// by a subtly different formula that a later checkpoint must
+/// recover (the anomalies correlate with `|d| * scale` landing
+/// within one to two ulps of a dyadic rational). The two retained
+/// SPP references only use verified scales (identity and 0.5 with
+/// their exact reciprocals), so this open item does not affect
+/// them.
+///
+/// Domain contract. The average must contain a nonzero entry and
+/// some probe in 1..=63 must match the anchor. The native scans
+/// without a bound and, when no probe matches, reads one entry
+/// past its probe table (garbage offsets); this port panics with a
+/// scale-aware message instead. The recorded battery and the
+/// request domain (quantized eighths 0.375..=1.0 and their
+/// reciprocals) always stay inside the contract.
+pub fn compute_resample_params(scale: f32) -> ResampleParams {
+    let scale64 = f64::from(scale);
+    let one_minus = 1.0 - 1.0 / scale64;
+    // Probe centers for k = 1..=64: the f32 division by the scale,
+    // widened to f64, fused with 0.5 * (1 - 1/scale), narrowed.
+    let mut centers = [0_f32; 64];
+    for (i, center) in centers.iter_mut().enumerate() {
+        let quotient = (i as u32 + 1) as f32 / scale;
+        *center = 0.5_f64.mul_add(one_minus, f64::from(quotient)) as f32;
+    }
+    let window = if scale < 1.0 { 2.0 / scale } else { 2.0 };
+    let half_window = window * 0.5;
+    let count = (window.ceil() + 2.0) as u32 as usize;
+    // Per-position floor starts, tent kernels and the average.
+    let mut starts = [0_i32; 64];
+    let mut kernels = vec![vec![0_f32; count]; 64];
+    let mut average = vec![0_f32; count];
+    for i in 0..64 {
+        // frintm plus fcvtzs on the f32 difference.
+        starts[i] = (centers[i] - half_window).floor() as i32;
+        let mut sum = 0_f32;
+        for (j, weight) in kernels[i].iter_mut().enumerate() {
+            let tap = starts[i].wrapping_add(j as i32);
+            let distance = centers[i] - tap as f32;
+            // The native magnitude is fneg plus fcsel (a branch
+            // abs), not fabs; identical for the reachable values.
+            let magnitude = if distance < 0.0 { -distance } else { distance };
+            let value = if scale < 1.0 {
+                // Clamp in f32 (fmul, then fcsel against 0 and 1),
+                // then 1 - clamped in f64, narrowed once by fcvt.
+                let clamped = magnitude * scale;
+                let clamped = if clamped < 0.0 { 0.0 } else { clamped };
+                let clamped = if clamped > 1.0 { 1.0 } else { clamped };
+                (1.0 - f64::from(clamped)) as f32
+            } else if magnitude > 1.0 {
+                // The up path compares first, then 1 - |d| in f32.
+                0.0
+            } else {
+                1.0 - magnitude
+            };
+            *weight = value;
+            sum += value;
+        }
+        for (j, weight) in kernels[i].iter_mut().enumerate() {
+            *weight /= sum;
+            average[j] += *weight;
+        }
+    }
+    let first_nonzero = average
+        .iter()
+        .position(|&value| value != 0.0)
+        .unwrap_or_else(|| panic!("resample scale {scale} has an all-zero average"));
+    // The reverse scan always finds the leading entry itself, so
+    // the fallback is unreachable; keep it defined anyway.
+    let last_nonzero = (first_nonzero..count)
+        .rev()
+        .find(|&j| average[j] != 0.0)
+        .unwrap_or(first_nonzero);
+    let kernel_x = (last_nonzero - first_nonzero + 1) as u32;
+    // Period detection against probe 0 at the anchor entry. The
+    // native compares fabd(w, anchor) / max(|w|, |anchor|) in f32
+    // against 1e-3f, or takes the first exact-zero match for a
+    // zero anchor (0x7b8f0..0x7b91c).
+    let anchor = kernels[0][first_nonzero];
+    let mut kernel_y = 64_u32;
+    for k in 1..64 {
+        let weight = kernels[k][first_nonzero];
+        let matched = if anchor != 0.0 {
+            let reference = weight.abs().max(anchor.abs());
+            (weight - anchor).abs() / reference < 1.0e-3_f32
+        } else {
+            weight == 0.0
+        };
+        if matched {
+            kernel_y = k as u32;
+            break;
+        }
+    }
+    if kernel_y == 64 {
+        // The native reads one entry past its 64-entry probe table
+        // here and emits garbage offsets; refuse instead.
+        panic!("resample scale {scale} has no phase period within the 64-probe table");
+    }
+    let offsets = (0..kernel_y as usize)
+        .map(|i| starts[i + 1].wrapping_sub(starts[i]) as u32)
+        .collect();
+    let mut table = vec![0_f32; (kernel_x * kernel_y) as usize];
+    for phase in 0..kernel_y as usize {
+        let span = &kernels[phase][first_nonzero..=last_nonzero];
+        table[phase * kernel_x as usize..(phase + 1) * kernel_x as usize].copy_from_slice(span);
+    }
+    ResampleParams {
+        table,
+        kernel_x,
+        kernel_y,
+        offsets,
+        tail: starts[0],
+    }
 }
 
 #[cfg(test)]
@@ -453,6 +644,51 @@ mod tests {
         }
         // The boundary fixup: table[half] == table[half + 1].
         assert_eq!(lut.tables[0][256], lut.tables[0][257]);
+    }
+
+    /// The 16-scale ComputeResampleParams battery from the native
+    /// oracle (kernel-results.txt plus the stage 7c sweeps, all
+    /// deterministic across runs): scale, kernel_x, kernel_y, tail,
+    /// the per-phase offsets, and the table FNV-1a over the f32
+    /// bits for the bit-verified scales (None elsewhere; see the
+    /// function documentation for the open divergence on scales
+    /// with inexact tent products). Scale 0.6 exercises the
+    /// zero-anchor period branch.
+    #[test]
+    fn compute_resample_params_matches_native_battery() {
+        let cases: &[(f32, u32, u32, i32, &[u32], Option<u64>)] = &[
+            (0.0625, 32, 1, -8, &[16], Some(0x7f9dd1e3e66f03c5)),
+            (0.125, 16, 1, -4, &[8], Some(0x3a0fe3d5da4854c5)),
+            (0.25, 8, 1, -2, &[4], Some(0xd076633462887ac5)),
+            (0.375, 6, 3, -1, &[2, 3, 3], None),
+            (0.5, 4, 1, -1, &[2], Some(0x9b2f1bb53e5bc065)),
+            (0.6, 5, 1, -1, &[2], Some(0xacf6cd31327fd439)),
+            (0.625, 4, 5, -1, &[2, 1, 2, 2, 1], None),
+            (0.75, 3, 3, -1, &[2, 1, 1], None),
+            (0.875, 3, 7, -1, &[2, 1, 1, 1, 1, 1, 1], None),
+            (1.0, 1, 1, 0, &[1], Some(0x4b72477f9c5c2f98)),
+            (0.4, 5, 2, -1, &[2, 3], None),
+            (0.7, 3, 7, -1, &[2, 1, 2, 1, 1, 2, 1], None),
+            (1.5, 2, 3, -1, &[1, 1, 0], Some(0x2903ab696398b73b)),
+            (0.05, 40, 1, -10, &[20], None),
+            (2.0, 2, 2, -1, &[1, 0], Some(0x45d388a7237d30b5)),
+            (3.0, 2, 3, -1, &[1, 0, 0], Some(0x1b19e2987852d1af)),
+        ];
+        for (scale, kernel_x, kernel_y, tail, offsets, table_hash) in cases {
+            let params = compute_resample_params(*scale);
+            assert_eq!(params.kernel_x, *kernel_x, "kernel_x at {scale}");
+            assert_eq!(params.kernel_y, *kernel_y, "kernel_y at {scale}");
+            assert_eq!(params.tail, *tail, "tail at {scale}");
+            assert_eq!(params.offsets.as_slice(), *offsets, "offsets at {scale}");
+            assert_eq!(
+                params.table.len(),
+                (*kernel_x * *kernel_y) as usize,
+                "table length at {scale}"
+            );
+            if let Some(expected) = table_hash {
+                assert_eq!(fnv_f32(&params.table), *expected, "table at {scale}");
+            }
+        }
     }
 
     #[test]
