@@ -278,13 +278,17 @@ unchanged; no new image-quality or full-pipeline parity result is claimed.
   black, GatherParams request gain, native spatial tables) is verified against
   a native composition oracle bit-for-bit on both retained references. Stage 2
   (WB radial shading: ValidPixRect geometry, MED stretch, native FMA order)
-  is instruction-replay verified and pinned by the corpus fixture
-  (`x3f-docs/spp-rgb-trace/followup-float-front-wiring/`); the SD1 CAMF omits
-  the shading entries, and the stage mirrors that native skip.
+  is instruction-replay verified and pinned by the corpus fixture; the SD1
+  CAMF omits the shading entries, and the stage mirrors that native skip.
+  Stage 3 (listed bad-pixel repair) reconstructs `ReplaceBadPixelsF20`:
+  the kernel matches the archived native oracle bit-for-bit, the badness
+  selection is validated on all 53 CAMFs, and the wired record counts match
+  the corpus inventory exactly (143,827 DP2 / 180,863 SD1)
+  (`x3f-docs/spp-rgb-trace/followup-float-front-wiring/`).
   `X3F_FLOAT_FRONT_TRACE` is the research dump. The remaining ordered stages
-  (listed/packed repair, highlight restoration, despeckle, offset correction)
-  and the float denoise consumer remain open; the normalized uint16 path
-  stays the default.
+  (highlight restoration, despeckle, offset correction) and the float
+  denoise consumer remain open; the normalized uint16 path stays the
+  default.
   Red detection, listed/packed repair and badness arithmetic now have bounded
   executable evidence. Offset correction now has an independent SVD and passes
   disjoint wrapper checks. Integration must define deterministic accumulation
