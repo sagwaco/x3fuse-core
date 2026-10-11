@@ -202,12 +202,60 @@ current biased uint16 buffer would still multiply the normalization bias and
 retain earlier quantization. These checks establish prerequisites for the
 float pipeline; they do not enable the native filters in production.
 
+The [repair-prerequisite checkpoint](https://github.com/sagwaco/x3f-docs/tree/main/spp-rgb-trace/followup-repair)
+now reconstructs the remaining list and packed-repair arithmetic. `DetectBadReds`
+reads pre-gain raw floats and visits only enabled neighbors of listed defects;
+it produces a new list and primary-neighbor overrides without changing pixels.
+Direct native tests match 6,202 synthetic calls and all 53 camera lists on
+controlled pixels. A separate pinned SD1 decoded-raw copy produces four identical
+derived records and excludes the isolated wheel site from this detector's reach.
+That copy is not a captured SPP runtime buffer.
+
+Badness selection uses typed calibration, temperature, shutter and a request
+field. Its inline float arithmetic matches 20,974 synthetic cases and 424
+camera-parameter cases through a relocated source-instruction replay; native
+input getters are checked separately. This is not execution of the complete
+original preprocessing function. The static managed trace connects PROP `BURST`
+through `usBurst` to native request `+0x198`. Corpus values are zero on 45 DP
+files and one on eight SD1 files. This establishes the expected ordinary as-shot
+input, not a runtime request capture, drive mode or physical frame count.
+Missing fields and saved-setting merges still need separate proof.
+At controlled request values zero/one,
+49 files select minimum two, three select zero and one selects one. The static
+selector admits 3,149,812 primary and 964 JPEG records, not that many distinct
+or changed pixels. Listed repair tests `badness >= minimum`; packed repair
+uses exact equality with its separately offset selector.
+
+Packed-cluster repair uses masked 3×3 patch matching in six orientations,
+then copies a clean donor's whole RGB triplet. Direct native comparisons match
+234 synthetic padded buffers and all 754 actual cluster records / 5,239 points
+on synthetic full-size float images. Stable priority order, first-donor ties,
+the native NE/E mask association and zero fallback are retained and tested.
+These checks cover the finite valid contract, not arbitrary malformed metadata.
+
+Row/column offset correction now has a bounded reconstruction. All 48 patch
+worker cases match the original library. Five final-subtraction cases match
+captured native accumulators, and two injected cases check count 20, magnitude
+equality and scalar-tail behavior. These tests still use Sigma's pseudoinverse
+matrices. Its embedded SVD is the next dependency; this is not an independent
+whole-wrapper implementation or a complete rendered-image comparison.
+
+Production still collects defect coordinates, discards the native badness,
+channel and neighbor flags, and interpolates all channels with cardinal
+neighbors in normalized uint16. Applying only the native selector to that
+buffer would not reproduce the float arithmetic, masks or sequential lists.
+The reconstructed kernels remain executable evidence until the complete ordered
+float segment and its downstream consumer are ready. Chroma-LUT selection is
+unchanged; no new image-quality or full-pipeline parity result is claimed.
+
 ## Remaining differences
 
 - The front end still stores normalized uint16 intermediates. Sigma uses float
   gained counts; reversing normalization cannot restore lost precision.
-  Native bad-red detection, packed-cluster arithmetic and the request field
-  controlling listed-repair badness still need resolution before integration.
+  Red detection, listed/packed repair and badness arithmetic now have bounded
+  executable evidence. Offset correction still needs an independent native SVD
+  reconstruction. Ordered integration, exact radial execution and the native
+  float denoise consumer remain separate work.
 - Highlight restoration still uses the existing normalized LUT/gate model,
   after denoise. Sigma restores camera-marked C2 and blends toward original C0
   before denoise, using CAMF saturation maps and different donor rules.
