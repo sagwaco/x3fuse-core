@@ -187,8 +187,9 @@ The donor and repair bounds are the inclusive `ValidPixRect`, not the visible
 active rectangle. Its horizontal limits come from `DarkShieldColRange`; its
 vertical limits expand the active rectangle, relative to the keep origin, by
 32 rows for HI and 16 otherwise. The threshold comes from typed float
-`ExpEstimate` and `ExpNet`; the forwarded Highlight Control argument is unused
-by this particular kernel. Skip bit 11 bypasses the whole routine. Missing both
+`ExpEstimate` and `ExpNet`; the forwarded slider argument is unused by this
+particular kernel. Its originating managed GUI property remains unverified.
+Skip bit 11 bypasses the whole routine. Missing both
 map forms for any channel sets bits 11–13, also bypassing its neutralization.
 
 The [float-front-end follow-up](https://github.com/sagwaco/x3f-docs/tree/main/spp-rgb-trace/followup-float-front)
