@@ -123,11 +123,12 @@ because CAMF dimensions were reversed. Both are superseded; source agreement,
 rather than the best score from an intermediate configuration, governs changes.
 
 SD1’s visible Sigma noise controls were at the middle of five detents, with
-Highlight Control 1.0. The native noise request is now derived in
+Highlight Control 1.0. The native noise request is derived in
 `x3f-docs/spp-rgb-trace/followup-noise-request/`: a native oracle over each
 decoded CAMF gives the denoise strength request 1.0 (DP2) and 0.5 (SD1),
-invariant across slider positions and resolution. The exact marshalled slider
-doubles and the runtime eProcessVersion stay uncaptured.
+invariant across slider positions, independent slider rows and resolution
+strings. The exact marshalled slider doubles, the adjusted WB gains and the
+resolution code stay uncaptured; the values are bounded, not observed.
 CPU NLM removes most shadow speckle, but one severe isolated wheel-pixel defect
 remains. At full sensor coordinate (4171,2349), raw C0 is 203 versus neighboring
 values 12–23; that site is absent from `BadPixelsF20`. All three packed
