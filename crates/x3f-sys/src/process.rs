@@ -2105,6 +2105,104 @@ pub(crate) unsafe fn merrill_float_gain_front(
     crate::float_front::FloatFront::new(black, gain, tables)
 }
 
+/// Native resolution string. The request builds it from
+/// adjustment+0x190 (1 = HI, 3 = MED, 4 = LOW, else empty); the
+/// corpus-bound choice reads PROP RESOLUTION. Both retained
+/// references are HI.
+unsafe fn merrill_resolution_string(x3f: *mut x3f_t) -> String {
+    let mut property = ptr::null_mut();
+    if unsafe { x3f_get_prop_entry(x3f, c"RESOLUTION".as_ptr().cast_mut(), &mut property) } == 0
+        || property.is_null()
+    {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(property) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Stage 2 of the ordered float frontend: native WB radial shading.
+/// Returns None when the CAMF property list or the WB matrix is absent;
+/// the native preprocess skips the whole radial block in that case
+/// (0xa8198, 0xa81f0).
+unsafe fn merrill_radial_shading(
+    x3f: *mut x3f_t,
+    wb: *mut libc::c_char,
+    control: Control<'_>,
+) -> crate::Result<Option<crate::float_front::RadialShading>> {
+    control.check()?;
+    let mut coefficients = [0.0_f64; 4];
+    if unsafe {
+        x3f_get_camf_matrix_for_wb(
+            x3f,
+            c"WhiteBalanceColorShadingFactor".as_ptr() as *mut _,
+            wb,
+            2,
+            2,
+            coefficients.as_mut_ptr(),
+        )
+    } == 0
+    {
+        return Ok(None);
+    }
+    let read_rect = |name: &std::ffi::CStr| -> Option<[i32; 4]> {
+        let mut values = [0u32; 4];
+        if unsafe {
+            x3f_get_camf_matrix(
+                x3f,
+                name.as_ptr() as *mut _,
+                4,
+                0,
+                0,
+                matrix_type_t_M_UINT,
+                values.as_mut_ptr().cast(),
+            )
+        } == 0
+        {
+            return None;
+        }
+        // GetRectFromCamfile adds one to the stored inclusive right and
+        // bottom endpoints, giving half-open bounds.
+        Some([
+            values[0] as i32,
+            values[1] as i32,
+            values[2] as i32 + 1,
+            values[3] as i32 + 1,
+        ])
+    };
+    let (Some(active), Some(keep)) = (read_rect(c"ActiveImageArea"), read_rect(c"KeepImageArea"))
+    else {
+        return Err(crate::Error::InvalidData(
+            "missing Merrill radial rectangles",
+        ));
+    };
+    let mut col_range = [0u32; 4];
+    if unsafe {
+        x3f_get_camf_matrix(
+            x3f,
+            c"DarkShieldColRange".as_ptr() as *mut _,
+            2,
+            2,
+            0,
+            matrix_type_t_M_UINT,
+            col_range.as_mut_ptr().cast(),
+        )
+    } == 0
+    {
+        return Err(crate::Error::InvalidData(
+            "missing Merrill radial column range",
+        ));
+    }
+    let resolution = unsafe { merrill_resolution_string(x3f) };
+    Ok(Some(crate::float_front::RadialShading::new(
+        active,
+        keep,
+        col_range.map(|v| v as i32),
+        coefficients,
+        &resolution,
+    )?))
+}
+
 unsafe fn merrill_wb_gain(x3f: *mut x3f_t, wb: *mut libc::c_char) -> Option<[f64; 3]> {
     let mut gain = [0.0; 3];
     if unsafe {
@@ -4672,7 +4770,7 @@ unsafe fn get_image_impl(
                         trace.data,
                         trace.rows as usize * trace.row_stride as usize,
                     );
-                    if let Ok(gained) = front.apply(
+                    if let Ok(mut gained) = front.apply(
                         decoded,
                         trace.columns as usize,
                         trace.rows as usize,
@@ -4681,14 +4779,34 @@ unsafe fn get_image_impl(
                     ) {
                         let black = front.black();
                         let gain = front.gain();
+                        let gained_fnv = crate::float_front::fnv1a_f32(&gained);
+                        let mut radial_note = "none";
+                        let mut radial_fnv = 0_u64;
+                        if let Ok(Some(radial)) = merrill_radial_shading(x3f, wb, control) {
+                            if radial
+                                .apply(
+                                    &mut gained,
+                                    trace.columns as usize,
+                                    trace.rows as usize,
+                                    trace.row_stride as usize,
+                                    control,
+                                )
+                                .is_ok()
+                            {
+                                radial_note = "applied";
+                                radial_fnv = crate::float_front::fnv1a_f32(&gained);
+                            }
+                        }
                         eprintln!(
-                            "X3F float front: {}x{} black={:x?} gain={:x?} spatial={} fnv1a={:016x}",
+                            "X3F float front: {}x{} black={:x?} gain={:x?} spatial={} fnv1a={:016x} radial={} radial_fnv1a={:016x}",
                             trace.columns,
                             trace.rows,
                             [black[0].to_bits(), black[1].to_bits(), black[2].to_bits()],
                             [gain[0].to_bits(), gain[1].to_bits(), gain[2].to_bits()],
                             front.spatial().is_some(),
-                            crate::float_front::fnv1a_f32(&gained)
+                            gained_fnv,
+                            radial_note,
+                            radial_fnv
                         );
                     }
                 }
@@ -6107,7 +6225,7 @@ mod tests {
     /// corpus is absent.
     #[test]
     fn merrill_float_gain_front_matches_reference_fixtures() {
-        use crate::process::merrill_float_gain_front;
+        use crate::process::{merrill_float_gain_front, merrill_radial_shading};
         use crate::{
             x3f_area16_t, x3f_delete, x3f_get_camf, x3f_get_raw, x3f_image_area, x3f_load_data,
             x3f_new_from_file, x3f_return_e_X3F_OK, Control,
@@ -6123,7 +6241,7 @@ mod tests {
             .filter(|line| !line.starts_with('#'))
         {
             let fields: Vec<_> = line.split('\t').collect();
-            assert_eq!(fields.len(), 7, "{line}");
+            assert_eq!(fields.len(), 9, "{line}");
             let name = fields[0];
             let cols: usize = fields[1].parse().unwrap();
             let rows: usize = fields[2].parse().unwrap();
@@ -6135,6 +6253,8 @@ mod tests {
             });
             let spatial: bool = fields[5] == "1";
             let expected: u64 = u64::from_str_radix(fields[6], 16).unwrap();
+            let radial_expected: bool = fields[7] == "1";
+            let radial_fnv: u64 = u64::from_str_radix(fields[8], 16).unwrap();
             let path = root.join(name);
             if !path.exists() {
                 continue;
@@ -6151,15 +6271,10 @@ mod tests {
                     assert_eq!(x3f_load_data(x3f, prop), x3f_return_e_X3F_OK);
                 }
                 assert_eq!(x3f_load_data(x3f, x3f_get_raw(x3f)), x3f_return_e_X3F_OK);
-                let front = merrill_float_gain_front(
-                    x3f,
-                    // get_image_impl resolves a null WB name through the
-                    // property list; the fixture reproduces that choice.
-                    crate::x3f_get_wb(x3f),
-                    true,
-                    Control::none(),
-                )
-                .unwrap();
+                // get_image_impl resolves a null WB name through the
+                // property list; the fixture reproduces that choice.
+                let wb = crate::x3f_get_wb(x3f);
+                let front = merrill_float_gain_front(x3f, wb, true, Control::none()).unwrap();
                 assert_eq!(front.black().map(f64::to_bits), black, "{name} black");
                 assert_eq!(front.gain().map(f64::to_bits), gain, "{name} gain");
                 assert_eq!(front.spatial().is_some(), spatial, "{name} spatial");
@@ -6170,7 +6285,7 @@ mod tests {
                     area.data,
                     area.rows as usize * area.row_stride as usize,
                 );
-                let gained = front
+                let mut gained = front
                     .apply(
                         decoded,
                         area.columns as usize,
@@ -6183,6 +6298,24 @@ mod tests {
                     crate::float_front::fnv1a_f32(&gained),
                     expected,
                     "{name} fnv"
+                );
+                let radial = merrill_radial_shading(x3f, wb, Control::none()).unwrap_or(None);
+                assert_eq!(radial.is_some(), radial_expected, "{name} radial presence");
+                if let Some(radial) = radial {
+                    radial
+                        .apply(
+                            &mut gained,
+                            area.columns as usize,
+                            area.rows as usize,
+                            area.row_stride as usize,
+                            Control::none(),
+                        )
+                        .unwrap();
+                }
+                assert_eq!(
+                    crate::float_front::fnv1a_f32(&gained),
+                    radial_fnv,
+                    "{name} radial fnv"
                 );
                 x3f_delete(x3f);
                 libc::fclose(file);

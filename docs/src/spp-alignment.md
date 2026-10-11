@@ -274,17 +274,17 @@ unchanged; no new image-quality or full-pipeline parity result is claimed.
 
 - The front end still stores normalized uint16 intermediates. Sigma uses float
   gained counts; reversing normalization cannot restore lost precision. The
-  verified float ApplyGains kernel now exists in core
-  (`crates/x3f-sys/src/float_front.rs`) as an ordered stage 1: black, the
-  GatherParams request gain (native order, base `wb/0.55` or `wb+wb` by
-  process model) and the native spatial tables feed the kernel over the exact
-  decoded sensor counts. A native composition oracle reproduces the Rust
-  black, gain and complete gained-raster FNV bit-for-bit on both retained
-  references (`x3f-docs/spp-rgb-trace/followup-float-front-wiring/`);
+  ordered float frontend is under construction in core. Stage 1 (ApplyGains:
+  black, GatherParams request gain, native spatial tables) is verified against
+  a native composition oracle bit-for-bit on both retained references. Stage 2
+  (WB radial shading: ValidPixRect geometry, MED stretch, native FMA order)
+  is instruction-replay verified and pinned by the corpus fixture
+  (`x3f-docs/spp-rgb-trace/followup-float-front-wiring/`); the SD1 CAMF omits
+  the shading entries, and the stage mirrors that native skip.
   `X3F_FLOAT_FRONT_TRACE` is the research dump. The remaining ordered stages
-  (radial shading, listed/packed repair, highlight restoration, despeckle,
-  offset correction) and the float denoise consumer remain open; the
-  normalized uint16 path stays the default.
+  (listed/packed repair, highlight restoration, despeckle, offset correction)
+  and the float denoise consumer remain open; the normalized uint16 path
+  stays the default.
   Red detection, listed/packed repair and badness arithmetic now have bounded
   executable evidence. Offset correction now has an independent SVD and passes
   disjoint wrapper checks. Integration must define deterministic accumulation

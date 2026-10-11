@@ -1,9 +1,10 @@
-# Merrill ordered float frontend (ApplyGains over decoded sensor counts)
-# on the two retained SPP reference files, via the production stage.
-# Columns: name <TAB> columns <TAB> rows <TAB> black bits <TAB> gain bits
-# <TAB> spatial <TAB> fnv1a of the gained f32 raster.
-# The fixture pins the derived DarkShieldTop trimmed black, the GatherParams
-# request gain in native order, the EXIF-driven spatial tables, and the
-# raster hash. Sources: x3f-docs spp-rgb-trace/followup-float-front-wiring/.
-sigma_sd1_merrill_15.x3f	4928	3264	402f706cda635676,402f6842bde221ac,402f7c526ccd29e6	40110883f2211dde,40002c42c56a345d,3ff24fcac9745d17	1	b9d43d1a54d46ec8
-_P2M0358.X3F	4928	3264	403f8d1b582eaac5,403f6597e0a3ba81,403fac6b03e51270	4013cedf28a33e34,400284437855da00,3ff64b2768000000	1	4647cf03161f2772
+# Merrill ordered float frontend on the two retained SPP reference files,
+# via the production stages. Columns: name <TAB> columns <TAB> rows
+# <TAB> black bits <TAB> gain bits <TAB> spatial <TAB> ApplyGains fnv1a
+# <TAB> radial applied <TAB> post-radial fnv1a.
+# Stage 1 (ApplyGains) is native-oracle verified bit-for-bit
+# (followup-float-front-wiring/). Stage 2 (radial) is instruction-replay
+# verified; the SD1 CAMF omits the shading property list, so the native
+# radial block skips for it. Sources: spp-rgb-trace/followup-float-front-wiring/.
+sigma_sd1_merrill_15.x3f	4928	3264	402f706cda635676,402f6842bde221ac,402f7c526ccd29e6	40110883f2211dde,40002c42c56a345d,3ff24fcac9745d17	1	b9d43d1a54d46ec8	0	b9d43d1a54d46ec8
+_P2M0358.X3F	4928	3264	403f8d1b582eaac5,403f6597e0a3ba81,403fac6b03e51270	4013cedf28a33e34,400284437855da00,3ff64b2768000000	1	4647cf03161f2772	1	62d1b444342f5737
