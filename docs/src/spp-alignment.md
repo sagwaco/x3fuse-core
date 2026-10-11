@@ -233,12 +233,29 @@ on synthetic full-size float images. Stable priority order, first-donor ties,
 the native NE/E mask association and zero fallback are retained and tested.
 These checks cover the finite valid contract, not arbitrary malformed metadata.
 
-Row/column offset correction now has a bounded reconstruction. All 48 patch
-worker cases match the original library. Five final-subtraction cases match
-captured native accumulators, and two injected cases check count 20, magnitude
-equality and scalar-tail behavior. These tests still use Sigma's pseudoinverse
-matrices. Its embedded SVD is the next dependency; this is not an independent
-whole-wrapper implementation or a complete rendered-image comparison.
+Row/column offset correction now has an independent solver and a bounded
+wrapper reconstruction. The three polynomial SVD states match every byte of
+Sigma's double arrays. Another 374 pseudoinverse cases match 355,320 float
+outputs and complete scratch buffers; 748 capacity rejections preserve output.
+Six mutation checks fail as intended. Six complete wrapper calls
+match on two synthetic geometries with disjoint worker rows, using no supplied
+native inverse or accumulator. Two additional calls check native cancellation
+at the first scale; they do not implement independent cancellation control.
+The code and native checks are in `x3f-docs/spp-rgb-trace/followup-offset-svd/`.
+
+The native dispatcher divides image height, while its workers use rectangle
+height and ignore the supplied row endpoint. Their ranges can overlap. Native
+row sums and outputs changed between repeated calls on one valid synthetic
+geometry. A deterministic implementation cannot promise one byte-identical
+reference for that case. A separate 8x6 all-ones (rank one) matrix makes the
+native solver write past its declared scratch capacity. The native deflation
+loop starts its column index at 1 instead of the LINPACK lower bound. The
+write extent and the in-range output values vary with uninitialized heap and
+caller memory. The research solver asserts its column bounds before that
+write; it is not a general matrix API. The three polynomial bases do not
+depend on image data. They never reach the defective deflation path, so
+camera content cannot trigger this overrun through the offset correction
+call. These results do not establish camera-render parity.
 
 Production still collects defect coordinates, discards the native badness,
 channel and neighbor flags, and interpolates all channels with cardinal
@@ -253,9 +270,10 @@ unchanged; no new image-quality or full-pipeline parity result is claimed.
 - The front end still stores normalized uint16 intermediates. Sigma uses float
   gained counts; reversing normalization cannot restore lost precision.
   Red detection, listed/packed repair and badness arithmetic now have bounded
-  executable evidence. Offset correction still needs an independent native SVD
-  reconstruction. Ordered integration, exact radial execution and the native
-  float denoise consumer remain separate work.
+  executable evidence. Offset correction now has an independent SVD and passes
+  disjoint wrapper checks. Integration must define deterministic accumulation
+  for overlapping worker rows. Ordered integration, exact radial execution and
+  the native float denoise consumer remain separate work.
 - Highlight restoration still uses the existing normalized LUT/gate model,
   after denoise. Sigma restores camera-marked C2 and blends toward original C0
   before denoise, using CAMF saturation maps and different donor rules.
