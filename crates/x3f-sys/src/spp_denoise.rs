@@ -26,7 +26,12 @@
 //! Transcendental parity: the native calls `exp`, `tanh` and `cos`
 //! from the platform libm; Rust routes `f64::exp`, `f64::tanh` and
 //! `f64::cos` through the same system libm, so the oracle battery
-//! pins the values bit-for-bit on this platform.
+//! pins the values bit-for-bit on this platform. The hash pins
+//! depend on that libm, so the transcendental tests are compiled
+//! only for `aarch64` macOS, where the battery was recorded; other
+//! platforms skip them instead of risking last-ulp differences.
+//! `compute_resample_params` uses no transcendentals and its pins
+//! are unconditional.
 //!
 //! Stage 7c adds `compute_resample_params`, the port of the free
 //! function `ComputeResampleParams` (0x7ab70, the geometry builder
@@ -118,8 +123,9 @@ pub fn tanh_lut(cf1: [f64; 3], cf2: [f64; 3]) -> TanhLut {
     // Mirror: table[size - k] = -table[k] for k in 1..half.
     for table in tables.iter_mut() {
         for k in 1..half as usize {
+            // The native `neg` wraps; i16::MIN mirrors itself.
             let value = table[k];
-            table[mask + 1 - k] = -value;
+            table[mask + 1 - k] = value.wrapping_neg();
         }
         // Boundary fixup: table[half] = table[half + 1].
         let boundary = table[half as usize + 1];
@@ -229,37 +235,49 @@ pub fn fast_bilateral_coeffs(
 ///
 /// Parity domain. The geometry (`kernel_x`, `kernel_y`, `tail`,
 /// `offsets`, and the crop) matches the native bit-for-bit on
-/// every scale of the native battery (16 recorded battery scales
-/// plus the 29 native sweep recordings of the stage 7c checkpoint). The kernel table is
-/// bit-for-bit on every scale whose tent products are exactly
-/// representable (0.0625, 0.125, 0.25, 0.5, 0.6), and on every
-/// upsampling scale tested (1.0, 1.5, 2.0, 3.0; the up path has no
-/// multiply by the scale). On the remaining downscaling scales
-/// (0.05, 0.4, 0.7, 0.375 and the other fractional eighths) the
-/// table differs from the native by scattered one-ulp entries.
-/// The investigation record (the stage 7c checkpoint in x3f-docs)
+/// every scale of the battery below (35 rows, recorded across the
+/// native sweep files of the stage 7c checkpoint). The kernel
+/// table is bit-for-bit on every scale whose tent products are
+/// exactly representable (0.0625, 0.125, 0.25, 0.5, 0.6), and on
+/// every upsampling scale (1.0, 1.14285715, 1.3333334, 1.5, 1.6,
+/// 2.0, 2.6666667, 3.0, 4.0, 8.0; the up path has no multiply by
+/// the scale). On the remaining downscaling scales (0.05, 0.4,
+/// 0.7, 0.375 and the other fractional eighths) the table differs
+/// from the native by scattered one-ulp entries. The
+/// investigation record (the stage 7c checkpoint in x3f-docs)
 /// rules out a rounding-mode difference (the runtime FPCR is
 /// round-to-nearest and forcing it reproduces the native table)
-/// and an instruction misreading (both the arm64 and x86_64 slices
-/// decode to this exact pipeline, and in-process hardware probes
-/// confirm the arithmetic). The native's tent weight for the
-/// differing taps is unreachable by any single-rounding variant of
-/// `1 - fl32(|d| * scale)`, so the native computes those products
-/// by a subtly different formula that a later checkpoint must
-/// recover (the anomalies correlate with `|d| * scale` landing
-/// within one to two ulps of a dyadic rational). The two retained
-/// SPP references only use verified scales (identity and 0.5 with
-/// their exact reciprocals), so this open item does not affect
+/// and an instruction misreading (both the arm64 and x86_64
+/// slices decode to this exact pipeline, and in-process hardware
+/// probes confirm the arithmetic). The native's tent weight for
+/// the differing taps is unreachable by any single-rounding
+/// variant of `1 - fl32(|d| * scale)`, so the native computes
+/// those products by a subtly different formula that a later
+/// checkpoint must recover (the anomalies correlate with
+/// `|d| * scale` landing within one to two ulps of a dyadic
+/// rational). The two retained SPP references only use verified
+/// scales (identity and 0.5), so this open item does not affect
 /// them.
 ///
 /// Domain contract. The average must contain a nonzero entry and
 /// some probe in 1..=63 must match the anchor. The native scans
 /// without a bound and, when no probe matches, reads one entry
-/// past its probe table (garbage offsets); this port panics with a
-/// scale-aware message instead. The recorded battery and the
-/// request domain (quantized eighths 0.375..=1.0 and their
-/// reciprocals) always stay inside the contract.
+/// past its probe table (garbage offsets; the recorded native
+/// 0.374 case does this with `kernel_y` at 64); this port panics
+/// with a scale-aware message instead. Zero, negative, NaN and
+/// infinite scales are rejected up front where the native divides
+/// without checking. The recorded battery and the request domain
+/// (quantized eighths 0.375..=1.0 and their reciprocals) always
+/// stay inside the contract.
 pub fn compute_resample_params(scale: f32) -> ResampleParams {
+    // The native divides by the scale without checking it; zero,
+    // negative, NaN and infinites produce garbage geometry there.
+    // The port refuses them instead (the request domain is finite
+    // and positive).
+    assert!(
+        scale.is_finite() && scale > 0.0,
+        "resample scale {scale} must be finite and positive"
+    );
     let scale64 = f64::from(scale);
     let one_minus = 1.0 - 1.0 / scale64;
     // Probe centers for k = 1..=64: the f32 division by the scale,
@@ -405,6 +423,7 @@ mod tests {
     /// The native oracle battery: check_denoise_kernels.cpp against
     /// the shipped library, archived in followup-tiled-denoise/
     /// kernel-results.txt. Every hash below is a native run.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     #[test]
     fn tanh_lut_matches_native_battery() {
         let cases: &[(&str, [f64; 3], [f64; 3], u32, u64, u64, u64)] = &[
@@ -493,6 +512,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     #[test]
     fn fast_bilateral_coeffs_matches_native_battery() {
         let cases: &[(f64, f64, f64, f64, u64, usize)] = &[
@@ -624,6 +644,7 @@ mod tests {
 
     /// The full entry-level dumps from the native battery pin the
     /// mirror and boundary-fixup semantics beyond the hashes.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     #[test]
     fn tanh_lut_matches_native_full_dump() {
         let lut = tanh_lut([3.0, 2.0, 1.0], [0.75, 0.5, 0.25]);
@@ -658,21 +679,99 @@ mod tests {
     fn compute_resample_params_matches_native_battery() {
         let cases: &[(f32, u32, u32, i32, &[u32], Option<u64>)] = &[
             (0.0625, 32, 1, -8, &[16], Some(0x7f9dd1e3e66f03c5)),
+            (0.05, 40, 1, -10, &[20], None),
             (0.125, 16, 1, -4, &[8], Some(0x3a0fe3d5da4854c5)),
+            (0.1875, 11, 3, -3, &[6, 5, 5], None),
             (0.25, 8, 1, -2, &[4], Some(0xd076633462887ac5)),
+            (0.3, 7, 3, -2, &[4, 3, 3], None),
+            (0.3125, 7, 5, -2, &[4, 3, 3, 3, 3], None),
+            (0.33333334, 5, 1, -1, &[3], None),
+            (0.36, 7, 1, -1, &[2], None),
             (0.375, 6, 3, -1, &[2, 3, 3], None),
+            (
+                0.376,
+                6,
+                47,
+                -1,
+                &[
+                    2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3,
+                    2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3,
+                ],
+                None,
+            ),
+            (
+                0.38,
+                6,
+                19,
+                -1,
+                &[2, 3, 3, 2, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 2, 3, 3],
+                None,
+            ),
+            (0.4, 5, 2, -1, &[2, 3], None),
+            (0.4375, 5, 7, -1, &[2, 2, 3, 2, 2, 3, 2], None),
+            (0.45, 5, 9, -1, &[2, 2, 3, 2, 2, 2, 2, 3, 2], None),
             (0.5, 4, 1, -1, &[2], Some(0x9b2f1bb53e5bc065)),
+            (0.5625, 4, 9, -1, &[2, 2, 1, 2, 2, 2, 2, 1, 2], None),
             (0.6, 5, 1, -1, &[2], Some(0xacf6cd31327fd439)),
             (0.625, 4, 5, -1, &[2, 1, 2, 2, 1], None),
-            (0.75, 3, 3, -1, &[2, 1, 1], None),
-            (0.875, 3, 7, -1, &[2, 1, 1, 1, 1, 1, 1], None),
-            (1.0, 1, 1, 0, &[1], Some(0x4b72477f9c5c2f98)),
-            (0.4, 5, 2, -1, &[2, 3], None),
+            (0.6875, 3, 11, -1, &[2, 1, 2, 1, 2, 1, 1, 2, 1, 2, 1], None),
             (0.7, 3, 7, -1, &[2, 1, 2, 1, 1, 2, 1], None),
+            (0.75, 3, 3, -1, &[2, 1, 1], None),
+            (
+                0.8125,
+                3,
+                13,
+                -1,
+                &[2, 1, 1, 1, 2, 1, 1, 1, 1, 2, 1, 1, 1],
+                None,
+            ),
+            (0.875, 3, 7, -1, &[2, 1, 1, 1, 1, 1, 1], None),
+            (
+                0.9375,
+                3,
+                15,
+                -1,
+                &[2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+                None,
+            ),
+            (1.0, 1, 1, 0, &[1], Some(0x4b72477f9c5c2f98)),
+            (
+                1.14285715,
+                2,
+                8,
+                -1,
+                &[1, 1, 1, 1, 1, 1, 1, 0],
+                Some(0xa325f76d9f09ba86),
+            ),
+            (1.3333334, 2, 4, -1, &[1, 1, 1, 0], Some(0x7833e11fbd04c4a5)),
             (1.5, 2, 3, -1, &[1, 1, 0], Some(0x2903ab696398b73b)),
-            (0.05, 40, 1, -10, &[20], None),
+            (
+                1.6,
+                2,
+                8,
+                -1,
+                &[1, 1, 0, 1, 0, 1, 1, 0],
+                Some(0xeb9cfa2244f62455),
+            ),
             (2.0, 2, 2, -1, &[1, 0], Some(0x45d388a7237d30b5)),
+            (
+                2.6666667,
+                2,
+                8,
+                -1,
+                &[1, 0, 0, 1, 0, 0, 1, 0],
+                Some(0x09e0cf5a9fc44455),
+            ),
             (3.0, 2, 3, -1, &[1, 0, 0], Some(0x1b19e2987852d1af)),
+            (4.0, 2, 4, -1, &[0, 1, 0, 0], Some(0x701ec0880d000725)),
+            (
+                8.0,
+                2,
+                8,
+                -1,
+                &[0, 0, 0, 1, 0, 0, 0, 0],
+                Some(0x80760f1086d9ca35),
+            ),
         ];
         for (scale, kernel_x, kernel_y, tail, offsets, table_hash) in cases {
             let params = compute_resample_params(*scale);
@@ -691,6 +790,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     #[test]
     fn fast_bilateral_coeffs_matches_native_full_dump() {
         let coeffs = fast_bilateral_coeffs(0.1, 0.0025, 0.12, 0.025);

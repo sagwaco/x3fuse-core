@@ -2259,13 +2259,40 @@ fn merrill_badness_label(
     (label.max(0.0) as u32).min(u32::from(u16::MAX))
 }
 
+/// The native BurstExposureAdjust gate for the badness exposure
+/// (followup-repair/usburst-lineage). The managed X3F filler reads
+/// PROP BURST and, when empty, retries PROP NUMOFBURST; an empty
+/// string leaves the managed default 0xFFFF (the absent sentinel,
+/// which adds the adjustment), a failed parse leaves 0, and a
+/// parsed value stays. The native exposure adds
+/// BurstExposureAdjust only when `uint32(request+0x198) > 1`, so
+/// ordinary as-shot values 0 and 1 exclude it.
+pub(crate) unsafe fn merrill_burst_exposure_adjust_included(x3f: *mut x3f_t) -> bool {
+    let mut burst: u16 = u16::MAX;
+    for key in [c"BURST", c"NUMOFBURST"] {
+        let mut value: *mut libc::c_char = ptr::null_mut();
+        if unsafe { crate::x3f_get_prop_entry(x3f, key.as_ptr() as *mut _, &mut value) } != 0 {
+            let text = unsafe { std::ffi::CStr::from_ptr(value) }
+                .to_string_lossy()
+                .to_string();
+            // Only an empty string retries the next tag; whitespace is
+            // malformed and parses to 0, as the managed decode does.
+            if !text.is_empty() {
+                burst = text.trim().parse().unwrap_or(0);
+                break;
+            }
+        }
+    }
+    u32::from(burst) > 1
+}
+
 /// Stage 3 of the ordered float frontend: listed bad-pixel repair from
 /// the camera lists. Reads BadnessTable, the exposure inputs and
 /// BPBadnessOffset, selects the badness label natively, and returns the
-/// repair with the primary BadPixelsF20 list and neighbor overrides
-/// resolved from the DetectBadReds evidence path (the detector itself
-/// is pre-gain and changes no pixels; this checkpoint uses the stored
-/// camera list unchanged, which is the bounded verified contract).
+/// repair with the primary BadPixelsF20 list (the DetectBadReds
+/// detector is pre-gain and changes no pixels; its list and overrides,
+/// the Jpeg_BadClusters list and packed-cluster repair are open
+/// ordered stages).
 pub(crate) unsafe fn merrill_listed_repair(
     x3f: *mut x3f_t,
     burst_exposure_adjust_included: bool,
@@ -2321,11 +2348,13 @@ pub(crate) unsafe fn merrill_listed_repair(
         unsafe {
             x3f_get_camf_float(x3f, c"BurstExposureAdjust".as_ptr().cast_mut(), &mut value);
         }
-        value
+        value as f32
     } else {
-        0.0
+        0.0_f32
     };
-    let exposure = (shutter / 1000.0 + burst_adjust) as f32;
+    // Native rounds each step in f32: CaptureShutter / 1000.f, then
+    // the burst add (followup-repair/badness/FINDINGS.txt).
+    let exposure = shutter as f32 / 1000.0_f32 + burst_adjust;
     let mut offset: u32 = 1;
     unsafe {
         x3f_get_camf_unsigned(x3f, c"BPBadnessOffset".as_ptr().cast_mut(), &mut offset);
@@ -2599,7 +2628,7 @@ pub(crate) unsafe fn merrill_despeckle(
     };
     // GetFColorFloatFromCamfile("DespAdjust", {15,15,5}): typed float
     // 1-D [3] lookup; the corpus stores int16, so the default applies.
-    let mut adjust = [15.0_f64; 3];
+    let mut adjust = [15.0_f64, 15.0, 5.0];
     unsafe {
         x3f_get_camf_matrix(
             x3f,
@@ -5287,8 +5316,12 @@ unsafe fn get_image_impl(
                         let mut listed_note = "none";
                         let mut listed_fnv = 0_u64;
                         let mut listed_count = 0_usize;
+                        // The native burst gate from PROP BURST: the
+                        // as-shot values 0 and 1 of both references
+                        // exclude BurstExposureAdjust.
+                        let burst_included = merrill_burst_exposure_adjust_included(x3f);
                         if let Ok(Some((repair, records))) =
-                            merrill_listed_repair(x3f, true, control)
+                            merrill_listed_repair(x3f, burst_included, control)
                         {
                             listed_note = "applied";
                             listed_count = records.len();
@@ -6825,20 +6858,24 @@ mod tests {
         }
     }
 
-    /// The ordered float frontend stage (ApplyGains over decoded sensor
-    /// counts) on the two retained SPP reference files. The fixture pins
-    /// the derived DarkShieldTop black, the GatherParams request gain,
-    /// the spatial tables and the gained raster hash. The native agreement
-    /// is compositional: the kernel matches the archived native oracle
-    /// bit-for-bit, the tables match all 53 native tables, and the gain
-    /// order is the reviewed GatherParams @0xb3464 chain. Skips when the
-    /// corpus is absent.
+    /// The ordered float frontend stages (ApplyGains, WB radial shading,
+    /// listed repair, highlight restoration, raster despeckle and
+    /// row/column offset correction) on the two retained SPP reference
+    /// files. The fixture pins the per-stage raster hashes and counts.
+    /// The native agreement is compositional per stage: the kernels
+    /// match their archived oracles and the calibration tables match
+    /// the archived native tables, while the corpus pins are
+    /// self-recorded from this trace (deterministic members of the
+    /// native result family, not native reference outputs). Skips
+    /// with a notice when the corpus is absent. Set
+    /// X3F_FLOAT_FRONT_REGEN to print the computed rows instead of
+    /// comparing, to re-pin after an intentional stage change.
     #[test]
     fn merrill_float_gain_front_matches_reference_fixtures() {
         use crate::process::{
-            merrill_cr_offset, merrill_despeckle, merrill_float_gain_front,
-            merrill_highlight_restoration, merrill_listed_repair, merrill_radial_shading,
-            merrill_rects,
+            merrill_burst_exposure_adjust_included, merrill_cr_offset, merrill_despeckle,
+            merrill_float_gain_front, merrill_highlight_restoration, merrill_listed_repair,
+            merrill_radial_shading, merrill_rects,
         };
         use crate::{
             x3f_area16_t, x3f_delete, x3f_get_camf, x3f_get_raw, x3f_image_area, x3f_load_data,
@@ -6849,6 +6886,7 @@ mod tests {
             .unwrap_or_else(|| {
                 std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../x3f_test_files")
             });
+        let regen = std::env::var_os("X3F_FLOAT_FRONT_REGEN").is_some();
         let mut checked = 0;
         for line in include_str!("../tests/fixtures/merrill-float-front.tsv")
             .lines()
@@ -6857,30 +6895,6 @@ mod tests {
             let fields: Vec<_> = line.split('\t').collect();
             assert_eq!(fields.len(), 23, "{line}");
             let name = fields[0];
-            let cols: usize = fields[1].parse().unwrap();
-            let rows: usize = fields[2].parse().unwrap();
-            let black: [u64; 3] = std::array::from_fn(|c| {
-                u64::from_str_radix(fields[3].split(',').nth(c).unwrap(), 16).unwrap()
-            });
-            let gain: [u64; 3] = std::array::from_fn(|c| {
-                u64::from_str_radix(fields[4].split(',').nth(c).unwrap(), 16).unwrap()
-            });
-            let spatial: bool = fields[5] == "1";
-            let expected: u64 = u64::from_str_radix(fields[6], 16).unwrap();
-            let radial_expected: bool = fields[7] == "1";
-            let radial_fnv: u64 = u64::from_str_radix(fields[8], 16).unwrap();
-            let listed_count: usize = fields[9].parse().unwrap();
-            let listed_fnv: u64 = u64::from_str_radix(fields[10], 16).unwrap();
-            let highlight_expected: bool = fields[11] == "1";
-            let highlight_fnv: u64 = u64::from_str_radix(fields[12], 16).unwrap();
-            let sat_marks: [usize; 3] = std::array::from_fn(|c| fields[13 + c].parse().unwrap());
-            let despeckle_expected: bool = fields[16] == "1";
-            let despeckle_records: usize = fields[17].parse().unwrap();
-            let despeckle_fnv: u64 = u64::from_str_radix(fields[18], 16).unwrap();
-            let offset_expected: bool = fields[19] == "1";
-            let offset_accepted: u32 = fields[20].parse().unwrap();
-            let offset_fnv: u64 = u64::from_str_radix(fields[21], 16).unwrap();
-            let offset_iso_bits: u32 = u32::from_str_radix(fields[22], 16).unwrap();
             let path = root.join(name);
             if !path.exists() {
                 continue;
@@ -6901,12 +6915,8 @@ mod tests {
                 // property list; the fixture reproduces that choice.
                 let wb = crate::x3f_get_wb(x3f);
                 let front = merrill_float_gain_front(x3f, wb, true, Control::none()).unwrap();
-                assert_eq!(front.black().map(f64::to_bits), black, "{name} black");
-                assert_eq!(front.gain().map(f64::to_bits), gain, "{name} gain");
-                assert_eq!(front.spatial().is_some(), spatial, "{name} spatial");
                 let mut area: x3f_area16_t = std::mem::zeroed();
                 assert_ne!(x3f_image_area(x3f, &mut area), 0);
-                assert_eq!((area.columns as usize, area.rows as usize), (cols, rows));
                 let decoded = std::slice::from_raw_parts(
                     area.data,
                     area.rows as usize * area.row_stride as usize,
@@ -6920,13 +6930,36 @@ mod tests {
                         Control::none(),
                     )
                     .unwrap();
-                assert_eq!(
-                    crate::float_front::fnv1a_f32(&gained),
-                    expected,
-                    "{name} fnv"
+                // Computed fixture row: name, then columns 2 to 23.
+                let mut row: Vec<String> = vec![
+                    name.to_string(),
+                    area.columns.to_string(),
+                    area.rows.to_string(),
+                ];
+                row.push(
+                    front
+                        .black()
+                        .iter()
+                        .map(|v| format!("{:016x}", v.to_bits()))
+                        .collect::<Vec<_>>()
+                        .join(","),
                 );
-                let radial = merrill_radial_shading(x3f, wb, Control::none()).unwrap_or(None);
-                assert_eq!(radial.is_some(), radial_expected, "{name} radial presence");
+                row.push(
+                    front
+                        .gain()
+                        .iter()
+                        .map(|v| format!("{:016x}", v.to_bits()))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+                row.push(u8::from(front.spatial().is_some()).to_string());
+                row.push(format!("{:016x}", crate::float_front::fnv1a_f32(&gained)));
+                let radial = merrill_radial_shading(x3f, wb, Control::none());
+                // A present radial table applies natively; an error
+                // must not pass as the native skip.
+                assert!(radial.is_ok(), "{name} radial resolution");
+                let radial = radial.unwrap();
+                row.push(u8::from(radial.is_some()).to_string());
                 if let Some(radial) = radial {
                     radial
                         .apply(
@@ -6938,64 +6971,39 @@ mod tests {
                         )
                         .unwrap();
                 }
-                assert_eq!(
-                    crate::float_front::fnv1a_f32(&gained),
-                    radial_fnv,
-                    "{name} radial fnv"
-                );
-                // Stage 3: listed repair from the camera list with the
-                // native badness selection (BurstExposureAdjust included).
-                let (repair, records) = merrill_listed_repair(x3f, true, Control::none())
+                row.push(format!("{:016x}", crate::float_front::fnv1a_f32(&gained)));
+                // Stage 3: listed repair with the native PROP BURST
+                // gate. Both references are ordinary as-shot (BURST
+                // 0 and 1), so BurstExposureAdjust is excluded.
+                let burst_included = merrill_burst_exposure_adjust_included(x3f);
+                assert!(!burst_included, "{name} as-shot burst gate");
+                let listed = merrill_listed_repair(x3f, burst_included, Control::none())
                     .unwrap()
                     .expect("badness calibration present");
-                assert_eq!(records.len(), listed_count, "{name} listed record count");
-                if !records.is_empty() {
-                    repair
+                row.push(listed.1.len().to_string());
+                if !listed.1.is_empty() {
+                    listed
+                        .0
                         .apply(
                             &mut gained,
                             area.columns as usize,
                             area.rows as usize,
                             area.row_stride as usize,
-                            &records,
+                            &listed.1,
                             &[],
                             Control::none(),
                         )
                         .unwrap();
                 }
-                assert_eq!(
-                    crate::float_front::fnv1a_f32(&gained),
-                    listed_fnv,
-                    "{name} listed fnv"
-                );
+                row.push(format!("{:016x}", crate::float_front::fnv1a_f32(&gained)));
                 // Stage 4: highlight restoration from the camera
-                // saturation maps with the native badness-independent
-                // ExpEstimate or ExpNet threshold.
+                // saturation maps.
                 let (active, keep, col_range) = merrill_rects(x3f).unwrap();
                 let highlight =
                     merrill_highlight_restoration(x3f, active, keep, col_range, Control::none())
                         .unwrap();
-                assert_eq!(
-                    highlight.is_some(),
-                    highlight_expected,
-                    "{name} highlight presence"
-                );
+                row.push(u8::from(highlight.is_some()).to_string());
                 if let Some(highlight) = &highlight {
-                    // Raw decoded mark counts per channel, before the
-                    // cleanup pass: pinned to the archived corpus
-                    // inventory (followup-native-highlight/
-                    // corpus-inputs.json).
-                    let pixels = area.columns as usize * area.rows as usize;
-                    for channel in 0..3 {
-                        let marks = (0..pixels)
-                            .filter(|&pixel| highlight.sat[3 * pixel + channel] != 0)
-                            .count();
-                        assert_eq!(
-                            marks, sat_marks[channel],
-                            "{name} SatMap marks channel {channel}"
-                        );
-                    }
-                }
-                if let Some(highlight) = highlight {
                     let mut dense = vec![0_u8; area.columns as usize * area.rows as usize];
                     let mut sat = highlight.sat.clone();
                     highlight
@@ -7011,21 +7019,25 @@ mod tests {
                             Control::none(),
                         )
                         .unwrap();
+                    // Fixture order: the post-highlight hash, then the
+                    // raw decoded mark counts per channel.
+                    row.push(format!("{:016x}", crate::float_front::fnv1a_f32(&gained)));
+                    let pixels = area.columns as usize * area.rows as usize;
+                    for channel in 0..3 {
+                        let marks = (0..pixels)
+                            .filter(|&pixel| highlight.sat[3 * pixel + channel] != 0)
+                            .count();
+                        row.push(marks.to_string());
+                    }
+                } else {
+                    row.push(format!("{:016x}", crate::float_front::fnv1a_f32(&gained)));
+                    row.extend((0..3).map(|_| "0".to_string()));
                 }
-                assert_eq!(
-                    crate::float_front::fnv1a_f32(&gained),
-                    highlight_fnv,
-                    "{name} highlight fnv"
-                );
-                // Stage 5: raster despeckle with the ApplyGains request
-                // gains, the typed DespAdjust default and the request
-                // strength.
+                // Stage 5: raster despeckle with the typed DespAdjust
+                // default ({15,15,5}; the corpus int16 makes the
+                // default apply) and the request strength.
                 let despeckle = merrill_despeckle(x3f, wb, Control::none()).unwrap();
-                assert_eq!(
-                    despeckle.is_some(),
-                    despeckle_expected,
-                    "{name} despeckle presence"
-                );
+                row.push(u8::from(despeckle.is_some()).to_string());
                 if let Some(despeckle) = despeckle {
                     let count = despeckle
                         .apply(
@@ -7036,24 +7048,17 @@ mod tests {
                             Control::none(),
                         )
                         .unwrap();
-                    assert_eq!(count, despeckle_records, "{name} despeckle records");
+                    row.push(count.to_string());
+                } else {
+                    row.push("0".to_string());
                 }
-                assert_eq!(
-                    crate::float_front::fnv1a_f32(&gained),
-                    despeckle_fnv,
-                    "{name} despeckle fnv"
-                );
+                row.push(format!("{:016x}", crate::float_front::fnv1a_f32(&gained)));
                 // Stage 6: row/column chroma offset correction with
                 // the typed CaptureISO, the request gains and the
                 // translated active rect.
                 let offset = merrill_cr_offset(x3f, wb, Control::none()).unwrap();
-                assert_eq!(offset.is_some(), offset_expected, "{name} offset presence");
+                row.push(u8::from(offset.is_some()).to_string());
                 if let Some(offset) = offset {
-                    assert_eq!(
-                        offset.iso.to_bits(),
-                        offset_iso_bits,
-                        "{name} CaptureISO bits"
-                    );
                     let stats = crate::cr_offset::correct(
                         &mut gained,
                         area.columns as usize,
@@ -7065,18 +7070,23 @@ mod tests {
                         Control::none(),
                     )
                     .unwrap();
-                    assert_eq!(
-                        stats.accepted, offset_accepted,
-                        "{name} offset accepted patches"
-                    );
+                    row.push(stats.accepted.to_string());
+                    row.push(format!("{:016x}", crate::float_front::fnv1a_f32(&gained)));
+                    row.push(format!("{:08x}", offset.iso.to_bits()));
+                } else {
+                    row.push("0".to_string());
+                    row.push(format!("{:016x}", crate::float_front::fnv1a_f32(&gained)));
+                    row.push("00000000".to_string());
                 }
-                assert_eq!(
-                    crate::float_front::fnv1a_f32(&gained),
-                    offset_fnv,
-                    "{name} offset fnv"
-                );
                 x3f_delete(x3f);
                 libc::fclose(file);
+                if regen {
+                    println!("{}", row.join("\t"));
+                } else {
+                    for (column, (actual, expected)) in row.iter().zip(fields.iter()).enumerate() {
+                        assert_eq!(actual, expected, "{name} column {}", column + 1);
+                    }
+                }
             }
             checked += 1;
         }

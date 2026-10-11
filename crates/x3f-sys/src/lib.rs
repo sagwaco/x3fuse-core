@@ -180,15 +180,19 @@ pub use image::{
 // in (1/aperture, lens-position) space, builds bilinear weights, and
 // either keeps the raw tables for on-the-fly combination via
 // `x3f_calc_spatial_gain` or pre-interpolates a dense table per channel.
-pub mod cr_offset;
-pub mod float_front;
 mod spatial_gain;
-pub mod spp_denoise;
 pub use spatial_gain::{
     x3f_calc_spatial_gain, x3f_cleanup_spatial_gain, x3f_get_classic_spatial_gain,
     x3f_get_interp_merrill_type_spatial_gain, x3f_get_merrill_type_spatial_gain,
     x3f_get_spatial_gain,
 };
+
+// Research modules for the ordered Merrill float frontend (stages 1
+// to 7c) and the SPP denoise preparation kernels (stage 7b/7c):
+// crate-private, not part of the stable library API.
+pub(crate) mod cr_offset;
+pub(crate) mod float_front;
+pub(crate) mod spp_denoise;
 
 // M6e: incremental native Rust port of src/x3f_process.c. M6e1 lifts
 // the color math accessors (x3f_get_gain, x3f_get_bmt_to_xyz,

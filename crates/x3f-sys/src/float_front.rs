@@ -16,6 +16,10 @@ use crate::Control;
 /// One channel of the spatial gain table. `values` is row-major with
 /// `rows` rows and `columns` knots per row. The CAMF builders in
 /// `spatial_gain.rs` produce this layout.
+///
+/// A hand-built table with public fields bypasses the `new`
+/// shape checks; `apply_gains` indexes `values` unchecked, and
+/// panics on a shape mismatch.
 #[derive(Clone, Debug)]
 pub struct GainTable {
     pub values: Vec<f32>,
@@ -38,15 +42,17 @@ impl GainTable {
     }
 }
 
-/// FNV-1a over the little-endian bytes of the f32 raster. Matches the
-/// archived native-oracle hashes (`followup-float-preprocess`).
+/// FNV-1a over the little-endian f32 bits of the raster (the
+/// recorded hashes use `to_le_bytes` order; this platform is
+/// little-endian). Matches the archived native-oracle hashes
+/// (`followup-float-preprocess`).
 pub(crate) fn fnv1a_f32(values: &[f32]) -> u64 {
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4) };
     let mut hash = 0xcbf29ce484222325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+    for value in values {
+        for byte in value.to_bits().to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
     }
     hash
 }
@@ -73,7 +79,7 @@ pub(crate) fn fnv1a_f32(values: &[f32]) -> u64 {
 ///
 /// Arithmetic (0xa8234..0xa83b4), exact native order:
 /// - Denominator `sqrt(contains_MED ? fma(2*halfY, 2*halfY, halfX*halfX)
-///   : fma(halfY, halfY, halfX*halfX))` — the stretch literal is "MED"
+///   : fma(halfY, halfY, halfX*halfX))`: the stretch literal is "MED"
 ///   (0xa6638), selected at 0xa82b8/0xa8364 with StrStr.
 /// - Per pixel `dx = x - centerX`, `dy = y - centerY`,
 ///   `r2 = sqrt(stretch ? fma(2dy, 2dy, dx*dx) : fma(dy, dy, dx*dx)) /
@@ -676,9 +682,11 @@ impl HighlightRestoration {
                     let index = Self::bin((a * 255.0) / (a + b));
                     c = (b * lut[index]).min(32767.0);
                 }
-                // Neutralization over the sorted current channels.
+                // Neutralization over the sorted current channels
+                // (total_cmp: the pub function must not panic on a
+                // non-finite sample).
                 let mut sorted = [a, b, c];
-                sorted.sort_by(|p, q| p.partial_cmp(q).unwrap().reverse());
+                sorted.sort_by(|p, q| p.total_cmp(q).reverse());
                 let hi = f64::from(sorted[0]);
                 let mid = f64::from(sorted[1]);
                 let lo = f64::from(sorted[2]);
@@ -1060,7 +1068,10 @@ impl FloatFront {
             return Err(Error::InvalidData("invalid Merrill float image layout"));
         }
         let mut data = Vec::with_capacity(decoded.len());
-        // u16 to f32 is exact: every u16 value is representable in f32.
+        // u16 to f32 is exact: every u16 value is representable in
+        // f32. Native sign-extends the 16-bit sample before the
+        // float conversion; the result is identical for valid
+        // 0..4095 sensor data (recorded in the stage 1 notes).
         data.extend(decoded.iter().map(|&v| f32::from(v)));
         let refs: [Option<&GainTable>; 3] = match &self.spatial {
             None => [None, None, None],
@@ -1275,10 +1286,10 @@ mod tests {
     fn radial_factors_match_instruction_reference() {
         // The docs' DP2 HI example: native center (2416, 1604) and
         // half-extents (2400, 1600). valid.top = 4, valid.bottom = 3204
-        // (activeMinusKeep.top 36 - 32 margin; 3236 + 32 - keep-relative
+        // (activeMinusKeep.top 36 - 32 margin; 3172 + 32 - keep-relative
         // already applied), valid.left = 16, valid.right = 4816.
         // minus_keep[1] = active.top - keep.top = 36, minus_keep[3] =
-        // active.bottom - keep.top = 3236.
+        // active.bottom - keep.top = 3172.
         let active = [0, 68, 0, 3204];
         let keep = [0, 32, 0, 32];
         let col_range = [0, 10, 4824, 0];

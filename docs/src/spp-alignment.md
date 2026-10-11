@@ -274,21 +274,27 @@ unchanged; no new image-quality or full-pipeline parity result is claimed.
 
 - The front end still stores normalized uint16 intermediates. Sigma uses float
   gained counts; reversing normalization cannot restore lost precision. The
-  ordered float frontend is under construction in core. Stage 1 (ApplyGains:
-  black, GatherParams request gain, native spatial tables) is verified against
-  a native composition oracle bit-for-bit on both retained references. Stage 2
-  (WB radial shading: ValidPixRect geometry, MED stretch, native FMA order)
-  is instruction-replay verified and pinned by the corpus fixture; the SD1
-  CAMF omits the shading entries, and the stage mirrors that native skip.
-  Stage 3 (listed bad-pixel repair) reconstructs `ReplaceBadPixelsF20`:
-  the kernel matches the archived native oracle bit-for-bit, the badness
-  selection is validated on all 53 CAMFs, and the wired record counts match
-  the corpus inventory exactly (143,827 DP2 / 180,863 SD1)
-  (`x3f-docs/spp-rgb-trace/followup-float-front-wiring/`).
-  `X3F_FLOAT_FRONT_TRACE` is the research dump. The remaining ordered stages
-  (highlight restoration, despeckle, offset correction) and the float
-  denoise consumer remain open; the normalized uint16 path stays the
-  default.
+  ordered float frontend is under construction in core. Verified stages:
+  stage 1 (ApplyGains: black, GatherParams request gain, native spatial
+  tables) against a native composition oracle on both retained references;
+  stage 2 (WB radial shading: ValidPixRect geometry, MED stretch, native FMA
+  order) by instruction replay and corpus fixture; stage 3 (listed
+  bad-pixel repair) reconstructs `ReplaceBadPixelsF20` with the badness
+  selection validated on all 53 CAMFs and the native PROP BURST gate; stages
+  4 (highlight restoration), 5 (raster despeckle) and 6 (row/column offset
+  correction, with an embedded SVD port) by archived C++ oracle replay;
+  stages 7b/7c (SPP denoise preparation kernels and resample geometry)
+  against the native library. Per-stage verification is compositional:
+  kernels match their archived oracles, and corpus pins are self-recorded
+  from the trace (deterministic members of the native result family, not
+  native reference outputs); see
+  `x3f-docs/spp-rgb-trace/followup-float-front-wiring/` and
+  `followup-tiled-denoise/`. `X3F_FLOAT_FRONT_TRACE` is the research dump.
+  Open items: the ordered native stages that the trace drops (the
+  Jpeg_BadClusters list, the DetectBadReds list and overrides, packed-
+  cluster repair), per-stage pixel pins for stages 2 to 5 that use native
+  buffers, and the float denoise consumer. The normalized uint16 path stays
+  the default.
   Red detection, listed/packed repair and badness arithmetic now have bounded
   executable evidence. Offset correction now has an independent SVD and passes
   disjoint wrapper checks. Integration must define deterministic accumulation

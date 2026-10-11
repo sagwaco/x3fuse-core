@@ -204,8 +204,10 @@ Tunables like `X3F_NO_CHROMA_LUT`, `X3F_REPAIR_PIX`, `X3F_EV`,
 `X3F_RUST_DECODE` keep working when ported to a typed config. Read
 existing names through `from_env()`-style adapters; don't break them
 without a deprecation cycle. `X3F_FLOAT_FRONT_TRACE` prints the ordered
-float stage (ApplyGains over decoded sensor counts) black/gain bits and
-the gained raster hash to stderr before normalization; it is a research
+float research stages (ApplyGains, WB radial shading, listed repair,
+highlight restoration, raster despeckle and row/column offset
+correction) per-stage raster hashes and counts to stderr before
+normalization; it is a research
 dump and never changes output pixels.
 
 ### FFI ABI stability across half-ported modules

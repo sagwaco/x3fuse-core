@@ -1520,10 +1520,10 @@ mod tests {
         let mut image2 = vec![100.0_f32; stride * height];
         final_apply(&mut image2, stride, &accum, &counts, iso_high, gains, rect);
         assert!((at2(&image2, stride, 30, 8) - (100.0 - 45.0 / 21.0)).abs() < 1.0e-6);
-        // Channel 2 at row 40: bound 0.5*1.2 (promoted) - offset
-        // accumulates from channel values, so this checks the
-        // per-channel bounds independently.
-        let _ = 0.0;
+        // Channel 2's bound (0.5 * the promoted 1.2) is not pinned
+        // here: the accumulator shares channels across columns, so
+        // an independent per-channel bound check needs a dedicated
+        // fixture (open item in the stage 6 checkpoint notes).
     }
 
     fn at2(image: &[f32], stride: usize, row: usize, column: usize) -> f32 {
