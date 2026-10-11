@@ -2517,6 +2517,127 @@ pub(crate) unsafe fn merrill_highlight_restoration(
     }))
 }
 
+/// The despeckle request strength (request+0x100). The manager copies
+/// GatherParams field+0x14 to request+0x100; SetUpNoiseParams blends
+/// the CAMF ISONoiseSettings column 1 when the camfile version is 3,
+/// else the static resolution table. The archived static proof pins
+/// column 1 to exactly 1.0 in every row of all 53 corpus CAMFs, which
+/// makes the blend exactly 1.0f for every interpolation fraction, and
+/// the static HI table is all 1.0. Non-constant columns and the
+/// MED/LOW static tables need the un-reconstructed ISO lookup and
+/// stay outside the verified contract. The supported corpus models
+/// are all camfile version 3 (the same model mapping the request
+/// gain uses).
+unsafe fn merrill_despeckle_strength(x3f: *mut x3f_t) -> crate::Result<f32> {
+    let mut dim0: libc::c_int = 0;
+    let mut dim1: libc::c_int = 0;
+    let mut table: *mut f64 = ptr::null_mut();
+    let found = unsafe {
+        x3f_get_camf_matrix_var(
+            x3f,
+            c"ISONoiseSettings".as_ptr() as *mut _,
+            &mut dim0,
+            &mut dim1,
+            ptr::null_mut(),
+            matrix_type_t_M_FLOAT,
+            &mut table as *mut *mut f64 as *mut *mut libc::c_void,
+        ) != 0
+    };
+    if found {
+        let rows = dim0.max(0) as usize;
+        let columns = dim1.max(0) as usize;
+        let Some(elements) = rows.checked_mul(columns) else {
+            return Err(crate::Error::InvalidData("invalid Merrill noise table"));
+        };
+        if rows == 0 || columns < 2 {
+            return Err(crate::Error::InvalidData("invalid Merrill noise table"));
+        }
+        let values = unsafe { std::slice::from_raw_parts(table, elements) };
+        // Constant column 1: the blend is exactly 1.0f for every t.
+        if (0..rows).any(|row| values[row * columns + 1] != 1.0) {
+            return Err(crate::Error::InvalidData(
+                "unverified Merrill despeckle strength",
+            ));
+        }
+        Ok(1.0)
+    } else {
+        let resolution = unsafe { merrill_resolution_string(x3f) };
+        if resolution.contains("HI") {
+            Ok(1.0)
+        } else {
+            Err(crate::Error::InvalidData(
+                "unverified Merrill despeckle strength",
+            ))
+        }
+    }
+}
+
+/// Stage 5 of the ordered float frontend: raster despeckle. Reads the
+/// ApplyGains request gains, the typed float DespAdjust vector (the
+/// strict getter ignores the corpus's int16 entry, so the default
+/// 15,15,5 applies on every corpus file), the request strength and
+/// the translated active rect. Skips when SkipStepFlags bit 14 is
+/// set (the native bit also skips the following CROffsetCorrection
+/// state, which is stage 6).
+pub(crate) unsafe fn merrill_despeckle(
+    x3f: *mut x3f_t,
+    wb: *mut libc::c_char,
+    control: Control<'_>,
+) -> crate::Result<Option<crate::float_front::Despeckle>> {
+    control.check()?;
+    let mut skip = 0_u32;
+    unsafe {
+        x3f_get_camf_unsigned(x3f, c"SkipStepFlags".as_ptr().cast_mut(), &mut skip);
+    }
+    if skip & (1 << 14) != 0 {
+        return Ok(None);
+    }
+    // The gain triple is the same ApplyGains request gain; an
+    // unsupported model path cannot derive it, so the stage skips.
+    let Some(gain) = (unsafe { merrill_request_gain(x3f, wb, control) }) else {
+        return Ok(None);
+    };
+    // GetFColorFloatFromCamfile("DespAdjust", {15,15,5}): typed float
+    // 1-D [3] lookup; the corpus stores int16, so the default applies.
+    let mut adjust = [15.0_f64; 3];
+    unsafe {
+        x3f_get_camf_matrix(
+            x3f,
+            c"DespAdjust".as_ptr() as *mut _,
+            3,
+            0,
+            0,
+            matrix_type_t_M_FLOAT,
+            adjust.as_mut_ptr().cast(),
+        );
+    }
+    let strength = unsafe { merrill_despeckle_strength(x3f)? };
+    let adjust = std::array::from_fn(|channel| adjust[channel] * f64::from(strength));
+    // ActiveImageArea translated by KeepImageArea left/top (0xa5e44):
+    // not the ValidPixRect the radial and highlight stages use.
+    let (active, keep, _col_range) = unsafe { merrill_rects(x3f)? };
+    let translated = [
+        active[0] - keep[0],
+        active[1] - keep[1],
+        active[2] - keep[0],
+        active[3] - keep[1],
+    ];
+    if translated.iter().any(|&v| v < 0) {
+        return Err(crate::Error::InvalidData(
+            "invalid Merrill despeckle rectangle",
+        ));
+    }
+    let rect = [
+        translated[0] as u32,
+        translated[1] as u32,
+        translated[2] as u32,
+        translated[3] as u32,
+    ];
+    Ok(Some(crate::float_front::Despeckle::new(
+        gain, adjust, rect,
+    )?))
+}
+
 unsafe fn merrill_wb_gain(x3f: *mut x3f_t, wb: *mut libc::c_char) -> Option<[f64; 3]> {
     let mut gain = [0.0; 3];
     if unsafe {
@@ -5172,8 +5293,28 @@ unsafe fn get_image_impl(
                                 }
                             }
                         }
+                        // Stage 5: raster despeckle from the detected
+                        // speckle list with the native request gains,
+                        // the typed DespAdjust default and the request
+                        // strength. SkipStepFlags bit 14 gates it.
+                        let mut despeckle_note = "none";
+                        let mut despeckle_records = 0_usize;
+                        let mut despeckle_fnv = highlight_fnv;
+                        if let Ok(Some(despeckle)) = merrill_despeckle(x3f, wb, control) {
+                            if let Ok(count) = despeckle.apply(
+                                &mut gained,
+                                trace.columns as usize,
+                                trace.rows as usize,
+                                trace.row_stride as usize,
+                                control,
+                            ) {
+                                despeckle_note = "applied";
+                                despeckle_records = count;
+                                despeckle_fnv = crate::float_front::fnv1a_f32(&gained);
+                            }
+                        }
                         eprintln!(
-                            "X3F float front: {}x{} black={:x?} gain={:x?} spatial={} fnv1a={:016x} radial={} radial_fnv1a={:016x} listed={} listed_count={} listed_fnv1a={:016x} highlight={} donors={} removed={} occupied={} dense={} lut={} highlight_fnv1a={:016x}",
+                            "X3F float front: {}x{} black={:x?} gain={:x?} spatial={} fnv1a={:016x} radial={} radial_fnv1a={:016x} listed={} listed_count={} listed_fnv1a={:016x} highlight={} donors={} removed={} occupied={} dense={} lut={} highlight_fnv1a={:016x} despeckle={} despeckle_records={} despeckle_fnv1a={:016x}",
                             trace.columns,
                             trace.rows,
                             [black[0].to_bits(), black[1].to_bits(), black[2].to_bits()],
@@ -5191,7 +5332,10 @@ unsafe fn get_image_impl(
                             highlight_stats.occupied,
                             highlight_stats.dense_pixels,
                             highlight_stats.have_lut,
-                            highlight_fnv
+                            highlight_fnv,
+                            despeckle_note,
+                            despeckle_records,
+                            despeckle_fnv
                         );
                     }
                 }
@@ -6611,8 +6755,8 @@ mod tests {
     #[test]
     fn merrill_float_gain_front_matches_reference_fixtures() {
         use crate::process::{
-            merrill_float_gain_front, merrill_highlight_restoration, merrill_listed_repair,
-            merrill_radial_shading, merrill_rects,
+            merrill_despeckle, merrill_float_gain_front, merrill_highlight_restoration,
+            merrill_listed_repair, merrill_radial_shading, merrill_rects,
         };
         use crate::{
             x3f_area16_t, x3f_delete, x3f_get_camf, x3f_get_raw, x3f_image_area, x3f_load_data,
@@ -6629,7 +6773,7 @@ mod tests {
             .filter(|line| !line.starts_with('#'))
         {
             let fields: Vec<_> = line.split('\t').collect();
-            assert_eq!(fields.len(), 16, "{line}");
+            assert_eq!(fields.len(), 19, "{line}");
             let name = fields[0];
             let cols: usize = fields[1].parse().unwrap();
             let rows: usize = fields[2].parse().unwrap();
@@ -6648,6 +6792,9 @@ mod tests {
             let highlight_expected: bool = fields[11] == "1";
             let highlight_fnv: u64 = u64::from_str_radix(fields[12], 16).unwrap();
             let sat_marks: [usize; 3] = std::array::from_fn(|c| fields[13 + c].parse().unwrap());
+            let despeckle_expected: bool = fields[16] == "1";
+            let despeckle_records: usize = fields[17].parse().unwrap();
+            let despeckle_fnv: u64 = u64::from_str_radix(fields[18], 16).unwrap();
             let path = root.join(name);
             if !path.exists() {
                 continue;
@@ -6783,6 +6930,32 @@ mod tests {
                     crate::float_front::fnv1a_f32(&gained),
                     highlight_fnv,
                     "{name} highlight fnv"
+                );
+                // Stage 5: raster despeckle with the ApplyGains request
+                // gains, the typed DespAdjust default and the request
+                // strength.
+                let despeckle = merrill_despeckle(x3f, wb, Control::none()).unwrap();
+                assert_eq!(
+                    despeckle.is_some(),
+                    despeckle_expected,
+                    "{name} despeckle presence"
+                );
+                if let Some(despeckle) = despeckle {
+                    let count = despeckle
+                        .apply(
+                            &mut gained,
+                            area.columns as usize,
+                            area.rows as usize,
+                            area.row_stride as usize,
+                            Control::none(),
+                        )
+                        .unwrap();
+                    assert_eq!(count, despeckle_records, "{name} despeckle records");
+                }
+                assert_eq!(
+                    crate::float_front::fnv1a_f32(&gained),
+                    despeckle_fnv,
+                    "{name} despeckle fnv"
                 );
                 x3f_delete(x3f);
                 libc::fclose(file);

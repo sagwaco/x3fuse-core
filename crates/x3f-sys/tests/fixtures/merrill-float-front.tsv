@@ -4,7 +4,9 @@
 # <TAB> radial applied <TAB> post-radial fnv1a <TAB> listed records
 # <TAB> post-listed fnv1a <TAB> highlight applied <TAB> post-highlight
 # fnv1a <TAB> decoded SatMapR marks <TAB> SatMapG marks <TAB> SatMapB
-# marks (raw decode, before cleanup; archived inventory values).
+# marks (raw decode, before cleanup; archived inventory values)
+# <TAB> despeckle applied <TAB> despeckle records <TAB> post-despeckle
+# fnv1a.
 # Stage 1 is native-oracle verified bit-for-bit; stage 2 is
 # instruction-replay verified (the SD1 CAMF omits the shading list, so
 # native skips radial for it); stage 3 (listed repair from the camera
@@ -18,6 +20,12 @@
 # the real-file raster hash plus the archived raw mark counts
 # (followup-native-highlight/corpus-inputs.json). The SD1 maps are
 # present but empty, so its neutralization is the identity (same fnv as
-# stage 3). Sources: spp-rgb-trace/followup-float-front-wiring/.
-sigma_sd1_merrill_15.x3f	4928	3264	402f706cda635676,402f6842bde221ac,402f7c526ccd29e6	40110883f2211dde,40002c42c56a345d,3ff24fcac9745d17	1	b9d43d1a54d46ec8	0	b9d43d1a54d46ec8	180863	d77ced3fd8990241	1	d77ced3fd8990241	0	0	0
-_P2M0358.X3F	4928	3264	403f8d1b582eaac5,403f6597e0a3ba81,403fac6b03e51270	4013cedf28a33e34,400284437855da00,3ff64b2768000000	1	4647cf03161f2772	1	62d1b444342f5737	143827	12be0246296d84d4	1	1de711802df3b37d	2	10039	395621
+# stage 3). Stage 5 (raster despeckle from the detected speckle list
+# with the ApplyGains request gains, the typed DespAdjust default and
+# the request strength) ports the archived native oracle
+# (followup-despeckle/check_native.cpp; its 7 detector cases, 4
+# wrapper cases, LUT endpoints and wheel probes are reproduced by the
+# float_front unit tests) and pins the real-file record counts and
+# raster hashes. Sources: spp-rgb-trace/followup-float-front-wiring/.
+sigma_sd1_merrill_15.x3f	4928	3264	402f706cda635676,402f6842bde221ac,402f7c526ccd29e6	40110883f2211dde,40002c42c56a345d,3ff24fcac9745d17	1	b9d43d1a54d46ec8	0	b9d43d1a54d46ec8	180863	d77ced3fd8990241	1	d77ced3fd8990241	0	0	0	1	1244	42113215b8987d7c
+_P2M0358.X3F	4928	3264	403f8d1b582eaac5,403f6597e0a3ba81,403fac6b03e51270	4013cedf28a33e34,400284437855da00,3ff64b2768000000	1	4647cf03161f2772	1	62d1b444342f5737	143827	12be0246296d84d4	1	1de711802df3b37d	2	10039	395621	1	1033	d6ee545d730081c4

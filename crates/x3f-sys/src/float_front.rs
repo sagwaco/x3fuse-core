@@ -224,7 +224,7 @@ impl RadialShading {
 /// `FBadPixel_F20`: row, column, then a packed u16 flags word
 /// (bits 0..7 neighbor mask, bits 8..11 badness, bits 12..14 channel
 /// mask C0=4/C1=2/C2=1).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BadPixelRecord {
     pub row: u16,
     pub column: u16,
@@ -255,6 +255,17 @@ impl ListedRepair {
             } else {
                 badness.wrapping_sub(offset)
             },
+        }
+    }
+
+    /// Construct with the final badness minimum directly. Native
+    /// `ReplaceBadPixelsF20` takes the caller-computed minimum as its
+    /// fourth argument: the listed path derives it from the selected
+    /// label and BPBadnessOffset, while the despeckle caller passes
+    /// the constant 3.
+    fn from_minimum(minimum: u32) -> Self {
+        Self {
+            minimum_badness: minimum,
         }
     }
 
@@ -694,6 +705,285 @@ impl HighlightRestoration {
             }
         }
         Ok(stats)
+    }
+}
+
+/// Stage 5 of the ordered float frontend: raster despeckle, the scalar
+/// reconstruction of the native `DespeckleRas` wrapper (0x4a62c) with
+/// the `DetectSpecklesRas` detector (0x49ac8), the `DoThreadedPix`
+/// eight-way row split (0x62f48) and the mode-3 `ReplaceBadPixelsF20`
+/// correction (native fourth argument 3 at 0x4aa30). Verified against
+/// the archived native oracle (x3f-docs
+/// `followup-despeckle/check_native.cpp`): 7 detector cases / 66,876
+/// records exactly equal in count, order and flags, every LUT index
+/// 0..4095 in all three channels straddled by nextafter probes on both
+/// threshold boundaries, 2,597 mode-3 correction cases and 4 full
+/// wrapper buffers byte-identical including row padding.
+///
+/// `gain` is the ApplyGains request gain triple (spatial factors
+/// already changed the pixels), `adjust` is the typed CAMF `DespAdjust`
+/// vector (default 15,15,5) scaled by the request strength, and `rect`
+/// is ActiveImageArea translated by KeepImageArea's left/top, not the
+/// ValidPixRect. The detector reads only the rect's left/top words.
+#[derive(Clone, Debug)]
+pub struct Despeckle {
+    lut: [[f32; 4096]; 3],
+    rect: [u32; 4],
+}
+
+impl Despeckle {
+    /// Native LUT construction (0x49c6c): 4096 float thresholds per
+    /// channel with explicit double fma and the exact native double
+    /// constants (channel-B terms are exact doubles of rounded floats).
+    /// The thresholds are float32 sample-count differences.
+    fn make_lut(gain: [f64; 3], adjust: [f64; 3]) -> Result<[[f32; 4096]; 3]> {
+        const K: [u64; 3] = [
+            0x3d08_c511_7a7e_165e,
+            0x3d00_e374_a4f8_e0b4,
+            0x3cec_d2b2_97d8_89bc,
+        ];
+        const B: [u64; 3] = [
+            0x3ea5_798e_e000_0000,
+            0x3eab_2dd8_e000_0000,
+            0x3e65_798e_e000_0000,
+        ];
+        const C1: u64 = 0x3f36_6666_6666_6666;
+        const C2: u64 = 0x3c04_8ad3_caef_e280;
+        const C3: u64 = 0x3c07_9ca1_0c92_4223;
+        const C4: u64 = 0x3fe8_3886_594a_f4f1;
+        let mut lut = [[0.0_f32; 4096]; 3];
+        for channel in 0..3 {
+            for index in 0..4096 {
+                let a = f64::from((f64::from_bits(K[channel]) / gain[channel]) as f32);
+                let mut t = ((f64::from(index as f32) * f64::from_bits(C1)) * a
+                    / f64::from_bits(C2)) as f32;
+                t = t.sqrt();
+                t = ((f64::from(t) * f64::from_bits(C3)) / a) as f32;
+                let inner = f64::from(t).mul_add(
+                    f64::from(t) * f64::from_bits(C4),
+                    f64::from_bits(B[channel]),
+                );
+                let mut u = inner.sqrt() as f32;
+                u *= adjust[channel] as f32;
+                u *= 4096.0_f32;
+                lut[channel][index] = (f64::from(u) / 1.4) as f32;
+            }
+        }
+        if lut
+            .iter()
+            .any(|channel| channel.iter().any(|v| !v.is_finite()))
+        {
+            return Err(Error::InvalidData("invalid Merrill despeckle thresholds"));
+        }
+        Ok(lut)
+    }
+
+    /// Build the stage from the request gains, the scaled adjust vector
+    /// and the translated active rect `[left, top, right, bottom]`.
+    pub fn new(gain: [f64; 3], adjust: [f64; 3], rect: [u32; 4]) -> Result<Self> {
+        // The verified domain requires positive finite gains and
+        // non-negative finite adjust values; other inputs reach native
+        // non-finite thresholds.
+        if gain.iter().any(|v| !v.is_finite() || *v <= 0.0)
+            || adjust.iter().any(|v| !v.is_finite() || *v < 0.0)
+        {
+            return Err(Error::InvalidData("invalid Merrill despeckle calibration"));
+        }
+        // The column scan bounds need left >= 5 so the one-pixel
+        // predicate halo stays inside the image; the row bounds depend
+        // on the worker split and are validated per scan against the
+        // effective range.
+        if rect[0] < 5 {
+            return Err(Error::InvalidData("invalid Merrill despeckle rectangle"));
+        }
+        let lut = Self::make_lut(gain, adjust)?;
+        Ok(Self { lut, rect })
+    }
+
+    /// One LUT threshold, for tests and traces.
+    pub fn lut(&self, channel: usize, index: usize) -> f32 {
+        self.lut[channel][index]
+    }
+
+    /// The translated active rect `[left, top, right, bottom]`.
+    pub fn rect(&self) -> [u32; 4] {
+        self.rect
+    }
+
+    /// The per-pixel channel mask (C0 bit 4, C1 bit 2, C2 bit 1) of
+    /// the native predicate: a strict horizontal maximum or minimum
+    /// that clears the cross and diagonal neighbor thresholds. The
+    /// maximum branch clamps the compared sample and the LUT index to
+    /// 4095; the minimum branch compares the original center with an
+    /// index truncated from the center clamped to 0..4095. Equality
+    /// at a threshold fails the strict comparison.
+    fn predicate(&self, data: &[f32], row_stride: usize, x: usize, y: usize) -> u32 {
+        let at = |dx: i32, dy: i32, channel: usize| -> f32 {
+            data[(y as i32 + dy) as usize * row_stride + (x as i32 + dx) as usize * 3 + channel]
+        };
+        let mut mask = 0_u32;
+        for channel in 0..3 {
+            let center = at(0, 0, channel);
+            let left = at(-1, 0, channel);
+            let right = at(1, 0, channel);
+            if center > left && center > right {
+                // Native clamps the compared sample as well as the LUT
+                // index.
+                let center = center.min(4095.0);
+                let threshold = self.lut[channel][(center.max(0.0)) as usize];
+                let cross = left
+                    .max(right)
+                    .max(at(0, -1, channel))
+                    .max(at(0, 1, channel));
+                let diagonal = at(-1, -1, channel)
+                    .max(at(1, -1, channel))
+                    .max(at(-1, 1, channel))
+                    .max(at(1, 1, channel));
+                if center > cross + threshold && center > diagonal + threshold {
+                    mask |= 4 >> channel;
+                }
+            } else if center < left && center < right {
+                let threshold = self.lut[channel][(center.clamp(0.0, 4095.0)) as usize];
+                let cross = left
+                    .min(right)
+                    .min(at(0, -1, channel))
+                    .min(at(0, 1, channel));
+                let diagonal = at(-1, -1, channel)
+                    .min(at(1, -1, channel))
+                    .min(at(-1, 1, channel))
+                    .min(at(1, 1, channel));
+                if center < cross - threshold && center < diagonal - threshold {
+                    mask |= 4 >> channel;
+                }
+            }
+        }
+        mask
+    }
+
+    /// One worker's detection scan over its inclusive row range. The
+    /// native bounds (0x49ac8) read only the rect's first two words:
+    /// rows intersect the worker range through
+    /// `max(top - 4, start) ..= min(height - (top - 4), end)` and
+    /// columns run `left - 4 ..= width - left + 2`; the detector
+    /// stops at 624,999 marks (its 625,000 six-byte segment slots
+    /// minus the four-byte count).
+    fn detect_worker(
+        &self,
+        data: &[f32],
+        width: usize,
+        height: usize,
+        row_stride: usize,
+        start: usize,
+        end: usize,
+        out: &mut Vec<BadPixelRecord>,
+        control: Control<'_>,
+    ) -> Result<()> {
+        control.check()?;
+        let [left, top, _, _] = self.rect;
+        let col_begin = i64::from(left) - 4;
+        let col_end = width as i64 - i64::from(left) + 2;
+        let row_begin = (i64::from(top) - 4).max(start as i64);
+        let row_end = (height as i64 - (i64::from(top) - 4)).min(end as i64);
+        // The column invariant (`left >= 5`) is owned by `new`. The
+        // row range depends on the worker split, so it is validated
+        // here: the predicate reads a one-pixel halo, and scans that
+        // would leave the image are outside the verified contract (the
+        // native reads without a clamp).
+        if row_begin > row_end {
+            // A worker outside the scan range detects nothing.
+            return Ok(());
+        }
+        if row_begin < 1 || row_end > height as i64 - 2 {
+            return Err(Error::InvalidData("invalid Merrill despeckle geometry"));
+        }
+        let mut marks = 0_usize;
+        for y in row_begin..=row_end {
+            control.check()?;
+            let y = y as usize;
+            for x in col_begin..=col_end {
+                let x = x as usize;
+                let mask = self.predicate(data, row_stride, x, y);
+                if mask == 0 {
+                    continue;
+                }
+                out.push(BadPixelRecord {
+                    row: y as u16,
+                    column: x as u16,
+                    flags: (0x3ff | (mask << 12)) as u16,
+                });
+                marks += 1;
+                if marks >= 624_999 {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Detect over the native `DoThreadedPix` partition: eight
+    /// nonoverlapping row ranges of `floor(height / 8)`, the remainder
+    /// in the final worker, joined in worker order (raster order).
+    pub fn detect(
+        &self,
+        data: &[f32],
+        width: usize,
+        height: usize,
+        row_stride: usize,
+        control: Control<'_>,
+    ) -> Result<Vec<BadPixelRecord>> {
+        control.check()?;
+        if height < 8 {
+            // floor(height / 8) cannot split fewer than eight rows.
+            return Err(Error::InvalidData("invalid Merrill despeckle size"));
+        }
+        if width > u16::MAX as usize || height > u16::MAX as usize {
+            return Err(Error::InvalidData("invalid Merrill despeckle size"));
+        }
+        if row_stride < width * 3 || data.len() < row_stride * (height - 1) + width * 3 {
+            return Err(Error::InvalidData("invalid Merrill despeckle layout"));
+        }
+        let step = height / 8;
+        let mut records = Vec::new();
+        let mut start = 0;
+        for worker in 0..8 {
+            let end = if worker == 7 {
+                height - 1
+            } else {
+                start + step - 1
+            };
+            self.detect_worker(
+                data,
+                width,
+                height,
+                row_stride,
+                start,
+                end,
+                &mut records,
+                control,
+            )?;
+            start += step;
+        }
+        Ok(records)
+    }
+
+    /// Run the full stage in place: detect all eight worker lists, join
+    /// them in worker order, then correct sequentially with the mode-3
+    /// `ReplaceBadPixelsF20` (minimum badness 3, all eight neighbors
+    /// enabled by the 0x3ff record flags, no overrides). Detection
+    /// finishes before correction starts; correction never re-detects.
+    /// Returns the joined record count.
+    pub fn apply(
+        &self,
+        data: &mut [f32],
+        width: usize,
+        height: usize,
+        row_stride: usize,
+        control: Control<'_>,
+    ) -> Result<usize> {
+        let records = self.detect(data, width, height, row_stride, control)?;
+        let repair = ListedRepair::from_minimum(3);
+        repair.apply(data, width, height, row_stride, &records, &[], control)?;
+        Ok(records.len())
     }
 }
 
@@ -1683,5 +1973,302 @@ mod tests {
         assert_eq!(empty, 15);
         assert_eq!(removed, 633);
         assert_eq!(donors, 19_480);
+    }
+
+    /// The archived native despeckle oracle
+    /// (followup-despeckle/check_native.cpp, seed 149902) in one
+    /// continuous run: 7 detector modes (random regimes plus the LUT
+    /// endpoint grid that straddles every index on both threshold
+    /// boundaries), the mode-3 replacement draws that keep the stream
+    /// aligned, 4 wrapper modes (independent channel gains, spatial
+    /// variation, varying rects) and 8 controlled wheel probes. The
+    /// archived run compared every case bit-for-bit with the native
+    /// DetectSpecklesRas / DespeckleRas / mode-3 ReplaceBadPixelsF20;
+    /// these are its per-mode record counts and LUT endpoints.
+    #[test]
+    fn despeckle_matches_archived_native_oracle() {
+        const DETECTOR_RECORDS: [usize; 7] = [19_226, 19_299, 20_169, 4_086, 0, 0, 4_096];
+        // C++ default ostream output rounds to 6 significant digits.
+        let close6 = |actual: f32, printed: f64, what: &str| {
+            let tolerance = printed.abs() * 5.1e-6 + 1.0e-9;
+            assert!(
+                (f64::from(actual) - printed).abs() <= tolerance,
+                "{what}: {actual} vs {printed}"
+            );
+        };
+        let mut random = Mt19937::new(149_902);
+        // Detector modes 0..6: w=263, h=265, stride = w*3+7.
+        let width = 263_usize;
+        let height = 265_usize;
+        let stride = width * 3 + 7;
+        let rect = [5_u32, 5, 258, 260];
+        for mode in 0..7_usize {
+            let mut gain = [0.731_f64, 1.831, 3.173];
+            let mut adjust = [10.0_f64, 10.0, 5.0];
+            if mode == 1 {
+                gain = [3.731, 0.331, 1.173];
+            }
+            if mode == 2 {
+                adjust = [0.001, 1.331, 3.117];
+            }
+            if mode >= 3 {
+                adjust = [1.0, 1.0, 1.0];
+            }
+            let despeckle = super::Despeckle::new(gain, adjust, rect).unwrap();
+            let mut data = vec![123.0_f32; stride * height];
+            if mode < 3 {
+                for y in 0..height {
+                    for x in 0..width {
+                        for c in 0..3 {
+                            let v = ((random.next() % 65_536) as i32 - 1024) as f32 * 0.125;
+                            data[y * stride + 3 * x + c] = v;
+                        }
+                    }
+                }
+            } else {
+                // Every LUT index straddled by nextafter probes on both
+                // boundaries; mode&1 selects the direction, mode>=5 the
+                // plus side.
+                let next_down = |value: f32| -> f32 {
+                    if value == 0.0 {
+                        f32::from_bits(0x8000_0001)
+                    } else if value < 0.0 {
+                        f32::from_bits(value.to_bits() + 1)
+                    } else {
+                        f32::from_bits(value.to_bits() - 1)
+                    }
+                };
+                let next_up = |value: f32| -> f32 { -next_down(-value) };
+                for i in 0..4096_usize {
+                    let x = 3 + (i % 64) * 4;
+                    let y = 3 + (i / 64) * 4;
+                    for c in 0..3 {
+                        let p = i as f32;
+                        let mut n = p - despeckle.lut(c, i);
+                        n = if mode & 1 == 1 {
+                            next_down(n)
+                        } else {
+                            next_up(n)
+                        };
+                        if mode >= 5 {
+                            n = p + despeckle.lut(c, i);
+                            n = if mode & 1 == 1 {
+                                next_down(n)
+                            } else {
+                                next_up(n)
+                            };
+                        }
+                        for dy in -1_i32..=1 {
+                            for dx in -1_i32..=1 {
+                                let value = if dx == 0 && dy == 0 { p } else { n };
+                                data[(y as i32 + dy) as usize * stride
+                                    + 3 * (x as i32 + dx) as usize
+                                    + c] = value;
+                            }
+                        }
+                    }
+                }
+            }
+            // The harness ran one native worker over rows [2, h-3].
+            let mut records = Vec::new();
+            despeckle
+                .detect_worker(
+                    &data,
+                    width,
+                    height,
+                    stride,
+                    2,
+                    height - 3,
+                    &mut records,
+                    Control::none(),
+                )
+                .unwrap();
+            assert_eq!(
+                records.len(),
+                DETECTOR_RECORDS[mode],
+                "mode {mode} detector records"
+            );
+            let lut0 = match mode {
+                0 | 1 => 23.405_7_f64,
+                2 => 0.002_340_57,
+                _ => 2.340_57,
+            };
+            let lut4095 = match mode {
+                0 => 107.845_f64,
+                1 => 238.986,
+                2 => 0.010_784_5,
+                _ => 10.784_5,
+            };
+            close6(despeckle.lut(0, 0), lut0, "mode {mode} LUT0");
+            close6(despeckle.lut(0, 4095), lut4095, "mode {mode} LUT4095");
+            // The oracle's per-mode replacement battery: 7 masks x 53
+            // seeds, 29 draws each. The mode-3 correction kernel is the
+            // stage-3 port; here the draws keep the stream aligned and
+            // the corrections exercise the 0x3ff flag path.
+            let repair = super::ListedRepair::from_minimum(3);
+            let mut scratch = vec![0.0_f32; stride * height];
+            for mask in 1..=7_usize {
+                for n in 0..53_usize {
+                    let x = 4 + (random.next() % (width as u32 - 8)) as usize;
+                    let y = 4 + (random.next() % (height as u32 - 8)) as usize;
+                    let record = super::BadPixelRecord {
+                        row: y as u16,
+                        column: x as u16,
+                        flags: (0x3ff | (mask << 12)) as u16,
+                    };
+                    scratch.copy_from_slice(&data);
+                    for dy in -1_i32..=1 {
+                        for dx in -1_i32..=1 {
+                            for c in 0..3 {
+                                let mut v = 1.0_f32 + (random.next() % 64_000) as f32 * 0.031_25;
+                                if n % 3 == 0 && dy == -1 {
+                                    v = 0.0;
+                                }
+                                if n % 3 == 1 {
+                                    v = if dy < 0 || dx < 0 { 0.0 } else { -v };
+                                }
+                                let index = (y as i32 + dy) as usize * stride
+                                    + 3 * (x as i32 + dx) as usize
+                                    + c;
+                                scratch[index] = v;
+                            }
+                        }
+                    }
+                    repair
+                        .apply(
+                            &mut scratch,
+                            width,
+                            height,
+                            stride,
+                            std::slice::from_ref(&record),
+                            &[],
+                            Control::none(),
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        // Wrapper modes 0..3: w=93, h=101, stride = w*3+11, one draw
+        // per sample, independent channel gains and spatial variation.
+        let width = 93_usize;
+        let height = 101_usize;
+        let stride = width * 3 + 11;
+        const WRAPPER_RECORDS: [usize; 4] = [2_682, 2_529, 2_448, 2_277];
+        for mode in 0..4_usize {
+            let gain = [0.91_f64, 2.735, 4.173];
+            let adjust = [10.0_f64, 10.0, 5.0];
+            let rect = [
+                (8 + mode) as u32,
+                (9 + mode) as u32,
+                (width - 8 - mode) as u32,
+                (height - 9 - mode) as u32,
+            ];
+            let despeckle = super::Despeckle::new(gain, adjust, rect).unwrap();
+            let mut data = vec![-12_345.25_f32; stride * height];
+            for y in 0..height {
+                for x in 0..width {
+                    for c in 0..3 {
+                        let raw = ((random.next() % 3000) as i32 - 120) as f32;
+                        let spatial = 0.81 + x as f64 * (c + 1) as f64 * 0.0011 + y as f64 * 0.0017;
+                        data[y * stride + 3 * x + c] =
+                            ((f64::from(raw) - 11.3) * gain[c] * spatial) as f32;
+                    }
+                }
+            }
+            let records = despeckle
+                .detect(&data, width, height, stride, Control::none())
+                .unwrap();
+            assert_eq!(
+                records.len(),
+                WRAPPER_RECORDS[mode],
+                "mode {mode} wrapper records"
+            );
+            // The eight-worker join equals the single full-range scan
+            // (worker order is raster order).
+            let mut single = Vec::new();
+            despeckle
+                .detect_worker(
+                    &data,
+                    width,
+                    height,
+                    stride,
+                    0,
+                    height - 1,
+                    &mut single,
+                    Control::none(),
+                )
+                .unwrap();
+            assert_eq!(records, single, "mode {mode} partition join");
+        }
+        // Eight controlled wheel probes: the observed raw 3x3
+        // neighborhood (deliberately not asserted to be native stage
+        // input) marks C0 only; the correction returns 47/3 scaled by
+        // the equal channel gain, the good channels unchanged, and is
+        // independent of the adjust vector.
+        const WHEEL: [[[f32; 3]; 3]; 3] = [
+            [[16.0, 16.0, 21.0], [17.0, 17.0, 23.0], [17.0, 23.0, 22.0]],
+            [[15.0, 18.0, 23.0], [203.0, 19.0, 20.0], [19.0, 22.0, 24.0]],
+            [[16.0, 19.0, 20.0], [21.0, 18.0, 19.0], [16.0, 22.0, 23.0]],
+        ];
+        let mut previous_gain = None::<(f64, f32)>;
+        for adjust_mode in 0..2_usize {
+            for gain_value in [1.0_f64, 2.0, 4.0, 8.0] {
+                let width = 64_usize;
+                let height = 64_usize;
+                let stride = width * 3;
+                let gain = [gain_value; 3];
+                let adjust = if adjust_mode == 0 {
+                    [10.0_f64, 10.0, 5.0]
+                } else {
+                    [15.0, 15.0, 5.0]
+                };
+                let despeckle = super::Despeckle::new(gain, adjust, [8, 8, 55, 55]).unwrap();
+                let mut pixels = vec![(20.0 * gain_value) as f32; stride * height];
+                for y in 0..3_usize {
+                    for x in 0..3_usize {
+                        for c in 0..3_usize {
+                            pixels[(y + 31) * stride + 3 * (x + 31) + c] =
+                                WHEEL[y][x][c] * gain_value as f32;
+                        }
+                    }
+                }
+                let before = [
+                    pixels[(32 * stride) + 3 * 32],
+                    pixels[(32 * stride) + 3 * 32 + 1],
+                    pixels[(32 * stride) + 3 * 32 + 2],
+                ];
+                let count = despeckle
+                    .apply(&mut pixels, width, height, stride, Control::none())
+                    .unwrap();
+                assert_eq!(count, 1, "adjust {adjust_mode} gain {gain_value}");
+                assert_eq!(
+                    pixels[(32 * stride) + 3 * 32 + 1],
+                    19.0 * gain_value as f32,
+                    "C1 unchanged"
+                );
+                assert_eq!(
+                    pixels[(32 * stride) + 3 * 32 + 2],
+                    20.0 * gain_value as f32,
+                    "C2 unchanged"
+                );
+                let after = pixels[(32 * stride) + 3 * 32];
+                assert_ne!(after, before[0]);
+                let expected = 47.0 / 3.0 * gain_value;
+                assert!(
+                    (f64::from(after) - expected).abs() <= expected * 1.0e-5,
+                    "adjust {adjust_mode} gain {gain_value}: {after}"
+                );
+                if let Some((previous_gain_value, previous_after)) = previous_gain {
+                    // Equal channel gains are powers of two, so the
+                    // correction scales exactly.
+                    assert_eq!(
+                        gain_value / previous_gain_value,
+                        f64::from(after) / f64::from(previous_after),
+                        "exact gain scaling"
+                    );
+                }
+                previous_gain = Some((gain_value, after));
+            }
+        }
     }
 }
