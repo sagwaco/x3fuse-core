@@ -205,6 +205,199 @@ impl RadialShading {
     }
 }
 
+/// One camera-listed bad-pixel record. Layout matches the native
+/// `FBadPixel_F20`: row, column, then a packed u16 flags word
+/// (bits 0..7 neighbor mask, bits 8..11 badness, bits 12..14 channel
+/// mask C0=4/C1=2/C2=1).
+#[derive(Clone, Copy, Debug)]
+pub struct BadPixelRecord {
+    pub row: u16,
+    pub column: u16,
+    pub flags: u16,
+}
+
+/// Stage 3 of the ordered float frontend: listed bad-pixel repair,
+/// the scalar reconstruction of the native `ReplaceBadPixelsF20`
+/// (0x3b108). Verified bit-for-bit against the native export over all
+/// 35,840 standalone cases (256 neighbor masks x 7 channel masks,
+/// badness cutoffs, override bounds, zero/negative finite neighborhoods
+/// and geometric skips) plus 8 sequential lists / 1,044 records:
+/// x3f-docs `followup-float-front/check_listed_repair.cpp`.
+#[derive(Clone, Debug)]
+pub struct ListedRepair {
+    minimum_badness: u32,
+}
+
+impl ListedRepair {
+    /// `badness` is the selected badness label; `offset` is the
+    /// metadata BPBadnessOffset. The native minimum is unsigned
+    /// subtraction `badness == 0 ? 0 : badness - offset`, not
+    /// saturating (tested offsets above badness wrap).
+    pub fn new(badness: u32, offset: u32) -> Self {
+        Self {
+            minimum_badness: if badness == 0 {
+                0
+            } else {
+                badness.wrapping_sub(offset)
+            },
+        }
+    }
+
+    pub fn minimum_badness(&self) -> u32 {
+        self.minimum_badness
+    }
+
+    /// Repair one record in place. Mirrors the native skip conditions:
+    /// out-of-halo coordinates (x or y below 2 or at the outermost
+    /// border), badness below the request minimum, or an empty
+    /// neighbor mask.
+    #[allow(clippy::too_many_lines)]
+    fn replace_one(
+        &self,
+        data: &mut [f32],
+        width: usize,
+        height: usize,
+        row_stride: usize,
+        record: BadPixelRecord,
+        override_mask: Option<u32>,
+    ) {
+        let x = record.column as usize;
+        let y = record.row as usize;
+        let channel_mask = (record.flags >> 12) as u32;
+        let mut neighbors = u32::from(record.flags & 0xff);
+        // The per-record override applies only within the caller's
+        // supplied count, when 1 <= override <= 254 and the override is
+        // numerically below the original mask.
+        if let Some(value) = override_mask {
+            if (1..=254).contains(&value) && value < neighbors {
+                neighbors = value;
+            }
+        }
+        let badness = u32::from((record.flags >> 8) & 0xf);
+        if x < 2
+            || y < 2
+            || x >= width.saturating_sub(1)
+            || y >= height.saturating_sub(1)
+            || badness < self.minimum_badness
+            || neighbors == 0
+        {
+            return;
+        }
+        let at = |data: &[f32], dx: i32, dy: i32, c: usize| -> f32 {
+            let index = (y as i32 + dy) as usize * row_stride + (x as i32 + dx) as usize * 3 + c;
+            data[index]
+        };
+        let mut sums = [0.0_f32; 3];
+        let mut lo = [0.0_f32; 3];
+        let mut hi = [0.0_f32; 3];
+        let mut original = [0.0_f32; 3];
+        let mut first = true;
+        let mut count = 0_u32;
+        let mut bit = 0_u32;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                if neighbors & (1 << bit) == 0 {
+                    bit += 1;
+                    continue;
+                }
+                bit += 1;
+                count += 1;
+                // Native re-checks the all-zero RGB extrema sentinel
+                // after every neighbor (0x3b284..0x3b300), so an
+                // all-zero neighbor resets both extrema.
+                let lo_zero = lo == [0.0, 0.0, 0.0];
+                let hi_zero = hi == [0.0, 0.0, 0.0];
+                for c in 0..3 {
+                    let value = at(data, dx, dy, c);
+                    sums[c] += value;
+                    if first || lo_zero {
+                        lo[c] = value;
+                    } else {
+                        lo[c] = lo[c].min(value);
+                    }
+                    if first || hi_zero {
+                        hi[c] = value;
+                    } else {
+                        hi[c] = hi[c].max(value);
+                    }
+                }
+                first = false;
+            }
+        }
+        for c in 0..3 {
+            if count > 2 {
+                sums[c] -= lo[c] + hi[c];
+            }
+            original[c] = at(data, 0, 0, c);
+        }
+        let divisor = (if count > 2 { count - 2 } else { count }) as f32;
+        // Native evaluates the channel-sum differences before dividing.
+        let delta = |sums: &[f32; 3], a: usize, b: usize| -> f32 { (sums[a] - sums[b]) / divisor };
+        let mut proposed = original;
+        for c in 0..3 {
+            if channel_mask & (4 >> c) == 0 {
+                continue;
+            }
+            if channel_mask == 7 {
+                // All three channels bad: trimmed mean per channel.
+                proposed[c] = sums[c] / divisor;
+            } else {
+                // One or two bad channels: anchor on the good
+                // channels plus the channel-sum differences.
+                let mut total = 0.0_f32;
+                let mut good = 0;
+                for d in 0..3 {
+                    if channel_mask & (4 >> d) == 0 {
+                        let value = original[d] + delta(&sums, c, d);
+                        if good == 0 {
+                            total = value;
+                        } else {
+                            total += value;
+                        }
+                        good += 1;
+                    }
+                }
+                proposed[c] = if good == 2 { total * 0.5 } else { total };
+            }
+        }
+        if proposed.iter().all(|v| v.is_finite()) {
+            let index = y * row_stride + x * 3;
+            data[index..index + 3].copy_from_slice(&proposed);
+        }
+    }
+
+    /// Apply a sequential list in place. The native changes the image
+    /// between records, so later records observe earlier repairs.
+    pub fn apply(
+        &self,
+        data: &mut [f32],
+        width: usize,
+        height: usize,
+        row_stride: usize,
+        records: &[BadPixelRecord],
+        overrides: &[u32],
+        control: Control<'_>,
+    ) -> Result<()> {
+        control.check()?;
+        if width < 4 || height < 4 {
+            // The halo requirement (>=2 and < dim-1) needs at least 4.
+            return Err(Error::InvalidData("invalid Merrill repair image size"));
+        }
+        if row_stride < width * 3 || data.len() < row_stride * (height - 1) + width * 3 {
+            return Err(Error::InvalidData("invalid Merrill repair image layout"));
+        }
+        for (index, record) in records.iter().enumerate() {
+            control.check()?;
+            let override_mask = overrides.get(index).copied();
+            self.replace_one(data, width, height, row_stride, *record, override_mask);
+        }
+        Ok(())
+    }
+}
+
 /// The ordered Merrill float frontend, stage 1: ApplyGains.
 ///
 /// `black` is the per-channel DarkShieldTop trimmed mean, `gain` is the
@@ -589,5 +782,244 @@ mod tests {
         let bad = [f64::NAN, 0.0, 0.0, 0.0];
         let result = RadialShading::new([0, 0, 100, 100], [0; 4], [0, 0, 92, 0], bad, "HI");
         assert!(result.is_err());
+    }
+
+    /// The listed-repair kernel rules, checked one by one against the
+    /// documented native behavior (the bit-for-bit native comparison is
+    /// the archived C++ oracle: 35,840 standalone cases plus 8
+    /// sequential lists / 1,044 records).
+    #[test]
+    fn listed_repair_matches_native_rules() {
+        const W: usize = 11;
+        const H: usize = 13;
+        const STRIDE: usize = W * 3 + 7;
+        let repair = ListedRepair::new(0, 1);
+        let base = |x: usize, y: usize, c: usize| -> f32 {
+            (((x * 31 + y * 17 + c * 7) * 131) % 100_000) as f32 * 0.015_625
+        };
+        // All-neighbor, all-channel interior record: the repaired value
+        // must equal the trimmed mean of the eight neighbors.
+        let mut data = vec![-31415.25_f32; STRIDE * H];
+        for y in 0..H {
+            for x in 0..W {
+                for c in 0..3 {
+                    data[y * STRIDE + 3 * x + c] = base(x, y, c);
+                }
+            }
+        }
+        let record = BadPixelRecord {
+            row: 6,
+            column: 5,
+            flags: 0xff | (3 << 8) | (7 << 12),
+        };
+        let mut expected = [0.0_f32; 3];
+        for c in 0..3 {
+            let mut values: Vec<f32> = Vec::new();
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    values.push(base((5 + dx) as usize, (6 + dy) as usize, c));
+                }
+            }
+            values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let trimmed = &values[1..values.len() - 1];
+            expected[c] = trimmed.iter().sum::<f32>() / trimmed.len() as f32;
+        }
+        repair
+            .apply(&mut data, W, H, STRIDE, &[record], &[], Control::none())
+            .unwrap();
+        let pixel = &data[6 * STRIDE + 5 * 3..6 * STRIDE + 5 * 3 + 3];
+        for c in 0..3 {
+            assert_eq!(pixel[c], expected[c], "trimmed mean channel {c}");
+        }
+
+        // Halo skips: x or y below 2 or at the outermost border.
+        for (row, column) in [(1_u16, 5_u16), (6, 1), (11, 5), (6, 10), (12, 5), (6, 11)] {
+            let mut data = vec![1.0_f32; STRIDE * H];
+            let record = BadPixelRecord {
+                row,
+                column,
+                flags: 0xff | (0 << 8) | (7 << 12),
+            };
+            repair
+                .apply(&mut data, W, H, STRIDE, &[record], &[], Control::none())
+                .unwrap();
+            let index = row as usize * STRIDE + column as usize * 3;
+            assert_eq!(
+                &data[index..index + 3],
+                &[1.0; 3],
+                "halo skip at ({row},{column})"
+            );
+        }
+
+        // Badness below the request minimum skips.
+        let mut data = vec![1.0_f32; STRIDE * H];
+        let strict = ListedRepair::new(2, 1);
+        let record = BadPixelRecord {
+            row: 6,
+            column: 5,
+            flags: 0xff | (1 << 8) | (7 << 12),
+        };
+        strict
+            .apply(&mut data, W, H, STRIDE, &[record], &[], Control::none())
+            .unwrap();
+        assert_eq!(
+            &data[6 * STRIDE + 15..6 * STRIDE + 18],
+            &[1.0; 3],
+            "badness skip"
+        );
+
+        // Override rules: within the 1..=254 window and numerically
+        // below the mask.
+        let record = BadPixelRecord {
+            row: 6,
+            column: 5,
+            flags: 0xff | (0 << 8) | (7 << 12),
+        };
+        let mut data = vec![2.0_f32; STRIDE * H];
+        data[6 * STRIDE + 5 * 3..6 * STRIDE + 5 * 3 + 3].fill(9.0);
+        // Override 255 is outside the 1..=254 window: the full mask
+        // applies and the pixel changes.
+        repair
+            .apply(&mut data, W, H, STRIDE, &[record], &[255], Control::none())
+            .unwrap();
+        assert_eq!(
+            &data[6 * STRIDE + 15..6 * STRIDE + 18],
+            &[2.0; 3],
+            "out-of-window override ignored, full mask repaired a uniform neighborhood to 2.0"
+        );
+        // Override above the original mask leaves the mask unchanged.
+        let mut data = vec![2.0_f32; STRIDE * H];
+        data[6 * STRIDE + 5 * 3..6 * STRIDE + 5 * 3 + 3].fill(9.0);
+        repair
+            .apply(&mut data, W, H, STRIDE, &[record], &[0xff], Control::none())
+            .unwrap();
+        assert_eq!(
+            &data[6 * STRIDE + 15..6 * STRIDE + 18],
+            &[2.0; 3],
+            "higher override ignored"
+        );
+        // Override 0 does not meet the native >= 1 guard, so the
+        // original full mask applies (the archived oracle passes 0 as
+        // one of its override probes).
+        let mut data = vec![2.0_f32; STRIDE * H];
+        data[6 * STRIDE + 5 * 3..6 * STRIDE + 5 * 3 + 3].fill(9.0);
+        repair
+            .apply(&mut data, W, H, STRIDE, &[record], &[0], Control::none())
+            .unwrap();
+        assert_eq!(
+            &data[6 * STRIDE + 15..6 * STRIDE + 18],
+            &[2.0; 3],
+            "zero override falls back to the original mask"
+        );
+
+        // All-zero RGB neighbors exercise the extrema sentinel.
+        let mut data = vec![0.0_f32; STRIDE * H];
+        data[6 * STRIDE + 5 * 3..6 * STRIDE + 5 * 3 + 3].fill(9.0);
+        repair
+            .apply(&mut data, W, H, STRIDE, &[record], &[], Control::none())
+            .unwrap();
+        assert_eq!(
+            &data[6 * STRIDE + 15..6 * STRIDE + 18],
+            &[0.0; 3],
+            "zero sentinel trimmed mean"
+        );
+
+        // A non-finite proposal keeps the original pixel.
+        let mut data = vec![1.0_f32; STRIDE * H];
+        data[5 * STRIDE + 4 * 3] = f32::INFINITY;
+        repair
+            .apply(&mut data, W, H, STRIDE, &[record], &[], Control::none())
+            .unwrap();
+        assert_eq!(
+            &data[6 * STRIDE + 15..6 * STRIDE + 18],
+            &[1.0; 3],
+            "non-finite keeps original"
+        );
+    }
+
+    #[test]
+    fn listed_repair_minimum_uses_unsigned_subtraction() {
+        // Native wraps instead of saturating: badness 1 with offset 3
+        // wraps to u32::MAX - 1 (0xFFFFFFFE).
+        let repair = ListedRepair::new(1, 3);
+        assert_eq!(repair.minimum_badness(), 0xFFFF_FFFE);
+        // Badness 0 selects minimum 0 regardless of the offset.
+        assert_eq!(ListedRepair::new(0, 3).minimum_badness(), 0);
+        assert_eq!(ListedRepair::new(4, 1).minimum_badness(), 3);
+    }
+
+    #[test]
+    fn listed_repair_sequential_lists_observe_earlier_repairs() {
+        const W: usize = 11;
+        const H: usize = 13;
+        const STRIDE: usize = W * 3;
+        let repair = ListedRepair::new(0, 1);
+        let mut data = vec![0.0_f32; STRIDE * H];
+        for y in 0..H {
+            for x in 0..W {
+                for c in 0..3 {
+                    data[y * STRIDE + 3 * x + c] = ((x + y + c) % 7) as f32 + 1.0;
+                }
+            }
+        }
+        // Two adjacent records: the second must observe the first's
+        // output.
+        let first = BadPixelRecord {
+            row: 6,
+            column: 5,
+            flags: 0xff | 0 << 8 | 7 << 12,
+        };
+        let second = BadPixelRecord {
+            row: 6,
+            column: 6,
+            flags: 0xff | 0 << 8 | 7 << 12,
+        };
+        let mut sequential = data.clone();
+        repair
+            .apply(
+                &mut sequential,
+                W,
+                H,
+                STRIDE,
+                &[first, second],
+                &[],
+                Control::none(),
+            )
+            .unwrap();
+        let mut isolated = data.clone();
+        repair
+            .apply(&mut isolated, W, H, STRIDE, &[first], &[], Control::none())
+            .unwrap();
+        let seq_pixel = &sequential[6 * STRIDE + 6 * 3..6 * STRIDE + 6 * 3 + 3];
+        let iso_pixel = &isolated[6 * STRIDE + 6 * 3..6 * STRIDE + 6 * 3 + 3];
+        assert_ne!(
+            seq_pixel, iso_pixel,
+            "second record must see the first repair"
+        );
+    }
+
+    #[test]
+    fn listed_repair_rejects_invalid_layout() {
+        let repair = ListedRepair::new(0, 1);
+        let mut data = vec![0.0_f32; 3 * 3 * 3];
+        // Width below 4 cannot host a halo record.
+        assert!(repair
+            .apply(
+                &mut data,
+                3,
+                3,
+                9,
+                &[BadPixelRecord {
+                    row: 1,
+                    column: 1,
+                    flags: 0xff
+                }],
+                &[],
+                Control::none()
+            )
+            .is_err());
     }
 }

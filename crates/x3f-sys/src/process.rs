@@ -2203,6 +2203,171 @@ unsafe fn merrill_radial_shading(
     )?))
 }
 
+/// Native badness selection (inline at 0xa6b2c..0xa6c9c), validated
+/// against all 53 corpus CAMFs and the archived instruction replay
+/// (followup-repair/badness). Returns the selected badness label.
+///
+/// `thresholds` is the BadnessTable as four (temperature, exposure,
+/// label) triples, already validated for shape and finiteness.
+/// `exposure` is `CaptureShutter / 1000 + (request+0x198 > 1 ?
+/// BurstExposureAdjust : 0)`. All arithmetic rounds to f32 separately;
+/// the exponential is `expf`.
+fn merrill_badness_label(
+    thresholds: &[(f32, f32, f32); 4],
+    sensor_temperature: f32,
+    exposure: f32,
+) -> u32 {
+    const K: f32 = f32::from_bits(0x3db1_7218); // ln(2)/8 native literal.
+    let mut values = [0.0_f32; 4];
+    for (i, &(temperature, exposure_threshold, _)) in thresholds.iter().enumerate() {
+        values[i] = exposure_threshold * (temperature * K).exp();
+    }
+    let severity = (sensor_temperature * K).exp() * exposure;
+    // Native min/max reductions start at threshold[0] clamped against
+    // +-1e6, then compare the remaining three values.
+    let mut max = values[0].max(-1.0e6_f32);
+    let mut min = values[0].min(1.0e6_f32);
+    for &value in &values[1..] {
+        if value > max {
+            max = value;
+        }
+        if value < min {
+            min = value;
+        }
+    }
+    let label = if severity <= min {
+        thresholds[3].2
+    } else if severity >= max {
+        thresholds[0].2
+    } else {
+        // Start at row 3 and move backwards while severity >
+        // threshold[row]; equality selects that row's label.
+        let mut row = 3;
+        while row > 0 && severity > values[row] {
+            row -= 1;
+        }
+        thresholds[row].2
+    };
+    // ARM64 FCVTZU: negative labels convert to zero.
+    (label.max(0.0) as u32).min(u32::from(u16::MAX))
+}
+
+/// Stage 3 of the ordered float frontend: listed bad-pixel repair from
+/// the camera lists. Reads BadnessTable, the exposure inputs and
+/// BPBadnessOffset, selects the badness label natively, and returns the
+/// repair with the primary BadPixelsF20 list and neighbor overrides
+/// resolved from the DetectBadReds evidence path (the detector itself
+/// is pre-gain and changes no pixels; this checkpoint uses the stored
+/// camera list unchanged, which is the bounded verified contract).
+pub(crate) unsafe fn merrill_listed_repair(
+    x3f: *mut x3f_t,
+    burst_exposure_adjust_included: bool,
+    control: Control<'_>,
+) -> crate::Result<
+    Option<(
+        crate::float_front::ListedRepair,
+        Vec<crate::float_front::BadPixelRecord>,
+    )>,
+> {
+    control.check()?;
+    let mut thresholds_raw = [0.0_f64; 12];
+    if unsafe {
+        x3f_get_camf_matrix(
+            x3f,
+            c"BadnessTable".as_ptr() as *mut _,
+            4,
+            3,
+            0,
+            matrix_type_t_M_FLOAT,
+            thresholds_raw.as_mut_ptr().cast(),
+        )
+    } == 0
+    {
+        return Ok(None);
+    }
+    let mut thresholds = [(0.0_f32, 0.0_f32, 0.0_f32); 4];
+    for (i, triple) in thresholds.iter_mut().enumerate() {
+        let values = [
+            thresholds_raw[3 * i] as f32,
+            thresholds_raw[3 * i + 1] as f32,
+            thresholds_raw[3 * i + 2] as f32,
+        ];
+        if !values.iter().all(|v| v.is_finite()) {
+            return Err(crate::Error::InvalidData(
+                "invalid Merrill badness calibration",
+            ));
+        }
+        *triple = (values[0], values[1], values[2]);
+    }
+    let shutter = unsafe {
+        let mut value = 0.0_f64;
+        x3f_get_camf_float(x3f, c"CaptureShutter".as_ptr().cast_mut(), &mut value);
+        value
+    };
+    let temperature = unsafe {
+        let mut value = 0.0_f64;
+        x3f_get_camf_float(x3f, c"SensorTemperature".as_ptr().cast_mut(), &mut value);
+        value
+    };
+    let burst_adjust = if burst_exposure_adjust_included {
+        let mut value = 0.0_f64;
+        unsafe {
+            x3f_get_camf_float(x3f, c"BurstExposureAdjust".as_ptr().cast_mut(), &mut value);
+        }
+        value
+    } else {
+        0.0
+    };
+    let exposure = (shutter / 1000.0 + burst_adjust) as f32;
+    let mut offset: u32 = 1;
+    unsafe {
+        x3f_get_camf_unsigned(x3f, c"BPBadnessOffset".as_ptr().cast_mut(), &mut offset);
+    }
+    let label = merrill_badness_label(&thresholds, temperature as f32, exposure);
+    let repair = crate::float_front::ListedRepair::new(label, offset);
+    // The primary camera list. BadPixelsF20 stores (row, column, flags)
+    // as u32 triples (rows/cols swapped at write time by the firmware
+    // quirk; the native preprocess reads them positionally).
+    let mut cols: libc::c_int = 0;
+    let mut rows: libc::c_int = 0;
+    let mut list: *mut u32 = ptr::null_mut();
+    if unsafe {
+        x3f_get_camf_matrix_var(
+            x3f,
+            c"BadPixelsF20".as_ptr() as *mut _,
+            &mut cols,
+            &mut rows,
+            ptr::null_mut(),
+            matrix_type_t_M_UINT,
+            &mut list as *mut *mut u32 as *mut *mut libc::c_void,
+        ) != 0
+            && cols == 3
+    } {
+        let count = rows as usize;
+        let mut records = Vec::with_capacity(count);
+        for row in 0..count {
+            control.check()?;
+            let base = unsafe { list.add(3 * row) };
+            let r = unsafe { *base } as u32;
+            let c = unsafe { *base.add(1) } as u32;
+            let flags = unsafe { *base.add(2) } as u32;
+            if (r as usize) < u16::MAX as usize + 1
+                && (c as usize) < u16::MAX as usize + 1
+                && flags < 0x1_0000
+            {
+                records.push(crate::float_front::BadPixelRecord {
+                    row: r as u16,
+                    column: c as u16,
+                    flags: flags as u16,
+                });
+            }
+        }
+        Ok(Some((repair, records)))
+    } else {
+        Ok(Some((repair, Vec::new())))
+    }
+}
+
 unsafe fn merrill_wb_gain(x3f: *mut x3f_t, wb: *mut libc::c_char) -> Option<[f64; 3]> {
     let mut gain = [0.0; 3];
     if unsafe {
@@ -4781,7 +4946,7 @@ unsafe fn get_image_impl(
                         let gain = front.gain();
                         let gained_fnv = crate::float_front::fnv1a_f32(&gained);
                         let mut radial_note = "none";
-                        let mut radial_fnv = 0_u64;
+                        let mut radial_fnv = gained_fnv;
                         if let Ok(Some(radial)) = merrill_radial_shading(x3f, wb, control) {
                             if radial
                                 .apply(
@@ -4797,8 +4962,33 @@ unsafe fn get_image_impl(
                                 radial_fnv = crate::float_front::fnv1a_f32(&gained);
                             }
                         }
+                        let mut listed_note = "none";
+                        let mut listed_fnv = 0_u64;
+                        let mut listed_count = 0_usize;
+                        if let Ok(Some((repair, records))) =
+                            merrill_listed_repair(x3f, true, control)
+                        {
+                            listed_note = "applied";
+                            listed_count = records.len();
+                            if !records.is_empty() {
+                                if repair
+                                    .apply(
+                                        &mut gained,
+                                        trace.columns as usize,
+                                        trace.rows as usize,
+                                        trace.row_stride as usize,
+                                        &records,
+                                        &[],
+                                        control,
+                                    )
+                                    .is_ok()
+                                {
+                                    listed_fnv = crate::float_front::fnv1a_f32(&gained);
+                                }
+                            }
+                        }
                         eprintln!(
-                            "X3F float front: {}x{} black={:x?} gain={:x?} spatial={} fnv1a={:016x} radial={} radial_fnv1a={:016x}",
+                            "X3F float front: {}x{} black={:x?} gain={:x?} spatial={} fnv1a={:016x} radial={} radial_fnv1a={:016x} listed={} listed_count={} listed_fnv1a={:016x}",
                             trace.columns,
                             trace.rows,
                             [black[0].to_bits(), black[1].to_bits(), black[2].to_bits()],
@@ -4806,7 +4996,10 @@ unsafe fn get_image_impl(
                             front.spatial().is_some(),
                             gained_fnv,
                             radial_note,
-                            radial_fnv
+                            radial_fnv,
+                            listed_note,
+                            listed_count,
+                            if listed_count > 0 { listed_fnv } else { radial_fnv }
                         );
                     }
                 }
@@ -6225,7 +6418,9 @@ mod tests {
     /// corpus is absent.
     #[test]
     fn merrill_float_gain_front_matches_reference_fixtures() {
-        use crate::process::{merrill_float_gain_front, merrill_radial_shading};
+        use crate::process::{
+            merrill_float_gain_front, merrill_listed_repair, merrill_radial_shading,
+        };
         use crate::{
             x3f_area16_t, x3f_delete, x3f_get_camf, x3f_get_raw, x3f_image_area, x3f_load_data,
             x3f_new_from_file, x3f_return_e_X3F_OK, Control,
@@ -6241,7 +6436,7 @@ mod tests {
             .filter(|line| !line.starts_with('#'))
         {
             let fields: Vec<_> = line.split('\t').collect();
-            assert_eq!(fields.len(), 9, "{line}");
+            assert_eq!(fields.len(), 11, "{line}");
             let name = fields[0];
             let cols: usize = fields[1].parse().unwrap();
             let rows: usize = fields[2].parse().unwrap();
@@ -6255,6 +6450,8 @@ mod tests {
             let expected: u64 = u64::from_str_radix(fields[6], 16).unwrap();
             let radial_expected: bool = fields[7] == "1";
             let radial_fnv: u64 = u64::from_str_radix(fields[8], 16).unwrap();
+            let listed_count: usize = fields[9].parse().unwrap();
+            let listed_fnv: u64 = u64::from_str_radix(fields[10], 16).unwrap();
             let path = root.join(name);
             if !path.exists() {
                 continue;
@@ -6316,6 +6513,30 @@ mod tests {
                     crate::float_front::fnv1a_f32(&gained),
                     radial_fnv,
                     "{name} radial fnv"
+                );
+                // Stage 3: listed repair from the camera list with the
+                // native badness selection (BurstExposureAdjust included).
+                let (repair, records) = merrill_listed_repair(x3f, true, Control::none())
+                    .unwrap()
+                    .expect("badness calibration present");
+                assert_eq!(records.len(), listed_count, "{name} listed record count");
+                if !records.is_empty() {
+                    repair
+                        .apply(
+                            &mut gained,
+                            area.columns as usize,
+                            area.rows as usize,
+                            area.row_stride as usize,
+                            &records,
+                            &[],
+                            Control::none(),
+                        )
+                        .unwrap();
+                }
+                assert_eq!(
+                    crate::float_front::fnv1a_f32(&gained),
+                    listed_fnv,
+                    "{name} listed fnv"
                 );
                 x3f_delete(x3f);
                 libc::fclose(file);
