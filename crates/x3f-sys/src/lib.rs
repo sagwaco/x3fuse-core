@@ -183,6 +183,7 @@ pub use image::{
 pub mod cr_offset;
 pub mod float_front;
 mod spatial_gain;
+pub mod spp_denoise;
 pub use spatial_gain::{
     x3f_calc_spatial_gain, x3f_cleanup_spatial_gain, x3f_get_classic_spatial_gain,
     x3f_get_interp_merrill_type_spatial_gain, x3f_get_merrill_type_spatial_gain,
