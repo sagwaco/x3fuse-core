@@ -187,9 +187,8 @@ pub use spatial_gain::{
     x3f_get_spatial_gain,
 };
 
-// Research modules for the ordered Merrill float frontend (stages 1
-// to 7c) and the SPP denoise preparation kernels (stage 7b/7c):
-// crate-private, not part of the stable library API.
+// Research modules for the ordered Merrill float frontend and SPP denoise
+// kernels, including image resampling. These modules are crate-private.
 pub(crate) mod cr_offset;
 pub(crate) mod float_front;
 pub(crate) mod spp_denoise;

@@ -283,9 +283,13 @@ unchanged; no new image-quality or full-pipeline parity result is claimed.
   selection validated on all 53 CAMFs and the native PROP BURST gate; stages
   4 (highlight restoration), 5 (raster despeckle) and 6 (row/column offset
   correction, with an embedded SVD port) by archived C++ oracle replay;
-  stages 7b/7c (SPP denoise preparation kernels and resample parameters)
+  stages 7b/7c (SPP denoise preparation kernels and image resampling)
   against the native library. All 35 resample test scales have native
   geometry, offset and table hash checks, including fractional scales.
+  `ResampleImage` also matches 1,224 native image cases. The tests include
+  filter phase carry, source reads across row padding, negative zero, and
+  the four destination rows that the native kernel does not write.
+  Invalid buffer extents return an error before the first output write.
   Per-stage verification is compositional:
   kernels match their archived oracles, and corpus pins are self-recorded
   from the trace (deterministic members of the native result family, not

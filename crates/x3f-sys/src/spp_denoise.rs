@@ -42,6 +42,12 @@
 //! and the leading tap. The geometry is reproduced in the native's
 //! exact operation order. The geometry and kernel table match all
 //! 35 scales in the native test set, including fractional scales.
+//!
+//! `resample_image` applies these tables to RGB float tiles. It preserves
+//! the native phase carry, row padding and four untouched destination rows.
+//! Its 1,224 image cases match the native output bits.
+
+use crate::{Error, Result};
 
 /// One `GetTanhLUT` result: the table size and the three channel
 /// tables in the native object order `{A, C, B}` (the object stores
@@ -353,6 +359,151 @@ pub fn compute_resample_params(scale: f32) -> ResampleParams {
     }
 }
 
+/// Resample an RGB float tile with the native `ResampleImage` operation order.
+/// The destination size is `[columns, rows]`. Strides count float samples.
+/// The last four destination rows and all destination padding stay unchanged.
+/// Source reads can cross row padding. The source slice must contain every
+/// sample the filter needs; the native function does not clamp its right edge.
+/// A destination with exactly four rows needs no source reads.
+///
+/// Invalid layouts or parameters return an error before any destination write.
+/// The native scratch arrays permit at most 24 taps. The parameter builder
+/// supports at most 63 phases. This port owns its scratch storage.
+pub fn resample_image(
+    source: &[f32],
+    source_stride: usize,
+    destination: &mut [f32],
+    destination_size: [usize; 2],
+    destination_stride: usize,
+    params: &ResampleParams,
+) -> Result<()> {
+    if source_stride < 3
+        || source.len() < 3
+        || destination_size[0] == 0
+        || !destination_size[0]
+            .checked_mul(3)
+            .is_some_and(|width| width <= destination_stride)
+        || !destination_size[1]
+            .checked_mul(destination_stride)
+            .is_some_and(|required| required <= destination.len())
+        || destination_size[1] < 4
+    {
+        return Err(Error::InvalidData("invalid SPP resample image layout"));
+    }
+    let taps = params.kernel_x as usize;
+    let phases = params.kernel_y as usize;
+    if !(1..=24).contains(&taps)
+        || !(1..=63).contains(&phases)
+        || params.table.len() != taps * phases
+        || params.offsets.len() != phases
+        || params.offsets.iter().any(|&step| step > params.kernel_x)
+    {
+        return Err(Error::InvalidData("invalid SPP resample parameters"));
+    }
+    let [width, rows] = destination_size;
+    let rows = rows - 4;
+    if rows == 0 {
+        return Ok(());
+    }
+    let half = taps / 2;
+    let tail = i64::from(params.tail);
+    if tail + (half as i64) < 0 {
+        return Err(Error::InvalidData("SPP resample reads before source rows"));
+    }
+    let check_source_extent = |row: i64, last_column: i64| {
+        let end = usize::try_from(last_column.max(0))
+            .ok()
+            .and_then(|column| column.checked_mul(3))
+            .and_then(|column| column.checked_add(3))
+            .and_then(|end| {
+                usize::try_from(row)
+                    .ok()?
+                    .checked_mul(source_stride)?
+                    .checked_add(end)
+            });
+        if end.is_some_and(|end| end <= source.len()) {
+            Ok(())
+        } else {
+            Err(Error::InvalidData("SPP resample reads past source storage"))
+        }
+    };
+    // The initial scratch rows carry the horizontal phase across row boundaries.
+    let mut initial_phase = 0;
+    let mut main_last_column = 0;
+    for y in 0..half.max(1) {
+        let mut column = tail;
+        let mut phase = initial_phase;
+        let mut last_column = 0;
+        for _ in 0..width {
+            last_column = column
+                .checked_add(taps as i64 - 1)
+                .ok_or(Error::InvalidData("SPP resample column overflow"))?;
+            column = column
+                .checked_add(i64::from(params.offsets[phase]))
+                .ok_or(Error::InvalidData("SPP resample column overflow"))?;
+            phase = (phase + 1) % phases;
+        }
+        if column < 0 {
+            return Err(Error::InvalidData("SPP resample destination is too narrow"));
+        }
+        check_source_extent((tail + y as i64).max(0), last_column)?;
+        if y == 0 {
+            main_last_column = last_column;
+        }
+        initial_phase = phase;
+    }
+    let mut row = tail;
+    for y in 0..rows {
+        check_source_extent(row + taps as i64 - 1, main_last_column)?;
+        row = row
+            .checked_add(i64::from(params.offsets[y % phases]))
+            .ok_or(Error::InvalidData("SPP resample row overflow"))?;
+    }
+    let row_samples = width * 3;
+    let mut scratch = vec![vec![0.0_f32; row_samples]; taps];
+    let horizontal = |source_row: usize, output: &mut [f32], phase: &mut usize| {
+        let mut column = tail;
+        for pixel in output.chunks_exact_mut(3) {
+            let weights = &params.table[*phase * taps..(*phase + 1) * taps];
+            pixel.fill(0.0);
+            for (tap, &weight) in weights.iter().enumerate() {
+                let x = (column + tap as i64).max(0) as usize;
+                let input = &source[source_row * source_stride + x * 3..][..3];
+                for channel in 0..3 {
+                    // Separate multiplication and addition match the native rounding.
+                    pixel[channel] += input[channel] * weight;
+                }
+            }
+            column += i64::from(params.offsets[*phase]);
+            *phase = (*phase + 1) % phases;
+        }
+    };
+    let mut phase = 0;
+    for (y, output) in scratch[..half].iter_mut().enumerate() {
+        horizontal((tail + y as i64).max(0) as usize, output, &mut phase);
+    }
+    let mut pending = taps - half;
+    let mut start = tail;
+    for y in 0..rows {
+        for (tap, output) in scratch.iter_mut().enumerate().skip(taps - pending) {
+            horizontal((start + tap as i64) as usize, output, &mut 0);
+        }
+        let phase = y % phases;
+        let weights = &params.table[phase * taps..(phase + 1) * taps];
+        let output = &mut destination[y * destination_stride..][..row_samples];
+        output.fill(0.0);
+        for (input, &weight) in scratch.iter().zip(weights) {
+            for (value, &sample) in output.iter_mut().zip(input) {
+                *value += sample * weight;
+            }
+        }
+        pending = params.offsets[phase] as usize;
+        scratch.rotate_left(pending);
+        start += pending as i64;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +545,150 @@ mod tests {
                 .collect::<Vec<_>>()
                 .as_slice(),
         )
+    }
+
+    #[test]
+    fn resample_image_matches_native_battery() {
+        // The native oracle checks allocated and caller-owned scratch storage.
+        let fixture = include_str!("../tests/fixtures/spp-resample-native.txt");
+        let sentinel = f32::from_bits(0xc5a1_2345);
+        let mut cases = 0;
+        for line in fixture.lines().filter(|line| !line.starts_with('#')) {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let scale = f32::from_bits(u32::from_str_radix(fields[0], 16).unwrap());
+            let width: usize = fields[1].parse().unwrap();
+            let rows: usize = fields[2].parse().unwrap();
+            let pattern: usize = fields[3].parse().unwrap();
+            let padding: usize = fields[4].parse().unwrap();
+            let expected = u64::from_str_radix(fields[5], 16).unwrap();
+            let params = if scale == 0.0 {
+                ResampleParams {
+                    kernel_x: 17,
+                    kernel_y: 3,
+                    tail: -3,
+                    offsets: vec![1, 2, 0],
+                    table: (0..3)
+                        .flat_map(|p| {
+                            (0..17).map(move |t| (((p + 1) * (t + 1)) % 5 + 1) as f32 / 128.0)
+                        })
+                        .collect(),
+                }
+            } else {
+                compute_resample_params(scale)
+            };
+            let source_columns = if pattern == 2 { 5 } else { 256 };
+            let source_stride = source_columns * 3 + padding;
+            let mut source = vec![sentinel; source_stride * 256];
+            let mut random = 0x1234_5678_u32;
+            for y in 0..256 {
+                for x in 0..source_columns {
+                    for channel in 0..3 {
+                        random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        let value = if pattern == 3 {
+                            -0.0
+                        } else if pattern == 0 || pattern == 2 {
+                            ((random >> 8) as i32 - 0x80_0000) as f32 / 256.0
+                        } else if x == 0 || y == 0 || (x == 6 && y == 5) {
+                            ((channel + 1) * 1024) as f32
+                        } else {
+                            -((channel + 1) as f32) / 8.0
+                        };
+                        source[y * source_stride + x * 3 + channel] = value;
+                    }
+                }
+            }
+            let stride = width * 3 + padding;
+            let mut output = vec![sentinel; 16 + stride * rows + 16];
+            resample_image(
+                &source,
+                source_stride,
+                &mut output[16..16 + stride * rows],
+                [width, rows],
+                stride,
+                &params,
+            )
+            .unwrap();
+            assert_eq!(fnv_f32(&output), expected, "{line}");
+            cases += 1;
+        }
+        assert_eq!(cases, 1224);
+    }
+
+    #[test]
+    fn resample_image_rejects_invalid_input_before_writes() {
+        let source = vec![1.0; 32 * 32 * 3];
+        let params = compute_resample_params(0.5);
+        let reject = |source_len,
+                      source_stride,
+                      destination_size,
+                      destination_stride,
+                      params: &ResampleParams| {
+            let mut output = vec![-123.0; 8 * 12 * 3];
+            assert!(resample_image(
+                &source[..source_len],
+                source_stride,
+                &mut output,
+                destination_size,
+                destination_stride,
+                params,
+            )
+            .is_err());
+            assert!(output.iter().all(|&value| value == -123.0));
+        };
+        for (length, stride) in [(0, 96), (source.len(), 2), (source.len(), usize::MAX)] {
+            reject(length, stride, [8, 12], 24, &params);
+        }
+        for (size, stride) in [
+            ([0, 12], 24),
+            ([8, 3], 24),
+            ([8, 12], 23),
+            ([8, 13], 24),
+            ([usize::MAX, 5], usize::MAX),
+        ] {
+            reject(source.len(), 96, size, stride, &params);
+        }
+        // These bounds fail after earlier pixels or rows would have been valid.
+        reject(15 * 3, 96, [8, 12], 24, &params);
+        reject(15 * 96, 96, [8, 12], 24, &params);
+        let mut bad = params.clone();
+        bad.table.pop();
+        reject(source.len(), 96, [8, 12], 24, &bad);
+        for (taps, phases) in [(0, 1), (25, 1), (4, 0), (4, 64)] {
+            let mut bad = params.clone();
+            bad.kernel_x = taps;
+            bad.kernel_y = phases;
+            reject(source.len(), 96, [8, 12], 24, &bad);
+        }
+        let mut bad = params.clone();
+        bad.offsets.clear();
+        reject(source.len(), 96, [8, 12], 24, &bad);
+        let mut bad = params.clone();
+        bad.offsets[0] = 5;
+        reject(source.len(), 96, [8, 12], 24, &bad);
+        let mut bad = params.clone();
+        bad.tail = -3;
+        reject(source.len(), 96, [8, 12], 24, &bad);
+        let upsample = compute_resample_params(8.0);
+        reject(source.len(), 96, [1, 12], 3, &upsample);
+    }
+
+    #[test]
+    fn resample_image_checks_the_carried_phase_source_extent() {
+        let params = ResampleParams {
+            kernel_x: 4,
+            kernel_y: 3,
+            tail: -1,
+            offsets: vec![0, 0, 4],
+            table: vec![0.25; 12],
+        };
+        let source = [1.0; 33];
+        let mut output = [-123.0; 5 * 5 * 3];
+        // Later fill rows need 27 samples; only the second initial row needs 33.
+        assert!(resample_image(&source[..32], 3, &mut output, [5, 5], 15, &params).is_err());
+        assert_eq!(output, [-123.0; 5 * 5 * 3]);
+        resample_image(&source, 3, &mut output, [5, 5], 15, &params).unwrap();
+        assert_eq!(output[..15], [1.0; 15]);
+        assert_eq!(output[15..], [-123.0; 60]);
     }
 
     /// The native oracle battery: check_denoise_kernels.cpp against
