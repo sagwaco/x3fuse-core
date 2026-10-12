@@ -708,7 +708,6 @@ pub(super) unsafe fn render(
     fix_bad: bool,
     apply_sgain: bool,
     wb: *mut libc::c_char,
-    chroma_lut: bool,
     control: Control<'_>,
 ) -> crate::Result<()> {
     control.check()?;
@@ -717,11 +716,6 @@ pub(super) unsafe fn render(
     let exif = unsafe { merrill_exif(x3f, control) }?;
     let noise = unsafe { noise_params(x3f, gain, &exif) }?;
     let matrix = unsafe { color_matrix(x3f, wb, noise.iso_gain) }?;
-    let lut_prior = chroma_lut.then(|| {
-        let mut prior = [0.; 3];
-        unsafe { compute_chroma_prior(matrix.as_flattened().as_ptr(), prior.as_mut_ptr()) };
-        prior
-    });
     let sensor = unsafe { typed_scalar(x3f, c"SensorISO", 3, 0.) } as f32;
     let sensor_scale = if sensor == 0. { 1. } else { sensor / 100. };
     let mut strengths = [0.; 3];
@@ -776,7 +770,6 @@ pub(super) unsafe fn render(
             apply_sgain,
             fix_bad,
             Some(noise.despeckle),
-            lut_prior,
             control,
             &mut observe,
         )

@@ -212,7 +212,7 @@ fn concurrent_conversions_match_serial_for_per_file_options() {
                 &clipped,
                 OutputFormat::Tiff,
                 ProcessOptions {
-                    spp_denoise: true,
+                    denoise_intensity: 0,
                     rgb_chroma_lut: Some(enabled),
                     ..ProcessOptions::default()
                 },
@@ -375,6 +375,10 @@ fn spp_errors_and_cancellation_do_not_publish_output() {
         let reader = loaded_reader(&file);
         for invalid in [
             ProcessOptions {
+                rgb_chroma_lut: Some(true),
+                ..options.clone()
+            },
+            ProcessOptions {
                 denoise_intensity: 0,
                 ..options.clone()
             },
@@ -387,18 +391,6 @@ fn spp_errors_and_cancellation_do_not_publish_output() {
                 ..options.clone()
             },
             ProcessOptions {
-                denoise_backend: DenoiseBackend::Gpu,
-                ..options.clone()
-            },
-            ProcessOptions {
-                spp_denoise: false,
-                rgb_chroma_lut: Some(true),
-                denoise_intensity: 0,
-                ..options.clone()
-            },
-            ProcessOptions {
-                spp_denoise: false,
-                rgb_chroma_lut: Some(true),
                 denoise_backend: DenoiseBackend::Gpu,
                 ..options.clone()
             },

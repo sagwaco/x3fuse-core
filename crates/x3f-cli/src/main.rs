@@ -136,21 +136,19 @@ fn usage(progname: &str) -> ! {
          \x20  -no-crop        Do not crop to active area\n\
          \x20  -no-denoise     Disable NLM denoise (same as -denoise 0)\n\
          \x20  -denoise-backend <auto|cpu|gpu>  Select execution backend\n\
-         \x20  -spp-denoise    Use Merrill SPP color processing on CPU\n\
+         \x20  -spp-pipeline   Use Merrill SPP recovery and denoise on CPU\n\
          \x20                  Neutral noise sliders; TIFF, PPM or histogram\n\
          \x20  -denoise <0-10> NLM denoise intensity. 0 = off,\n\
          \x20                  10 = full strength (default). Intermediate\n\
          \x20                  values linearly scale the NLM sigma.\n\
          \x20  -no-sgain       Do not apply spatial gain (color compensation)\n\
          \x20  -no-fix-bad     Do not fix bad pixels\n\
-         \x20  -chroma-lut     Enable scene LUT highlight recovery\n\
-         \x20                  Merrill color exports use SPP plus LUT refinement,\n\
-         \x20                  with the same limits as -spp-denoise.\n\
-         \x20  -no-chroma-lut  Disable the LUT on the selected processing path\n\
+         \x20  -chroma-lut     Enable scene-derived RGB highlight recovery\n\
+         \x20  -no-chroma-lut  Disable that LUT; retain prior recovery and gate\n\
          \x20                  Both override X3F_NO_CHROMA_LUT for rendered\n\
          \x20                  sRGB/AdobeRGB/ProPhotoRGB output.\n\
-         \x20                  Defaults preserve legacy processing or SPP alone.\n\
-         \x20                  Use -spp-denoise -no-chroma-lut for the SPP baseline.\n\
+         \x20                  Default: LUT on unless the environment disables it.\n\
+         \x20                  -chroma-lut cannot combine with -spp-pipeline.\n\
          \x20                  DNG, -color none, raw and Cineon ignore these flags.\n\
          \x20                  The environment still controls the separate DNG\n\
          \x20                  recovery LUT, including -color none output.\n\
@@ -308,7 +306,7 @@ fn parse_args(argv: &[String]) -> Args {
             "-chroma-lut" => args.rgb_chroma_lut = Some(true),
             "-no-chroma-lut" => args.rgb_chroma_lut = Some(false),
             "-no-denoise" => args.denoise_intensity = 0,
-            "-spp-denoise" => args.spp_denoise = true,
+            "-spp-pipeline" => args.spp_denoise = true,
             "-denoise-backend" => {
                 i += 1;
                 let v = argv.get(i).unwrap_or_else(|| usage(progname));
@@ -392,6 +390,11 @@ fn normalize(args: &mut Args) {
 /// exercise it without `process::exit`.
 fn validate_args(args: &Args) -> Result<(), String> {
     if args.spp_denoise {
+        if args.rgb_chroma_lut == Some(true) {
+            return Err(
+                "-spp-pipeline cannot combine with -chroma-lut; select one pipeline".into(),
+            );
+        }
         if !matches!(
             args.file_type,
             FileType::Tiff | FileType::PpmP3 | FileType::PpmP6 | FileType::Histogram
@@ -401,15 +404,15 @@ fn validate_args(args: &Args) -> Result<(), String> {
                 ColorEncoding::Srgb | ColorEncoding::AdobeRgb | ColorEncoding::ProPhotoRgb
             )
         {
-            return Err("-spp-denoise requires color TIFF, PPM or histogram output".into());
+            return Err("-spp-pipeline requires color TIFF, PPM or histogram output".into());
         }
         if args.denoise_intensity != 10 {
             return Err(
-                "-spp-denoise uses neutral SPP noise sliders and requires -denoise 10".into(),
+                "-spp-pipeline uses neutral SPP noise sliders and requires -denoise 10".into(),
             );
         }
         if args.denoise_backend == x3f_core::DenoiseBackend::Gpu {
-            return Err("-spp-denoise supports -denoise-backend auto or cpu".into());
+            return Err("-spp-pipeline supports -denoise-backend auto or cpu".into());
         }
     }
     if args.cineon && args.file_type != FileType::Tiff {
@@ -824,10 +827,10 @@ mod tests {
     }
 
     #[test]
-    fn spp_denoise_is_explicit_and_rejects_unsupported_modes() {
+    fn spp_pipeline_is_explicit_and_rejects_unsupported_modes() {
         assert!(!parse(&["in.X3F"]).spp_denoise);
         for format in ["-tiff", "-ppm", "-histogram"] {
-            let args = parse(&[format, "-color", "sRGB", "-spp-denoise", "in.X3F"]);
+            let args = parse(&[format, "-color", "sRGB", "-spp-pipeline", "in.X3F"]);
             assert!(args.spp_denoise);
             assert!(validate_args(&args).is_ok(), "{format}");
         }
@@ -842,17 +845,43 @@ mod tests {
             vec!["-tiff", "-denoise-backend", "gpu"],
         ] {
             let mut command = flags;
-            command.extend(["-spp-denoise", "in.X3F"]);
+            command.extend(["-spp-pipeline", "in.X3F"]);
             assert!(validate_args(&parse(&command)).is_err(), "{command:?}");
         }
         assert!(validate_args(&parse(&[
             "-tiff",
-            "-spp-denoise",
+            "-spp-pipeline",
             "-denoise-backend",
             "cpu",
             "in.X3F"
         ]))
         .is_ok());
+    }
+
+    #[test]
+    fn recovery_pipelines_are_separate() {
+        for flags in [
+            vec!["-chroma-lut", "-spp-pipeline"],
+            vec!["-spp-pipeline", "-chroma-lut"],
+        ] {
+            let mut command = vec!["-tiff"];
+            command.extend(flags);
+            command.push("in.X3F");
+            let error = validate_args(&parse(&command)).unwrap_err();
+            assert!(error.contains("select one pipeline"), "{error}");
+        }
+        for flags in [
+            vec!["-chroma-lut", "-no-denoise"],
+            vec!["-chroma-lut", "-denoise", "5"],
+            vec!["-chroma-lut", "-denoise-backend", "gpu"],
+            vec!["-spp-pipeline", "-no-chroma-lut"],
+            vec!["-spp-pipeline", "-chroma-lut", "-no-chroma-lut"],
+        ] {
+            let mut command = vec!["-tiff"];
+            command.extend(flags);
+            command.push("in.X3F");
+            assert!(validate_args(&parse(&command)).is_ok(), "{command:?}");
+        }
     }
 
     #[test]

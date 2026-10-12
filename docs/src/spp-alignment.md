@@ -8,37 +8,23 @@ tests. The library SHA-256 is
 `037419dc04bb1afe86dddad7a14888a1b36d6c00a0231ec50a6974a9963ce5e6`.
 
 Ordinary Merrill sRGB, Adobe RGB and ProPhoto RGB rendering uses the recovered
-calibration and output stages. The explicit `-spp-denoise` option also uses the
+calibration and output stages. The explicit `-spp-pipeline` option also uses the
 ordered float front end and the native bilateral/residual denoise sequence.
 The default renderer, DNG, scene-linear, Cineon and Quattro paths retain their
 existing processing. DNG's embedded preview retains its existing calibration.
 
-For Merrill color exports, `-chroma-lut` or
-`ProcessOptions::rgb_chroma_lut = Some(true)` selects the full SPP path with
-scene LUT refinement. This includes SPP tiled denoise and requires the same
-supported camera, resolution, output, intensity and backend as `-spp-denoise`.
-In particular, `-no-denoise` and a forced GPU backend return an error.
-`-spp-denoise -no-chroma-lut` selects the SPP baseline. Explicit choices override
-`X3F_NO_CHROMA_LUT`. With no explicit LUT choice, `-spp-denoise` keeps its native
-highlight stage and the default renderer keeps its existing LUT behavior.
-Other cameras retain their existing RGB LUT path. DNG, scene-linear, Cineon,
-camera-space and unprocessed output retain their existing processing.
-
-The refinement learns from float samples before native highlight restoration.
-Donors must have no original camera saturation marks, positive values below
-the saturation threshold in all three channels, and sufficient brightness.
-Local white levels use the same black subtraction, gains and shading as the
-image. The LUT refines only C2 where C0 and C1 remain reliable and a nearby
-ratio bin has donor evidence. It blends once from the native C2 estimate,
-before SPP applies its brightness and saturation-density neutralization.
-Missing evidence and saturation marks removed by SPP leave the baseline intact.
-LUT preparation uses a temporary float white raster and sparse proposals. Both
-are released before tiled denoise starts.
+Scene-derived chroma-LUT recovery remains selectable through `-chroma-lut` /
+`-no-chroma-lut`, or `ProcessOptions::rgb_chroma_lut`. The per-conversion choice
+overrides `X3F_NO_CHROMA_LUT`; the default preserves current rendering. LUT-off
+still uses the existing prior recovery and matrix gate, not the native Sigma
+highlight stage. The original x3fuse LUT pipeline and SPP pipeline remain
+separate. `-chroma-lut` does not select SPP and cannot combine with
+`-spp-pipeline`. Select one pipeline for each conversion.
 
 ## Explicit SPP export
 
 ```sh
-x3f_extract -tiff -color ProPhotoRGB -spp-denoise input.X3F
+x3f_extract -tiff -color ProPhotoRGB -spp-pipeline input.X3F
 ```
 
 Rust callers set `ProcessOptions::spp_denoise = true`. The default is false.
@@ -66,8 +52,9 @@ Native calls are used only to produce verification fixtures.
 
 `fix_bad=false` skips listed and detected repairs. `crop=false` returns the full
 Keep area. These library modifiers extend the native export behavior. Spatial
-gain selection and the white-balance override still apply. Set
-`rgb_chroma_lut = Some(true)` to refine the camera-based highlight estimate.
+gain selection and the white-balance override still apply. SPP uses its own
+camera-based highlight recovery. `rgb_chroma_lut = Some(true)` cannot combine
+with `spp_denoise = true`. Use `None` or `Some(false)` for SPP.
 
 ## SPP production verification
 

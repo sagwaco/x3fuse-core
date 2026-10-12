@@ -91,22 +91,23 @@ stages from the remaining legacy algorithms.
    orientation. Raw/undefined encodings have no named-space profile. PPM stores
    samples without TIFF metadata.
 
-RGB chroma-LUT recovery is selected by `-chroma-lut` and disabled by
-`-no-chroma-lut` for sRGB, Adobe RGB and ProPhoto RGB TIFF, PPM and histograms.
-On Merrill, explicit LUT selection uses the complete SPP float pipeline,
-including tiled denoise. Its scene LUT refines the native C2 highlight estimate
-before the native neutralization. The [SPP export limits](./spp-alignment.md)
-apply. Use `-spp-denoise -no-chroma-lut` for the native baseline.
-Both flags override `X3F_NO_CHROMA_LUT`. Omitting them preserves SPP alone
-when selected, or the existing default renderer and its environment setting.
-Rust callers set
+RGB chroma-LUT recovery remains an explicit option: `-chroma-lut` enables it
+and `-no-chroma-lut` disables it for rendered sRGB, Adobe RGB and ProPhoto RGB
+TIFF, PPM and histograms through the original x3fuse pipeline. It does not
+select SPP processing or impose SPP's denoise limits. Both override
+`X3F_NO_CHROMA_LUT`; omitting the flags preserves the existing default (on unless
+that environment variable is present). Rust callers set
 `ProcessOptions::rgb_chroma_lut` to `Some(true)`, `Some(false)`, or `None` for
 that default. The choice belongs to each conversion, including concurrent calls.
-On the default renderer, disabling the LUT retains prior recovery and the
-matrix gate. DNG, scene-linear,
+Disabling this LUT retains prior-based recovery and the matrix-pathology gate;
+it does not select Sigma's native highlight routine. `-spp-pipeline` selects
+the separate SPP pipeline and cannot combine with `-chroma-lut`. It uses
+camera-based highlight recovery with an
+omitted LUT flag or `-no-chroma-lut`. DNG, scene-linear,
 `-color none`, unprocessed and Cineon output ignore the RGB override.
 `X3F_NO_CHROMA_LUT` still controls the separate DNG-recovery LUT, including
-camera-space (`-color none`) output.
+camera-space (`-color none`) output. The RGB LUT remains available as an
+alternative while Sigma's native pipeline is reconstructed.
 
 The DNG path replaces stages 6–9 with highlight handling in sensor BMT
 space. Recovery is opt-in through `-dng-highlight-recovery`. On Merrill
@@ -322,7 +323,7 @@ sensor's base NLM sigma. `10` → `scale = 1.0` is full-strength denoise; `0`
 gates the pass out entirely. (Denoise output is not part of the byte-parity
 gate — every tier-2/3 test runs with `-no-denoise`.)
 
-`-spp-denoise` selects a separate Merrill float path before normalized sensor
+`-spp-pipeline` selects a separate Merrill float path before normalized sensor
 processing. `ProcessOptions::spp_denoise` carries this choice per conversion.
 The path runs float gains and ordered repairs, native highlight restoration,
 despeckle, row/column correction, tiled bilateral and residual denoise,

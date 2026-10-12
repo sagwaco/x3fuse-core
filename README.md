@@ -86,7 +86,7 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 | `-denoise <0-10>`         | NLM denoise intensity: `0` = off, `10` = full strength (**default**); intermediate values linearly scale the NLM sigma |
 | `-no-denoise`             | disable the NLM denoise pass (alias for `-denoise 0`)                               |
 | `-denoise-backend <auto\|cpu\|gpu>` | execution backend; `auto` falls back to CPU, `gpu` fails if acceleration is unavailable |
-| `-spp-denoise` | Merrill SPP float processing on CPU with neutral noise sliders; full-resolution color TIFF, PPM or histogram |
+| `-spp-pipeline` | Merrill SPP recovery and denoise on CPU with neutral noise sliders; full-resolution color TIFF, PPM or histogram |
 | `-no-crop`                | do not crop to the active image area                                               |
 | `-no-sgain` / `-sgain`    | disable / force spatial-gain (lens color) compensation                             |
 | `-no-fix-bad`             | do not fix bad pixels                                                              |
@@ -124,7 +124,7 @@ x3f_extract -dng -denoise 5 input.X3F
 x3f_extract -v -dng -denoise-backend gpu input.X3F
 
 # Merrill SPP processing with neutral noise sliders
-x3f_extract -tiff -color ProPhotoRGB -spp-denoise input.X3F
+x3f_extract -tiff -color ProPhotoRGB -spp-pipeline input.X3F
 
 # Metadata dump
 x3f_extract -meta input.X3F
@@ -133,18 +133,15 @@ x3f_extract -meta input.X3F
 ## RGB highlight recovery
 
 For rendered RGB, `-chroma-lut` and `-no-chroma-lut` explicitly enable or disable
-the scene LUT, overriding `X3F_NO_CHROMA_LUT`. The default renderer keeps its LUT
-enabled unless that environment variable is present. Disabling its LUT retains
-prior recovery and the matrix gate. These RGB options do not affect DNG or
-Cineon output.
+the scene-derived LUT, overriding `X3F_NO_CHROMA_LUT`. The default remains on
+unless that environment variable is present. Disabling the LUT retains the
+prior recovery and matrix gate; it does not select native Sigma recovery. These
+RGB options do not affect DNG or Cineon output. The LUT uses the original
+x3fuse pipeline and does not select SPP. `-chroma-lut` cannot combine with
+`-spp-pipeline`; select one pipeline. `-no-chroma-lut` is accepted with SPP
+and does not disable SPP's camera-based highlight recovery.
 
-`-chroma-lut` selects the complete SPP path for Merrill color exports and adds
-scene LUT refinement to its highlight recovery. It has the same output,
-resolution, denoise intensity and CPU backend limits as `-spp-denoise`.
-Use `-spp-denoise -no-chroma-lut` to select the SPP baseline for comparison.
-Without either option, the current processing path remains unchanged.
-
-`-spp-denoise` selects the complete Merrill float path, including camera-based
+`-spp-pipeline` selects the complete Merrill float path, including camera-based
 highlight repair, tiled denoise and sharpening. It requires an HI Merrill file,
 color output and denoise intensity 10. DNG, Cineon, monochrome, MED/LOW and a
 forced GPU backend return an error. Rust callers set `ProcessOptions::spp_denoise`.

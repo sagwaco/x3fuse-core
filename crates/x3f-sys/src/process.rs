@@ -2892,7 +2892,6 @@ pub(crate) struct MerrillPreparedFloat {
 /// `despeckle_strength` is the calibrated request strength (NoiseParams+0x14);
 /// `None` uses the verified constant-column derivation, which returns an
 /// error for unverified ISO tables.
-/// `lut_prior` enables scene LUT refinement in gained sensor units.
 /// `observe` receives each stage name, the raster after the stage and a
 /// short detail. Every error and cancellation propagates. With `fix_bad`,
 /// a missing primary list or BadnessTable is an error: the native caller
@@ -2903,7 +2902,6 @@ pub(crate) unsafe fn merrill_prepare_float(
     apply_sgain: bool,
     fix_bad: bool,
     despeckle_strength: Option<f32>,
-    lut_prior: Option<[f64; 3]>,
     control: Control<'_>,
     observe: &mut dyn FnMut(&'static str, &[f32], String),
 ) -> crate::Result<MerrillPreparedFloat> {
@@ -3064,41 +3062,7 @@ pub(crate) unsafe fn merrill_prepare_float(
     let detail = if let Some(highlight) = highlight {
         let mut dense = vec![0_u8; width * height];
         let mut sat = highlight.sat;
-        let mut refinement = if let Some(prior) = lut_prior {
-            let mut max_raw = [0; 3];
-            if unsafe { x3f_get_max_raw(x3f, max_raw.as_mut_ptr()) } == 0 {
-                return Err(crate::Error::InvalidData("missing SPP LUT white levels"));
-            }
-            // Match the image's local units, including spatial and radial gain.
-            let mut white = Vec::new();
-            white
-                .try_reserve_exact(data.len())
-                .map_err(|_| crate::Error::Allocation)?;
-            white.resize(data.len(), 0.);
-            for row in white.chunks_mut(row_stride) {
-                control.check()?;
-                for pixel in row[..width * 3].chunks_exact_mut(3) {
-                    pixel.copy_from_slice(&max_raw.map(|v| v as f32));
-                }
-            }
-            front.apply_in_place(&mut white, width, height, row_stride, control)?;
-            if let Some(radial) = &radial {
-                radial.apply(&mut white, width, height, row_stride, control)?;
-            }
-            Some(crate::highlight::spp::Refinement::new(
-                &data,
-                &white,
-                [width, height],
-                row_stride,
-                &sat,
-                highlight.valid,
-                prior,
-                control,
-            )?)
-        } else {
-            None
-        };
-        let stats = highlight.restore.restore_with_refinement(
+        let stats = highlight.restore.restore(
             &mut data,
             width,
             height,
@@ -3107,11 +3071,6 @@ pub(crate) unsafe fn merrill_prepare_float(
             &mut dense,
             highlight.valid,
             control,
-            |offset, value| {
-                refinement
-                    .as_mut()
-                    .map_or(value, |r| r.apply(offset, value))
-            },
         )?;
         format!(
             "donors={} removed={} occupied={} dense={} lut={}",
@@ -5503,7 +5462,6 @@ pub struct ProcessingOptions {
     pub dng_shoulder: bool,
     pub cineon: bool,
     /// Per-conversion RGB override; None preserves X3F_NO_CHROMA_LUT behavior.
-    /// Some(true) selects SPP with LUT refinement for Merrill color output.
     pub rgb_chroma_lut: Option<bool>,
 }
 
@@ -5654,15 +5612,12 @@ unsafe fn get_image_impl(
     linear: Option<&mut SceneLinearData>,
 ) -> crate::Result<()> {
     let dng_recovery = options.dng_highlight_recovery;
-    let use_spp = options.spp_denoise
-        || (options.rgb_chroma_lut == Some(true)
-            && !options.cineon
-            && matches!(
-                encoding,
-                x3f_color_encoding_e_SRGB | x3f_color_encoding_e_ARGB | x3f_color_encoding_e_PPRGB
-            )
-            && unsafe { is_merrill_model(x3f) });
-    if use_spp {
+    if options.spp_denoise {
+        if options.rgb_chroma_lut == Some(true) {
+            return Err(crate::Error::InvalidData(
+                "SPP processing cannot combine with RGB chroma LUT recovery; select one pipeline",
+            ));
+        }
         spp::validate_mode(
             encoding,
             options.cineon,
@@ -5682,7 +5637,7 @@ unsafe fn get_image_impl(
         wb = unsafe { x3f_get_wb(x3f) };
     }
 
-    if use_spp {
+    if options.spp_denoise {
         return unsafe {
             spp::render(
                 x3f,
@@ -5693,7 +5648,6 @@ unsafe fn get_image_impl(
                 fix_bad != 0,
                 apply_sgain != 0,
                 wb,
-                options.rgb_chroma_lut == Some(true),
                 control,
             )
         };
@@ -5780,16 +5734,7 @@ unsafe fn get_image_impl(
             );
         };
         match unsafe {
-            merrill_prepare_float(
-                x3f,
-                wb,
-                apply_sgain != 0,
-                true,
-                None,
-                None,
-                control,
-                &mut observe,
-            )
+            merrill_prepare_float(x3f, wb, apply_sgain != 0, true, None, control, &mut observe)
         } {
             Ok(prepared) => eprintln!(
                 "X3F float front: prepared {}x{}",
