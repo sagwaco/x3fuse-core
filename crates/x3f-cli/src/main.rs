@@ -143,11 +143,14 @@ fn usage(progname: &str) -> ! {
          \x20                  values linearly scale the NLM sigma.\n\
          \x20  -no-sgain       Do not apply spatial gain (color compensation)\n\
          \x20  -no-fix-bad     Do not fix bad pixels\n\
-         \x20  -chroma-lut     Enable scene-derived RGB highlight recovery\n\
-         \x20  -no-chroma-lut  Disable that LUT; retain prior recovery and gate\n\
+         \x20  -chroma-lut     Enable scene LUT highlight recovery\n\
+         \x20                  Merrill color exports use SPP plus LUT refinement,\n\
+         \x20                  with the same limits as -spp-denoise.\n\
+         \x20  -no-chroma-lut  Disable the LUT on the selected processing path\n\
          \x20                  Both override X3F_NO_CHROMA_LUT for rendered\n\
          \x20                  sRGB/AdobeRGB/ProPhotoRGB output.\n\
-         \x20                  Default: LUT on unless the environment disables it.\n\
+         \x20                  Defaults preserve legacy processing or SPP alone.\n\
+         \x20                  Use -spp-denoise -no-chroma-lut for the SPP baseline.\n\
          \x20                  DNG, -color none, raw and Cineon ignore these flags.\n\
          \x20                  The environment still controls the separate DNG\n\
          \x20                  recovery LUT, including -color none output.\n\

@@ -133,10 +133,16 @@ x3f_extract -meta input.X3F
 ## RGB highlight recovery
 
 For rendered RGB, `-chroma-lut` and `-no-chroma-lut` explicitly enable or disable
-the scene-derived LUT, overriding `X3F_NO_CHROMA_LUT`. The default remains on
-unless that environment variable is present. Disabling the LUT retains the
-prior recovery and matrix gate; it does not select native Sigma recovery. These
-RGB options do not affect SPP, DNG or Cineon output.
+the scene LUT, overriding `X3F_NO_CHROMA_LUT`. The default renderer keeps its LUT
+enabled unless that environment variable is present. Disabling its LUT retains
+prior recovery and the matrix gate. These RGB options do not affect DNG or
+Cineon output.
+
+`-chroma-lut` selects the complete SPP path for Merrill color exports and adds
+scene LUT refinement to its highlight recovery. It has the same output,
+resolution, denoise intensity and CPU backend limits as `-spp-denoise`.
+Use `-spp-denoise -no-chroma-lut` to select the SPP baseline for comparison.
+Without either option, the current processing path remains unchanged.
 
 `-spp-denoise` selects the complete Merrill float path, including camera-based
 highlight repair, tiled denoise and sharpening. It requires an HI Merrill file,

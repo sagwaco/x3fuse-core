@@ -150,14 +150,16 @@ pub struct ProcessOptions {
     /// `fix_bad=false` skips listed and detected repairs; `crop=false` returns
     /// the full Keep area. These modifiers extend the native export behavior.
     pub spp_denoise: bool,
-    /// Use scene-derived chroma-LUT recovery for sRGB, Adobe RGB or ProPhoto RGB.
-    /// `None` (default) enables it unless `X3F_NO_CHROMA_LUT` is present;
-    /// `Some(true)` or `Some(false)` overrides that environment setting for
-    /// this conversion. Disabling the LUT retains the prior-based recovery
-    /// and matrix-pathology gate; it does not select Sigma's native recovery.
-    /// Ignored by SPP, DNG, scene-linear, `ColorEncoding::None`, unprocessed and
-    /// Cineon output. `X3F_NO_CHROMA_LUT` still controls the separate DNG
-    /// recovery LUT, including camera-space (`None`) output.
+    /// Select scene LUT recovery for sRGB, Adobe RGB or ProPhoto RGB.
+    /// On Merrill, `Some(true)` selects SPP processing and refines its highlight
+    /// estimate. It requires full-resolution output, denoise intensity 10 and
+    /// the Auto or Cpu backend, as with `spp_denoise`.
+    /// `None` preserves the current path: SPP alone when `spp_denoise` is true,
+    /// otherwise legacy LUT recovery unless `X3F_NO_CHROMA_LUT` is present.
+    /// `Some(false)` disables the LUT on the selected path. Explicit choices
+    /// override that environment setting for this conversion.
+    /// DNG, scene-linear, `ColorEncoding::None`, unprocessed and Cineon ignore
+    /// this option. The environment still controls the separate DNG LUT.
     pub rgb_chroma_lut: Option<bool>,
     /// Directory of pre-rendered DNG `OpcodeList3` blobs (Sigma's per-
     /// model / per-aperture flat-fielding gain maps). When set, the DNG

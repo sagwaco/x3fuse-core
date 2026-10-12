@@ -388,6 +388,7 @@ fn denoise_image_matches_native_reference_files() {
                 true,
                 true,
                 Some(noise.despeckle),
+                None,
                 control,
                 &mut |_, _, _| {},
             )

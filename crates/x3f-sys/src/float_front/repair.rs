@@ -789,6 +789,7 @@ mod tests {
                     true,
                     true,
                     None,
+                    None,
                     Control::none(),
                     &mut observe,
                 )

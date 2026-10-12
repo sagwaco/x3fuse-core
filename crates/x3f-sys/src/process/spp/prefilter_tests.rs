@@ -293,6 +293,7 @@ fn prefilter_matches_native_sd1() {
             true,
             true,
             Some(noise.despeckle),
+            None,
             control,
             &mut |_, _, _| {},
         )

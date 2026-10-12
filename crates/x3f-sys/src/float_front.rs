@@ -534,7 +534,6 @@ impl HighlightRestoration {
 
     /// Run the full stage in place. `sat` is the packed RGB saturation
     /// map (cleaned in place); `dense` receives the dilation map.
-    #[allow(clippy::too_many_lines)]
     pub fn restore(
         &self,
         data: &mut [f32],
@@ -545,6 +544,33 @@ impl HighlightRestoration {
         dense: &mut [u8],
         valid: [i32; 4],
         control: Control<'_>,
+    ) -> Result<HighlightStats> {
+        self.restore_with_refinement(
+            data,
+            width,
+            height,
+            row_stride,
+            sat,
+            dense,
+            valid,
+            control,
+            |_, c| c,
+        )
+    }
+
+    /// Refine the native C2 estimate before its final neutralization.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn restore_with_refinement(
+        &self,
+        data: &mut [f32],
+        width: usize,
+        height: usize,
+        row_stride: usize,
+        sat: &mut [u8],
+        dense: &mut [u8],
+        valid: [i32; 4],
+        control: Control<'_>,
+        mut refine: impl FnMut(usize, f32) -> f32,
     ) -> Result<HighlightStats> {
         control.check()?;
         if width < 4 || height < 4 {
@@ -683,6 +709,9 @@ impl HighlightRestoration {
                 if stats.have_lut && sat[3 * (y_index * width + x_index) + 2] != 0 {
                     let index = Self::bin((a * 255.0) / (a + b));
                     c = (b * lut[index]).min(32767.0);
+                }
+                if sat[3 * (y_index * width + x_index) + 2] != 0 {
+                    c = refine(y_index * row_stride + 3 * x_index + 2, c);
                 }
                 // Neutralization over the sorted current channels
                 // (total_cmp: the pub function must not panic on a

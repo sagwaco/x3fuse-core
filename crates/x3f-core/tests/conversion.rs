@@ -212,7 +212,7 @@ fn concurrent_conversions_match_serial_for_per_file_options() {
                 &clipped,
                 OutputFormat::Tiff,
                 ProcessOptions {
-                    denoise_intensity: 0,
+                    spp_denoise: true,
                     rgb_chroma_lut: Some(enabled),
                     ..ProcessOptions::default()
                 },
@@ -387,6 +387,18 @@ fn spp_errors_and_cancellation_do_not_publish_output() {
                 ..options.clone()
             },
             ProcessOptions {
+                denoise_backend: DenoiseBackend::Gpu,
+                ..options.clone()
+            },
+            ProcessOptions {
+                spp_denoise: false,
+                rgb_chroma_lut: Some(true),
+                denoise_intensity: 0,
+                ..options.clone()
+            },
+            ProcessOptions {
+                spp_denoise: false,
+                rgb_chroma_lut: Some(true),
                 denoise_backend: DenoiseBackend::Gpu,
                 ..options.clone()
             },

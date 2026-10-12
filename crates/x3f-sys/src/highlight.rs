@@ -39,6 +39,8 @@ use crate::*;
 // libc compat — see `sysabi.rs`.
 use crate::sysabi as libc;
 
+pub(crate) mod spp;
+
 // ----------------------------------------------------------------------
 // highlight_params_t  (matches the C typedef in src/x3f_process.c)
 // ----------------------------------------------------------------------
@@ -602,6 +604,24 @@ pub unsafe extern "C" fn chroma_lut_apply_pixel(
         return 0;
     }
     let s = unsafe { std::slice::from_raw_parts_mut(s, 3) };
+    let Some((strength, recovered)) =
+        (unsafe { chroma_lut_proposal([s[0], s[1], s[2]], lut, stats) })
+    else {
+        return 0;
+    };
+    s[2] = (1.0 - strength) * s[2] + strength * recovered;
+    1
+}
+
+// Separate the estimate from its blend so SPP can supply the baseline value.
+unsafe fn chroma_lut_proposal(
+    s: [f64; 3],
+    lut: &chroma_lut_t,
+    stats: *mut chroma_lut_apply_stats_t,
+) -> Option<(f64, f64)> {
+    if lut.valid == 0 {
+        return None;
+    }
     if !stats.is_null() {
         unsafe { (*stats).total_eval += 1 };
     }
@@ -613,7 +633,7 @@ pub unsafe extern "C" fn chroma_lut_apply_pixel(
         if !stats.is_null() {
             unsafe { (*stats).t_strength_kill += 1 };
         }
-        return 0;
+        return None;
     }
     if t_strength > 1.0 {
         t_strength = 1.0;
@@ -626,7 +646,7 @@ pub unsafe extern "C" fn chroma_lut_apply_pixel(
         if !stats.is_null() {
             unsafe { (*stats).asym_kill += 1 };
         }
-        return 0;
+        return None;
     }
     if asym_strength > 1.0 {
         asym_strength = 1.0;
@@ -637,7 +657,7 @@ pub unsafe extern "C" fn chroma_lut_apply_pixel(
         if !stats.is_null() {
             unsafe { (*stats).bm_clip_kill += 1 };
         }
-        return 0;
+        return None;
     }
 
     // Sigma's brightness blend — weighted_lum from sorted s[] drives a
@@ -699,7 +719,7 @@ pub unsafe extern "C" fn chroma_lut_apply_pixel(
                 (*stats).bin_kill_hist[bin] += 1;
             }
         }
-        return 0;
+        return None;
     }
 
     let mut recovered = sm * bin_v;
@@ -707,15 +727,13 @@ pub unsafe extern "C" fn chroma_lut_apply_pixel(
         recovered = lut.recovery_cap;
     }
 
-    s[2] = (1.0 - strength) * s[2] + strength * recovered;
-
     if !stats.is_null() {
         unsafe {
             (*stats).applied += 1;
             (*stats).bin_applied_hist[bin] += 1;
         }
     }
-    1
+    Some((strength, recovered))
 }
 
 // ----------------------------------------------------------------------
