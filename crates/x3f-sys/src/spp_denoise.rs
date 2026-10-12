@@ -46,6 +46,10 @@
 //! `resample_image` applies these tables to RGB float tiles. It preserves
 //! the native phase carry, row padding and four untouched destination rows.
 //! Its 1,224 image cases match the native output bits.
+//!
+//! `compute_edge_map` starts stage 7d. Its 13,440 image cases match the
+//! native tiled overload on arm64 macOS. Other targets compare NaN positions
+//! and all non-NaN bits. The median helper matches 59,049 direct cases.
 
 use crate::{Error, Result};
 
@@ -504,6 +508,150 @@ pub fn resample_image(
     Ok(())
 }
 
+/// Parameters for the tiled native edge map.
+#[derive(Clone, Copy, Debug)]
+pub struct EdgeMapParams {
+    /// Added to each source sample before the median filter.
+    pub bias: f32,
+    /// Multiplies source samples when `noise_model` is absent.
+    pub scale: f32,
+    /// Optional channel triples: constant terms, then linear terms.
+    /// With a model, the source scale is 1 and each divisor is
+    /// `constant + linear * median_sample`, evaluated in f64.
+    pub noise_model: Option<[[f64; 3]; 2]>,
+    /// Sum channel energies for each direction. Otherwise select the largest
+    /// horizontal energy and the largest vertical energy separately.
+    pub accumulate: bool,
+    /// Apply the final five-sample cross average.
+    pub smooth: bool,
+    /// Exclude this many source rows and columns at each image edge.
+    pub border: usize,
+}
+
+// The native comparison order also determines which signed zero is selected.
+fn edge_median5([mut s0, mut s1, s2, mut s3, mut s4]: [f32; 5]) -> f32 {
+    let mut s5 = if s0 > s1 { s1 } else { s0 };
+    s0 = if s0 > s1 { s0 } else { s1 };
+    let greater = s3 > s4;
+    s1 = if greater { s4 } else { s3 };
+    s3 = if greater { s3 } else { s4 };
+    let greater = s5 > s1;
+    s4 = if greater { s3 } else { s0 };
+    s1 = if greater { s5 } else { s1 };
+    s0 = if greater { s0 } else { s3 };
+    s3 = if s4 < s1 { s4 } else { s1 };
+    s5 = if s0 > s2 { s2 } else { s0 };
+    s3 = if !(s1 < s2) { s3 } else { s5 };
+    s0 = if s4 < s0 { s4 } else { s0 };
+    s5 = if s1 > s2 { s2 } else { s1 };
+    s0 = if !(s4 < s1) { s0 } else { s5 };
+    if !(s4 < s2) {
+        s3
+    } else {
+        s0
+    }
+}
+
+/// Compute the native tiled edge map from RGB floats into a mono destination.
+/// `size` is [columns, rows]. Both strides count f32 samples.
+/// Only columns `[border + 1, width - border - 1)` and rows
+/// `[border + 3, height - border - 3)` are written. Other samples stay intact.
+/// The two scratch columns beside this region stay zero.
+/// Both strides must be positive. Both slices must include the last row's padding.
+/// Empty images or borders larger than half either dimension are rejected,
+/// including some layouts where the native function returns without a write.
+/// Invalid layouts return an error before any destination write.
+pub fn compute_edge_map(
+    source: &[f32],
+    source_stride: usize,
+    destination: &mut [f32],
+    size: [usize; 2],
+    destination_stride: usize,
+    params: &EdgeMapParams,
+) -> Result<()> {
+    let [width, height] = size;
+    let border = params.border;
+    let row_samples = width.checked_mul(3);
+    if width == 0
+        || height == 0
+        || !row_samples.is_some_and(|n| n <= source_stride)
+        || destination_stride < width
+        || !height
+            .checked_mul(source_stride)
+            .is_some_and(|n| n <= source.len())
+        || !height
+            .checked_mul(destination_stride)
+            .is_some_and(|n| n <= destination.len())
+        || border > width / 2
+        || border > height / 2
+    {
+        return Err(Error::InvalidData("invalid SPP edge map layout"));
+    }
+    if width - 2 * border <= 2 || height - 2 * border <= 6 {
+        return Ok(());
+    }
+    let mut rgb = vec![vec![0.0_f32; row_samples.unwrap()]; 5];
+    let mut edges = vec![vec![0.0_f32; width]; 3];
+    let scale = if params.noise_model.is_some() {
+        1.0
+    } else {
+        params.scale
+    };
+    for y in border..height - border {
+        for x in border + 1..width - border - 1 {
+            let mut horizontal = [0.0_f32; 3];
+            let mut vertical = [0.0_f32; 3];
+            for c in 0..3 {
+                let i = x * 3 + c;
+                rgb[4][i] = source[y * source_stride + i] * scale + params.bias;
+                rgb[2][i] = edge_median5([
+                    rgb[3][i - 3],
+                    rgb[3][i],
+                    rgb[3][i + 3],
+                    rgb[2][i],
+                    rgb[4][i],
+                ]);
+                let divisor = if let Some(model) = params.noise_model {
+                    (model[0][c] + model[1][c] * f64::from(rgb[1][i])) as f32
+                } else {
+                    rgb[1][i]
+                };
+                let inverse = 1.0_f32 / divisor;
+                let dx = (rgb[1][i - 3] - rgb[1][i + 3]) * inverse;
+                let dy = (rgb[0][i] - rgb[2][i]) * inverse;
+                horizontal[c] = dx * dx;
+                vertical[c] = dy * dy;
+            }
+            let energy = |v: [f32; 3]| {
+                if params.accumulate {
+                    (v[0] + v[1]) + v[2]
+                } else {
+                    let tail = if v[1] > v[2] { v[1] } else { v[2] };
+                    if v[0] > tail {
+                        v[0]
+                    } else {
+                        tail
+                    }
+                }
+            };
+            edges[2][x] = ((energy(horizontal) + energy(vertical)) * 0.5).sqrt();
+            if y >= border + 6 {
+                let value = if params.smooth {
+                    let sum = edges[2][x]
+                        + (edges[0][x] + (edges[1][x + 1] + (edges[1][x] + edges[1][x - 1])));
+                    (f64::from(sum) * 0.2_f64) as f32
+                } else {
+                    edges[1][x]
+                };
+                destination[(y - 3) * destination_stride + x] = value;
+            }
+        }
+        rgb.rotate_left(1);
+        edges.rotate_left(1);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,6 +693,186 @@ mod tests {
                 .collect::<Vec<_>>()
                 .as_slice(),
         )
+    }
+
+    #[test]
+    fn edge_median_matches_native_special_values() {
+        let values = [
+            0xc080_0000,
+            0xbf80_0000,
+            0x8000_0000,
+            0,
+            0x3f80_0000,
+            0x4080_0000,
+            0x7fc1_2345,
+            0x7f80_0000,
+            0xff80_0000,
+        ]
+        .map(f32::from_bits);
+        let mut output = Vec::with_capacity(59_049);
+        for a in values {
+            for b in values {
+                for c in values {
+                    for d in values {
+                        for e in values {
+                            output.push(edge_median5([a, b, c, d, e]));
+                        }
+                    }
+                }
+            }
+        }
+        let fixture = include_str!("../tests/fixtures/spp-edge-map-native.txt");
+        let row = fixture
+            .lines()
+            .find(|line| line.starts_with("MEDIAN "))
+            .unwrap();
+        let fields: Vec<_> = row.split_whitespace().collect();
+        assert_eq!(fields[..3], ["MEDIAN", "9", "59049"]);
+        assert_eq!(
+            fnv_f32(&output),
+            u64::from_str_radix(fields[3], 16).unwrap()
+        );
+    }
+
+    #[test]
+    fn edge_map_matches_native_battery() {
+        let fixture = include_str!("../tests/fixtures/spp-edge-map-native.txt");
+        let mut cases = 0;
+        for line in fixture.lines().filter(|line| line.starts_with("EDGE ")) {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let values: Vec<usize> = fields[1..7].iter().map(|v| v.parse().unwrap()).collect();
+            let [width, height, border, padding, pattern, mode] = values[..] else {
+                panic!()
+            };
+            let source_stride = width * 3 + padding;
+            let destination_stride = width + padding;
+            let mut source = vec![-123.25_f32; 8 + source_stride * height + 8];
+            let mut destination = vec![-321.5_f32; 8 + destination_stride * height + 8];
+            let mut state = 0x1234_5678_u32;
+            for y in 0..height {
+                for x in 0..width {
+                    for c in 0..3 {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        let value = match pattern {
+                            0 => ((state >> 16) as i32 - 32768) as f32 / 4096.0,
+                            1 => (c + 1) as f32,
+                            2 => {
+                                if x == width / 2 && y == height / 2 {
+                                    (16 * (c + 1)) as f32
+                                } else {
+                                    0.0
+                                }
+                            }
+                            3 => (x + 2 * y + 3 * c) as f32 / 8.0,
+                            4 => {
+                                if (x + y + c) % 2 == 1 {
+                                    -0.0
+                                } else {
+                                    0.0
+                                }
+                            }
+                            5 => {
+                                if (x + 3 * y + 5 * c) % 19 == 0 {
+                                    f32::from_bits(0x7fc1_2345)
+                                } else {
+                                    ((state >> 16) as i32 - 32768) as f32 / 4096.0
+                                }
+                            }
+                            _ => panic!("unknown pattern"),
+                        };
+                        source[8 + y * source_stride + x * 3 + c] = value;
+                    }
+                }
+            }
+            assert_eq!(
+                fnv_f32(&source),
+                u64::from_str_radix(fields[7], 16).unwrap(),
+                "{line}"
+            );
+            let params = EdgeMapParams {
+                bias: if mode & 8 != 0 { 16.7 } else { 8.0 },
+                scale: if mode & 8 != 0 { -0.73 } else { 0.375 },
+                noise_model: (mode & 2 != 0).then_some(if mode & 8 != 0 {
+                    [[2.03, 3.17, 5.29], [0.12345, 0.23456, 0.45678]]
+                } else {
+                    [[2.0, 3.0, 5.0], [0.125, 0.25, 0.5]]
+                }),
+                accumulate: mode & 1 != 0,
+                smooth: mode & 4 != 0,
+                border,
+            };
+            compute_edge_map(
+                &source[8..8 + height * source_stride],
+                source_stride,
+                &mut destination[8..8 + height * destination_stride],
+                [width, height],
+                destination_stride,
+                &params,
+            )
+            .unwrap();
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            assert_eq!(
+                fnv_f32(&destination),
+                u64::from_str_radix(fields[8], 16).unwrap(),
+                "{line}"
+            );
+            // NaN payload and sign can differ between CPU architectures.
+            for value in &mut destination {
+                if value.is_nan() {
+                    *value = f32::from_bits(0x7fc0_0000);
+                }
+            }
+            assert_eq!(
+                fnv_f32(&destination),
+                u64::from_str_radix(fields[9], 16).unwrap(),
+                "{line}"
+            );
+            cases += 1;
+        }
+        assert_eq!(cases, 13_440);
+    }
+
+    #[test]
+    fn edge_map_rejects_invalid_layout_before_writes() {
+        let source = [1.0; 3 * 7 * 13];
+        let params = EdgeMapParams {
+            bias: 8.0,
+            scale: 0.375,
+            noise_model: None,
+            accumulate: true,
+            smooth: true,
+            border: 0,
+        };
+        for (source_len, source_stride, size, destination_stride, border) in [
+            (source.len() - 1, 21, [7, 13], 7, 0),
+            (source.len(), 20, [7, 13], 7, 0),
+            (source.len(), 21, [7, 13], 6, 0),
+            (source.len(), 21, [7, 14], 7, 0),
+            (source.len(), 21, [0, 13], 7, 0),
+            (source.len(), 21, [7, 0], 7, 0),
+            (source.len(), 21, [7, 13], 7, 4),
+            (source.len(), 21, [7, 13], 7, usize::MAX),
+            (source.len(), 21, [usize::MAX, 13], 7, 0),
+            (source.len(), usize::MAX, [7, 13], 7, 0),
+            (source.len(), 21, [7, 13], usize::MAX, 0),
+        ] {
+            let mut destination = [-321.5; 7 * 13];
+            let mut params = params;
+            params.border = border;
+            assert!(compute_edge_map(
+                &source[..source_len],
+                source_stride,
+                &mut destination,
+                size,
+                destination_stride,
+                &params
+            )
+            .is_err());
+            assert_eq!(destination, [-321.5; 7 * 13]);
+        }
+        let mut destination = [-321.5; 7 * 13 - 1];
+        assert!(compute_edge_map(&source, 21, &mut destination, [7, 13], 7, &params).is_err());
+        assert_eq!(destination, [-321.5; 7 * 13 - 1]);
     }
 
     #[test]

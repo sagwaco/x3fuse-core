@@ -290,6 +290,14 @@ unchanged; no new image-quality or full-pipeline parity result is claimed.
   filter phase carry, source reads across row padding, negative zero, and
   the four destination rows that the native kernel does not write.
   Invalid buffer extents return an error before the first output write.
+  Stage 7d now includes the tiled `ComputeEdgeMap` kernel. It matches
+  13,440 native image cases on arm64 macOS with sum/max channel energy,
+  optional noise models, optional smoothing, padded rows and excluded borders. The
+  median helper matches 59,049 cases, including signed zeros and NaNs.
+  Other targets check NaN positions and all non-NaN output bits.
+  The edge map preserves the native output region and float operation
+  order. `LocalMean`, `BilateralFilterRGB` and the later denoise stages
+  remain open. These kernels have no production caller yet.
   Per-stage verification is compositional:
   kernels match their archived oracles, and corpus pins are self-recorded
   from the trace (deterministic members of the native result family, not
