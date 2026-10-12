@@ -40,10 +40,8 @@
 //! kernels, detects the phase period by comparing kernel anchors,
 //! and emits the kernel table, the phase count, the phase offsets
 //! and the leading tap. The geometry is reproduced in the native's
-//! exact operation order and pinned on every scale of the native
-//! battery; the kernel table is pinned bit-for-bit on the scales
-//! listed in the function documentation (the fractional-downscale
-//! table has an open one-ulp divergence, documented there).
+//! exact operation order. The geometry and kernel table match all
+//! 35 scales in the native test set, including fractional scales.
 
 /// One `GetTanhLUT` result: the table size and the three channel
 /// tables in the native object order `{A, C, B}` (the object stores
@@ -217,9 +215,9 @@ pub fn fast_bilateral_coeffs(
 /// `floor(center - window / 2)`, where `window = 2 / scale` when
 /// scaling down and `2.0` when scaling up. Each downscaling tap
 /// weight clamps `|center - tap| * scale` to [0, 1] in f32, then
-/// computes `1 - clamped` in f64 and narrows once (the native
-/// multiplies by a constant 1.0 gain, a bit-exact no-op, omitted
-/// here); the upscaling weight is the f32 tent
+/// computes `(1 - f64(clamped)) * f64(scale)` and narrows once.
+/// Keep the scale factor before normalization to preserve float
+/// rounding. The upscaling weight is the f32 tent
 /// `1 - |center - tap|`, zero past 1. Every kernel is normalized
 /// by its own tap sum and accumulated into one average buffer.
 ///
@@ -233,31 +231,10 @@ pub fn fast_bilateral_coeffs(
 /// floor-start deltas, and `table` the normalized per-phase kernels
 /// cropped to the nonzero span.
 ///
-/// Parity domain. The geometry (`kernel_x`, `kernel_y`, `tail`,
-/// `offsets`, and the crop) matches the native bit-for-bit on
-/// every scale of the battery below (35 rows, recorded across the
-/// native sweep files of the stage 7c checkpoint). The kernel
-/// table is bit-for-bit on every scale whose tent products are
-/// exactly representable (0.0625, 0.125, 0.25, 0.5, 0.6), and on
-/// every upsampling scale (1.0, 1.14285715, 1.3333334, 1.5, 1.6,
-/// 2.0, 2.6666667, 3.0, 4.0, 8.0; the up path has no multiply by
-/// the scale). On the remaining downscaling scales (0.05, 0.4,
-/// 0.7, 0.375 and the other fractional eighths) the table differs
-/// from the native by scattered one-ulp entries. The
-/// investigation record (the stage 7c checkpoint in x3f-docs)
-/// rules out a rounding-mode difference (the runtime FPCR is
-/// round-to-nearest and forcing it reproduces the native table)
-/// and an instruction misreading (both the arm64 and x86_64
-/// slices decode to this exact pipeline, and in-process hardware
-/// probes confirm the arithmetic). The native's tent weight for
-/// the differing taps is unreachable by any single-rounding
-/// variant of `1 - fl32(|d| * scale)`, so the native computes
-/// those products by a subtly different formula that a later
-/// checkpoint must recover (the anomalies correlate with
-/// `|d| * scale` landing within one to two ulps of a dyadic
-/// rational). The two retained SPP references only use verified
-/// scales (identity and 0.5), so this open item does not affect
-/// them.
+/// The geometry and table match all 35 native test scales. The
+/// test set includes the request scales in eighths from 0.375 to
+/// 1.0 and their reciprocals. `crp-complete-results.txt` in the
+/// x3f-docs checkpoint records every scale and table as exact bits.
 ///
 /// Domain contract. The average must contain a nonzero entry and
 /// some probe in 1..=63 must match the anchor. The native scans
@@ -305,12 +282,11 @@ pub fn compute_resample_params(scale: f32) -> ResampleParams {
             // abs), not fabs; identical for the reachable values.
             let magnitude = if distance < 0.0 { -distance } else { distance };
             let value = if scale < 1.0 {
-                // Clamp in f32 (fmul, then fcsel against 0 and 1),
-                // then 1 - clamped in f64, narrowed once by fcvt.
+                // The saved d15 is f64(scale); apply it before the f32 rounding.
                 let clamped = magnitude * scale;
                 let clamped = if clamped < 0.0 { 0.0 } else { clamped };
                 let clamped = if clamped > 1.0 { 1.0 } else { clamped };
-                (1.0 - f64::from(clamped)) as f32
+                ((1.0 - f64::from(clamped)) * scale64) as f32
             } else if magnitude > 1.0 {
                 // The up path compares first, then 1 - |d| in f32.
                 0.0
@@ -667,27 +643,22 @@ mod tests {
         assert_eq!(lut.tables[0][256], lut.tables[0][257]);
     }
 
-    /// The 16-scale ComputeResampleParams battery from the native
-    /// oracle (kernel-results.txt plus the stage 7c sweeps, all
-    /// deterministic across runs): scale, kernel_x, kernel_y, tail,
-    /// the per-phase offsets, and the table FNV-1a over the f32
-    /// bits for the bit-verified scales (None elsewhere; see the
-    /// function documentation for the open divergence on scales
-    /// with inexact tent products). Scale 0.6 exercises the
-    /// zero-anchor period branch.
+    /// All 35 scales from crp-complete-results.txt. Each table hash
+    /// comes from the native library, including fractional scales.
+    /// Scale 0.6 checks the zero-anchor period branch.
     #[test]
     fn compute_resample_params_matches_native_battery() {
-        let cases: &[(f32, u32, u32, i32, &[u32], Option<u64>)] = &[
-            (0.0625, 32, 1, -8, &[16], Some(0x7f9dd1e3e66f03c5)),
-            (0.05, 40, 1, -10, &[20], None),
-            (0.125, 16, 1, -4, &[8], Some(0x3a0fe3d5da4854c5)),
-            (0.1875, 11, 3, -3, &[6, 5, 5], None),
-            (0.25, 8, 1, -2, &[4], Some(0xd076633462887ac5)),
-            (0.3, 7, 3, -2, &[4, 3, 3], None),
-            (0.3125, 7, 5, -2, &[4, 3, 3, 3, 3], None),
-            (0.33333334, 5, 1, -1, &[3], None),
-            (0.36, 7, 1, -1, &[2], None),
-            (0.375, 6, 3, -1, &[2, 3, 3], None),
+        let cases: &[(f32, u32, u32, i32, &[u32], u64)] = &[
+            (0.0625, 32, 1, -8, &[16], 0x7f9dd1e3e66f03c5),
+            (0.05, 40, 1, -10, &[20], 0xf34027766c0f89d9),
+            (0.125, 16, 1, -4, &[8], 0x3a0fe3d5da4854c5),
+            (0.1875, 11, 3, -3, &[6, 5, 5], 0x54ba064f311ad2e5),
+            (0.25, 8, 1, -2, &[4], 0xd076633462887ac5),
+            (0.3, 7, 3, -2, &[4, 3, 3], 0xb594b657f46c02f4),
+            (0.3125, 7, 5, -2, &[4, 3, 3, 3, 3], 0x4d3618e90de35ef4),
+            (0.33333334, 5, 1, -1, &[3], 0x5e4dc14a2ff9cb0f),
+            (0.36, 7, 1, -1, &[2], 0xab19293a7f9e4a07),
+            (0.375, 6, 3, -1, &[2, 3, 3], 0x860e1fba1c86c10f),
             (
                 0.376,
                 6,
@@ -697,7 +668,7 @@ mod tests {
                     2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3,
                     2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3,
                 ],
-                None,
+                0x3d7bef47aac1f945,
             ),
             (
                 0.38,
@@ -705,73 +676,80 @@ mod tests {
                 19,
                 -1,
                 &[2, 3, 3, 2, 3, 2, 3, 3, 2, 3, 3, 2, 3, 3, 2, 3, 2, 3, 3],
-                None,
+                0xc48a8ce554a80576,
             ),
-            (0.4, 5, 2, -1, &[2, 3], None),
-            (0.4375, 5, 7, -1, &[2, 2, 3, 2, 2, 3, 2], None),
-            (0.45, 5, 9, -1, &[2, 2, 3, 2, 2, 2, 2, 3, 2], None),
-            (0.5, 4, 1, -1, &[2], Some(0x9b2f1bb53e5bc065)),
-            (0.5625, 4, 9, -1, &[2, 2, 1, 2, 2, 2, 2, 1, 2], None),
-            (0.6, 5, 1, -1, &[2], Some(0xacf6cd31327fd439)),
-            (0.625, 4, 5, -1, &[2, 1, 2, 2, 1], None),
-            (0.6875, 3, 11, -1, &[2, 1, 2, 1, 2, 1, 1, 2, 1, 2, 1], None),
-            (0.7, 3, 7, -1, &[2, 1, 2, 1, 1, 2, 1], None),
-            (0.75, 3, 3, -1, &[2, 1, 1], None),
+            (0.4, 5, 2, -1, &[2, 3], 0x1bc4c38d0949e132),
+            (0.4375, 5, 7, -1, &[2, 2, 3, 2, 2, 3, 2], 0x93fe54637fddbe0e),
+            (
+                0.45,
+                5,
+                9,
+                -1,
+                &[2, 2, 3, 2, 2, 2, 2, 3, 2],
+                0x793c243d66b8a733,
+            ),
+            (0.5, 4, 1, -1, &[2], 0x9b2f1bb53e5bc065),
+            (
+                0.5625,
+                4,
+                9,
+                -1,
+                &[2, 2, 1, 2, 2, 2, 2, 1, 2],
+                0xb86cc035a8515849,
+            ),
+            (0.6, 5, 1, -1, &[2], 0xacf6cd31327fd439),
+            (0.625, 4, 5, -1, &[2, 1, 2, 2, 1], 0xfdc95829938b2fa2),
+            (
+                0.6875,
+                3,
+                11,
+                -1,
+                &[2, 1, 2, 1, 2, 1, 1, 2, 1, 2, 1],
+                0xd8e5be1c00278267,
+            ),
+            (0.7, 3, 7, -1, &[2, 1, 2, 1, 1, 2, 1], 0xfdf17147c4a8f9b9),
+            (0.75, 3, 3, -1, &[2, 1, 1], 0x4fa6e8c0799580e1),
             (
                 0.8125,
                 3,
                 13,
                 -1,
                 &[2, 1, 1, 1, 2, 1, 1, 1, 1, 2, 1, 1, 1],
-                None,
+                0xcfa3f4f65caa6a0c,
             ),
-            (0.875, 3, 7, -1, &[2, 1, 1, 1, 1, 1, 1], None),
+            (0.875, 3, 7, -1, &[2, 1, 1, 1, 1, 1, 1], 0xcedcbb349d494c96),
             (
                 0.9375,
                 3,
                 15,
                 -1,
                 &[2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-                None,
+                0x6e8a6ae8cda2eaa0,
             ),
-            (1.0, 1, 1, 0, &[1], Some(0x4b72477f9c5c2f98)),
+            (1.0, 1, 1, 0, &[1], 0x4b72477f9c5c2f98),
             (
                 1.14285715,
                 2,
                 8,
                 -1,
                 &[1, 1, 1, 1, 1, 1, 1, 0],
-                Some(0xa325f76d9f09ba86),
+                0xa325f76d9f09ba86,
             ),
-            (1.3333334, 2, 4, -1, &[1, 1, 1, 0], Some(0x7833e11fbd04c4a5)),
-            (1.5, 2, 3, -1, &[1, 1, 0], Some(0x2903ab696398b73b)),
-            (
-                1.6,
-                2,
-                8,
-                -1,
-                &[1, 1, 0, 1, 0, 1, 1, 0],
-                Some(0xeb9cfa2244f62455),
-            ),
-            (2.0, 2, 2, -1, &[1, 0], Some(0x45d388a7237d30b5)),
+            (1.3333334, 2, 4, -1, &[1, 1, 1, 0], 0x7833e11fbd04c4a5),
+            (1.5, 2, 3, -1, &[1, 1, 0], 0x2903ab696398b73b),
+            (1.6, 2, 8, -1, &[1, 1, 0, 1, 0, 1, 1, 0], 0xeb9cfa2244f62455),
+            (2.0, 2, 2, -1, &[1, 0], 0x45d388a7237d30b5),
             (
                 2.6666667,
                 2,
                 8,
                 -1,
                 &[1, 0, 0, 1, 0, 0, 1, 0],
-                Some(0x09e0cf5a9fc44455),
+                0x09e0cf5a9fc44455,
             ),
-            (3.0, 2, 3, -1, &[1, 0, 0], Some(0x1b19e2987852d1af)),
-            (4.0, 2, 4, -1, &[0, 1, 0, 0], Some(0x701ec0880d000725)),
-            (
-                8.0,
-                2,
-                8,
-                -1,
-                &[0, 0, 0, 1, 0, 0, 0, 0],
-                Some(0x80760f1086d9ca35),
-            ),
+            (3.0, 2, 3, -1, &[1, 0, 0], 0x1b19e2987852d1af),
+            (4.0, 2, 4, -1, &[0, 1, 0, 0], 0x701ec0880d000725),
+            (8.0, 2, 8, -1, &[0, 0, 0, 1, 0, 0, 0, 0], 0x80760f1086d9ca35),
         ];
         for (scale, kernel_x, kernel_y, tail, offsets, table_hash) in cases {
             let params = compute_resample_params(*scale);
@@ -784,10 +762,21 @@ mod tests {
                 (*kernel_x * *kernel_y) as usize,
                 "table length at {scale}"
             );
-            if let Some(expected) = table_hash {
-                assert_eq!(fnv_f32(&params.table), *expected, "table at {scale}");
-            }
+            assert_eq!(fnv_f32(&params.table), *table_hash, "table at {scale}");
         }
+    }
+
+    #[test]
+    fn compute_resample_params_rejects_invalid_scales() {
+        for scale in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(std::panic::catch_unwind(|| compute_resample_params(scale)).is_err());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "has no phase period within the 64-probe table")]
+    fn compute_resample_params_rejects_native_period_overread() {
+        compute_resample_params(0.374);
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
