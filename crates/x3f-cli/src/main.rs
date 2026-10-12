@@ -51,6 +51,7 @@ struct Args {
     /// 10 is full strength (legacy default).
     denoise_intensity: u8,
     denoise_backend: x3f_core::DenoiseBackend,
+    spp_denoise: bool,
     rgb_chroma_lut: Option<bool>,
     apply_sgain: Option<bool>,
     file_type: FileType,
@@ -84,6 +85,7 @@ impl Default for Args {
             fix_bad: true,
             denoise_intensity: 10,
             denoise_backend: x3f_core::DenoiseBackend::Auto,
+            spp_denoise: false,
             rgb_chroma_lut: None,
             apply_sgain: None,
             file_type: FileType::Dng,
@@ -134,6 +136,8 @@ fn usage(progname: &str) -> ! {
          \x20  -no-crop        Do not crop to active area\n\
          \x20  -no-denoise     Disable NLM denoise (same as -denoise 0)\n\
          \x20  -denoise-backend <auto|cpu|gpu>  Select execution backend\n\
+         \x20  -spp-denoise    Use Merrill SPP color processing on CPU\n\
+         \x20                  Neutral noise sliders; TIFF, PPM or histogram\n\
          \x20  -denoise <0-10> NLM denoise intensity. 0 = off,\n\
          \x20                  10 = full strength (default). Intermediate\n\
          \x20                  values linearly scale the NLM sigma.\n\
@@ -301,6 +305,7 @@ fn parse_args(argv: &[String]) -> Args {
             "-chroma-lut" => args.rgb_chroma_lut = Some(true),
             "-no-chroma-lut" => args.rgb_chroma_lut = Some(false),
             "-no-denoise" => args.denoise_intensity = 0,
+            "-spp-denoise" => args.spp_denoise = true,
             "-denoise-backend" => {
                 i += 1;
                 let v = argv.get(i).unwrap_or_else(|| usage(progname));
@@ -383,6 +388,27 @@ fn normalize(args: &mut Args) {
 /// usage()-style exit. Kept as a pure function so the unit tests can
 /// exercise it without `process::exit`.
 fn validate_args(args: &Args) -> Result<(), String> {
+    if args.spp_denoise {
+        if !matches!(
+            args.file_type,
+            FileType::Tiff | FileType::PpmP3 | FileType::PpmP6 | FileType::Histogram
+        ) || args.cineon
+            || !matches!(
+                args.color_encoding,
+                ColorEncoding::Srgb | ColorEncoding::AdobeRgb | ColorEncoding::ProPhotoRgb
+            )
+        {
+            return Err("-spp-denoise requires color TIFF, PPM or histogram output".into());
+        }
+        if args.denoise_intensity != 10 {
+            return Err(
+                "-spp-denoise uses neutral SPP noise sliders and requires -denoise 10".into(),
+            );
+        }
+        if args.denoise_backend == x3f_core::DenoiseBackend::Gpu {
+            return Err("-spp-denoise supports -denoise-backend auto or cpu".into());
+        }
+    }
     if args.cineon && args.file_type != FileType::Tiff {
         return Err(
             "-cineon is only meaningful with -tiff (other formats apply their own gamma/profile)"
@@ -491,6 +517,7 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
         fix_bad: args.fix_bad,
         denoise_intensity: args.denoise_intensity,
         denoise_backend: args.denoise_backend,
+        spp_denoise: args.spp_denoise,
         rgb_chroma_lut: args.rgb_chroma_lut,
         apply_sgain: args.apply_sgain,
         wb: args.wb.clone(),
@@ -791,6 +818,38 @@ mod tests {
             DenoiseBackend::Gpu
         );
         assert!("opencl".parse::<DenoiseBackend>().is_err());
+    }
+
+    #[test]
+    fn spp_denoise_is_explicit_and_rejects_unsupported_modes() {
+        assert!(!parse(&["in.X3F"]).spp_denoise);
+        for format in ["-tiff", "-ppm", "-histogram"] {
+            let args = parse(&[format, "-color", "sRGB", "-spp-denoise", "in.X3F"]);
+            assert!(args.spp_denoise);
+            assert!(validate_args(&args).is_ok(), "{format}");
+        }
+        for flags in [
+            vec!["-dng"],
+            vec!["-jpg"],
+            vec!["-meta"],
+            vec!["-tiff", "-cineon"],
+            vec!["-tiff", "-color", "none"],
+            vec!["-tiff", "-no-denoise"],
+            vec!["-tiff", "-denoise", "5"],
+            vec!["-tiff", "-denoise-backend", "gpu"],
+        ] {
+            let mut command = flags;
+            command.extend(["-spp-denoise", "in.X3F"]);
+            assert!(validate_args(&parse(&command)).is_err(), "{command:?}");
+        }
+        assert!(validate_args(&parse(&[
+            "-tiff",
+            "-spp-denoise",
+            "-denoise-backend",
+            "cpu",
+            "in.X3F"
+        ]))
+        .is_ok());
     }
 
     #[test]

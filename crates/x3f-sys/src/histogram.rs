@@ -113,11 +113,6 @@ unsafe fn dump_histogram_impl(
     log_hist: libc::c_int,
     options: Option<(ProcessingOptions, Control<'_>)>,
 ) -> crate::Result<x3f_return_t> {
-    let f_out = unsafe { libc::fopen(outfilename, c"wb".as_ptr()) };
-    if f_out.is_null() {
-        return Ok(x3f_return_e_X3F_OUTFILE_ERROR);
-    }
-
     let mut image: x3f_area16_t = unsafe { mem::zeroed() };
     let ok = if let Some((options, control)) = options {
         match unsafe {
@@ -136,10 +131,7 @@ unsafe fn dump_histogram_impl(
             )
         } {
             Ok(_) => 1,
-            Err(error) => {
-                unsafe { libc::fclose(f_out) };
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         }
     } else {
         unsafe {
@@ -157,7 +149,6 @@ unsafe fn dump_histogram_impl(
         }
     };
     if ok == 0 || image.channels < 3 {
-        unsafe { libc::fclose(f_out) };
         unsafe { libc::free(image.buf) };
         return Ok(x3f_return_e_X3F_ARGUMENT_ERROR);
     }
@@ -167,6 +158,15 @@ unsafe fn dump_histogram_impl(
     let mut histograms: [*mut u32; 3] = [ptr::null_mut(); 3];
     for slot in &mut histograms {
         *slot = unsafe { libc::calloc(bin_count, mem::size_of::<u32>()) as *mut u32 };
+    }
+    if histograms.iter().any(|slot| slot.is_null()) {
+        unsafe {
+            for slot in histograms {
+                libc::free(slot.cast());
+            }
+            libc::free(image.buf);
+        }
+        return Err(crate::Error::Allocation);
     }
 
     let mut max: u16 = 0;
@@ -188,6 +188,18 @@ unsafe fn dump_histogram_impl(
                 }
             }
         }
+    }
+
+    // Processing and allocation must succeed before an output can be truncated.
+    let f_out = unsafe { libc::fopen(outfilename, c"wb".as_ptr()) };
+    if f_out.is_null() {
+        unsafe {
+            for slot in histograms {
+                libc::free(slot.cast());
+            }
+            libc::free(image.buf);
+        }
+        return Ok(x3f_return_e_X3F_OUTFILE_ERROR);
     }
 
     for i in 0..=max as usize {

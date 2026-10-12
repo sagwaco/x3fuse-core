@@ -319,6 +319,16 @@ sensor's base NLM sigma. `10` → `scale = 1.0` is full-strength denoise; `0`
 gates the pass out entirely. (Denoise output is not part of the byte-parity
 gate — every tier-2/3 test runs with `-no-denoise`.)
 
+`-spp-denoise` selects a separate Merrill float path before normalized sensor
+processing. `ProcessOptions::spp_denoise` carries this choice per conversion.
+The path runs float gains and ordered repairs, native highlight restoration,
+despeckle, row/column correction, tiled bilateral and residual denoise,
+sharpening, active-area crop, and the shared Merrill tone and output stages.
+It accepts HI color TIFF, PPM and histogram output with neutral noise sliders.
+It uses CPU execution for `Auto` or `Cpu`; forced `Gpu` returns an error.
+Unsupported cameras, resolution, calibration and output modes return errors.
+The [SPP alignment notes](./spp-alignment.md) describe its verification and limits.
+
 Native CLI builds also include a wgpu implementation of both NLM windows in
 [`denoise/`](../../crates/x3f-sys/src/denoise/). `-denoise-backend auto` (default)
 tries Metal/Vulkan/DX12 and retries on CPU if initialization or execution fails.

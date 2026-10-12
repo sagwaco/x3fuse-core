@@ -7,11 +7,11 @@ records, original instructions, reconstructed kernels, and native differential
 tests. The library SHA-256 is
 `037419dc04bb1afe86dddad7a14888a1b36d6c00a0231ec50a6974a9963ce5e6`.
 
-The implementation now uses the recovered calibration and output stages for
-ordinary Merrill sRGB, Adobe RGB and ProPhoto RGB rendering. It remains a
-partial pipeline reconstruction. DNG, scene-linear, Cineon and Quattro rendering
-retain their existing processing. DNG's embedded preview retains its existing
-calibration too.
+Ordinary Merrill sRGB, Adobe RGB and ProPhoto RGB rendering uses the recovered
+calibration and output stages. The explicit `-spp-denoise` option also uses the
+ordered float front end and the native bilateral/residual denoise sequence.
+The default renderer, DNG, scene-linear, Cineon and Quattro paths retain their
+existing processing. DNG's embedded preview retains its existing calibration.
 
 Scene-derived chroma-LUT recovery remains selectable through `-chroma-lut` /
 `-no-chroma-lut`, or `ProcessOptions::rgb_chroma_lut`. The per-conversion choice
@@ -19,6 +19,75 @@ overrides `X3F_NO_CHROMA_LUT`; the default preserves current rendering. LUT-off
 still uses the existing prior recovery and matrix gate, not the native Sigma
 highlight stage. Native alignment retains the LUT alternative so callers can
 choose their preferred highlight recovery.
+
+## Explicit SPP export
+
+```sh
+x3f_extract -tiff -color ProPhotoRGB -spp-denoise input.X3F
+```
+
+Rust callers set `ProcessOptions::spp_denoise = true`. The default is false.
+The option supports full-resolution HI color output from the supported SD1
+Merrill and DP Merrill models at X3F versions 2.3 and 3.0. TIFF, PPM and native
+histograms accept sRGB, Adobe RGB or ProPhoto RGB. It uses CPU execution for
+`Auto` and `Cpu`. DNG, Cineon, monochrome/sepia, MED/LOW, other cameras, forced
+`Gpu`, and denoise intensity other than 10 return an error. Unsupported
+calibration also returns an error.
+
+The noise sliders use the middle of five positions. Sharpness, fill light and
+saturation use zero; Highlight Control uses one. These are explicit export
+settings. They do not load saved Sigma adjustments or reproduce its editor UI.
+The option runs raw-float red detection, gains, radial shading, ordered listed
+and packed repairs, highlight restoration, despeckle and row/column correction.
+It then runs noise setup, full-image prefiltering when required, 8 by 8 tile
+processing, residual mixing, color correction, sharpness luminance, reverse tile
+blending, final sharpening, crop, and the shared tone/output conversion.
+
+The work remains in gained float counts until the output stage. Per-conversion
+LUTs and tile state permit concurrent exports with different options. Tile work
+runs in parallel on native targets and serially on WASM. Cancellation and
+processing errors discard the result. No Sigma library is loaded at runtime.
+Native calls are used only to produce verification fixtures.
+
+`fix_bad=false` skips listed and detected repairs. `crop=false` returns the full
+Keep area. These library modifiers extend the native export behavior. Spatial
+gain selection and the white-balance override still apply. `rgb_chroma_lut` is
+ignored by SPP because its float path uses camera-based highlight restoration.
+
+## SPP production verification
+
+The native comparison supplies the same float Keep image and request parameters
+to Rust and Sigma's `TiledDenoise` plus `Sharpen`. Eight synthetic images cover
+all six supported scales. Both full-size DP2 and SD1 reference inputs match
+the native output bit for bit, including tile blending and sharpening. The
+tests also cover cancellation and rejected layouts. Native hash tests run on
+arm64 macOS because other platforms can produce different `expf` and `tanhf`
+lookup-table bits. Portable tests check the tile core and shared kernels.
+
+These checks establish equality at the denoise boundary. They do not establish
+the complete Sigma application's input gains, color matrix, or saved settings.
+The two end-to-end comparisons use the retained original-size ProPhoto RGB
+TIFF16 exports, with 14,751,744 oriented pixels per image and no color fitting.
+Research environment overrides are cleared.
+
+| Reference | Explicit SPP MAE | Explicit SPP PSNR | Default CPU NLM PSNR |
+| --- | --- | --- | --- |
+| DP2 Merrill | 0.02924% | 52.69 dB | 40.68 dB |
+| SD1 Merrill | 0.17485% | 50.38 dB | 36.42 dB |
+
+The 53-file Merrill smoke check produces 50 color exports with the expected
+dimensions, ICC profile and orientation. The three monochrome files return the
+documented unsupported-mode error. No export selects a fallback. Source hashes
+are unchanged. All six documented no-denoise DNG/TIFF hashes also remain
+unchanged. Error and cancellation tests check that no output is published;
+histogram validation errors preserve an existing destination.
+
+The [production evidence](https://github.com/sagwaco/x3f-docs/tree/main/spp-rgb-trace/followup-tiled-denoise/production)
+records binary hashes, commands, output hashes, measurements and the independent
+review. The archive verifier checks the native recordings and matching Rust
+fixtures. No native library or non-redistributable input image ships in the core.
+
+## Default renderer alignment
 
 | Stage | Previous behavior | Verified Sigma behavior and implementation |
 | --- | --- | --- |
@@ -71,11 +140,13 @@ The source's signed16 output conversion alone is not a valid integration
 boundary. Passing negative values from the old color pipeline into it produced
 bright colored shadow artifacts. `ApplyColorResidual` clamps finite results to
 `[0,32766]` before the later geometry/output steps; the integration uses those
-bounds with neutral residual gain. The native tile residual calculation itself
-is still missing. The pure output kernel retains its exact signed-wrap behavior
+bounds with neutral residual gain. The default renderer does not use the native tile residual calculation. The pure output kernel retains its exact signed-wrap behavior
 and has a separate regression test for the conditioned integration input.
 
-## Verification
+## Earlier default renderer verification
+
+This section records the default-renderer checkpoint before explicit SPP export.
+Its measurements and test counts apply to that checkpoint.
 
 Direct calls into the supplied library verified twelve complete tone LUTs,
 five complete gamma LUTs, and 774 RGB48 output pixels, including signed indices
@@ -154,7 +225,13 @@ The RGB LUT selector additionally passes TIFF, PPM and histogram checks on
 choices override the environment; DNG and Cineon ignore them. Concurrent API
 conversions with both choices match their serial outputs on that same fixture.
 
-The next missing filter is now reconstructed in the external evidence archive:
+## Earlier reconstruction evidence
+
+The following checkpoints predate the explicit SPP integration. Their native
+kernel checks remain evidence for the float path. Statements about pending
+production wiring describe those checkpoints.
+
+The raster filter was reconstructed in the external evidence archive:
 the raster despeckler matches 66,876 native classifications, 2,597 finite
 all-neighbor replacements (including zero extrema), and four complete wrapper
 cases containing 9,936 detected sites. The wrapper checks preserve padding,
@@ -272,67 +349,20 @@ unchanged; no new image-quality or full-pipeline parity result is claimed.
 
 ## Remaining differences
 
-- The front end still stores normalized uint16 intermediates. Sigma uses float
-  gained counts; reversing normalization cannot restore lost precision. The
-  ordered float frontend is under construction in core. Verified stages:
-  stage 1 (ApplyGains: black, GatherParams request gain, native spatial
-  tables) against a native composition oracle on both retained references;
-  stage 2 (WB radial shading: ValidPixRect geometry, MED stretch, native FMA
-  order) by instruction replay and corpus fixture; stage 3 (listed
-  bad-pixel repair) reconstructs `ReplaceBadPixelsF20` with the badness
-  selection validated on all 53 CAMFs and the native PROP BURST gate; stages
-  4 (highlight restoration), 5 (raster despeckle) and 6 (row/column offset
-  correction, with an embedded SVD port) by archived C++ oracle replay;
-  stages 7b/7c (SPP denoise preparation kernels and image resampling)
-  against the native library. All 35 resample test scales have native
-  geometry, offset and table hash checks, including fractional scales.
-  `ResampleImage` also matches 1,224 native image cases. The tests include
-  filter phase carry, source reads across row padding, negative zero, and
-  the four destination rows that the native kernel does not write.
-  Invalid buffer extents return an error before the first output write.
-  Stage 7d now includes the tiled `ComputeEdgeMap` kernel. It matches
-  13,440 native image cases on arm64 macOS with sum/max channel energy,
-  optional noise models, optional smoothing, padded rows and excluded borders. The
-  median helper matches 59,049 cases, including signed zeros and NaNs.
-  Other targets check NaN positions and all non-NaN output bits.
-  The edge map preserves the native output region and float operation
-  order. `LocalMean`, `BilateralFilterRGB` and the later denoise stages
-  remain open. These kernels have no production caller yet.
-  Per-stage verification is compositional:
-  kernels match their archived oracles, and corpus pins are self-recorded
-  from the trace (deterministic members of the native result family, not
-  native reference outputs); see
-  `x3f-docs/spp-rgb-trace/followup-float-front-wiring/` and
-  `followup-tiled-denoise/`. `X3F_FLOAT_FRONT_TRACE` is the research dump.
-  Open items: the ordered native stages that the trace drops (the
-  Jpeg_BadClusters list, the DetectBadReds list and overrides, packed-
-  cluster repair), per-stage pixel pins for stages 2 to 5 that use native
-  buffers, and the float denoise consumer. The normalized uint16 path stays
-  the default.
-  Red detection, listed/packed repair and badness arithmetic now have bounded
-  executable evidence. Offset correction now has an independent SVD and passes
-  disjoint wrapper checks. Integration must define deterministic accumulation
-  for overlapping worker rows. Ordered integration, exact radial execution and
-  the native float denoise consumer remain separate work.
-- Highlight restoration still uses the existing normalized LUT/gate model,
-  after denoise. Sigma restores camera-marked C2 and blends toward original C0
-  before denoise, using CAMF saturation maps and different donor rules.
-- Rust NLM is not Sigma's tiled bilateral/residual pipeline. Native residual
-  mixing, sharpening, hue/fringe filters and nonzero retinex adjustments remain
-  reconstruction work. Do not describe the current output as pixel-identical.
-- MED/LOW black-rectangle overrides and the separate monochrome/sepia branches
-  are not covered by the full-resolution ordinary-color reference.
-- ColorDQ setups requiring an unknown native EstimatedISO or an unresolved
-  slider input fall back to legacy rendering. Missing or unreadable ISO tables
-  now use the verified ordinary HI/MED/LOW fallback column (four at every row).
-  Readable malformed tables and the `SkipStepFlags` denoise-bypass branch still
-  fall back rather than assuming ordinary range conditioning applies.
-- The exact Bézier implementation currently accepts effective tone saturation
-  in `[1,16384]` to bound its cubic work. For 12-bit Merrill this includes the
-  ordinary -2 EV setting; larger extents select legacy rendering with a warning.
-  This is an implementation resource limit, not a restriction discovered in
-  Sigma's kernel.
+- The default renderer keeps its normalized uint16 intermediates, NLM denoise
+  and optional scene-derived highlight LUT. The SPP option selects the float
+  path and camera-based highlight restoration.
+- Nonzero retinex, creative saturation, chromatic-aberration correction,
+  defringe, grain, monochrome/sepia and MED/LOW processing are outside this
+  neutral color export. Unsupported camera modes return an error.
+- Native row/column correction can overlap worker ranges. The Rust solver uses
+  deterministic accumulation. Some native results depend on worker order;
+  kernel and whole-image checks must state which native execution they compare.
+- The two genuine Sigma exports cover two scenes. They do not establish
+  corpus-wide color accuracy or pixel identity with every Sigma adjustment.
+- Tone saturation is bounded to `[1,16384]` to limit cubic work. The ordinary
+  renderer falls back with a warning outside that range. The SPP option returns
+  an error. This bound is an implementation limit.
 
-The independent B/M chroma-table validity correction in `highlight.rs` fixes a
-separate helper bug. It is not evidence that the normalized highlight algorithm
-matches Sigma's native restoration.
+The independent B/M chroma-table correction in `highlight.rs` applies to the
+default renderer. It does not establish parity with Sigma highlight restoration.

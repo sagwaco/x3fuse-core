@@ -13,6 +13,8 @@
 use crate::control::{Error, Result};
 use crate::Control;
 
+pub mod repair;
+
 /// One channel of the spatial gain table. `values` is row-major with
 /// `rows` rows and `columns` knots per row. The CAMF builders in
 /// `spatial_gain.rs` produce this layout.
@@ -1067,21 +1069,50 @@ impl FloatFront {
         if row_stride < width * 3 || decoded.len() < row_stride * (height - 1) + width * 3 {
             return Err(Error::InvalidData("invalid Merrill float image layout"));
         }
-        let mut data = Vec::with_capacity(decoded.len());
-        // u16 to f32 is exact: every u16 value is representable in
-        // f32. Native sign-extends the 16-bit sample before the
-        // float conversion; the result is identical for valid
-        // 0..4095 sensor data (recorded in the stage 1 notes).
-        data.extend(decoded.iter().map(|&v| f32::from(v)));
+        let mut data = raw_float(decoded)?;
+        self.apply_in_place(&mut data, width, height, row_stride, control)?;
+        Ok(data)
+    }
+
+    /// Apply stage 1 to a raw float raster from `raw_float`. The detector
+    /// stage reads this raster before the gains.
+    pub fn apply_in_place(
+        &self,
+        data: &mut [f32],
+        width: usize,
+        height: usize,
+        row_stride: usize,
+        control: Control<'_>,
+    ) -> Result<()> {
+        control.check()?;
+        if height == 0 || width == 0 {
+            return Err(Error::InvalidData("empty Merrill float image"));
+        }
+        if self.spatial.is_some() && height < 2 {
+            return Err(Error::InvalidData("invalid Merrill float image size"));
+        }
+        if row_stride < width * 3 || data.len() < row_stride * (height - 1) + width * 3 {
+            return Err(Error::InvalidData("invalid Merrill float image layout"));
+        }
         let refs: [Option<&GainTable>; 3] = match &self.spatial {
             None => [None, None, None],
             Some(t) => [Some(&t[0]), Some(&t[1]), Some(&t[2])],
         };
-        apply_gains(
-            &mut data, width, height, row_stride, self.black, self.gain, refs,
-        );
-        Ok(data)
+        apply_gains(data, width, height, row_stride, self.black, self.gain, refs);
+        Ok(())
     }
+}
+
+/// Convert decoded sensor counts to the owned native float raster.
+/// u16 to f32 is exact: every u16 value is representable in f32. Native
+/// sign-extends the 16-bit sample before the float conversion; the result
+/// is identical for valid 0..4095 sensor data (recorded in the stage 1 notes).
+pub fn raw_float(decoded: &[u16]) -> Result<Vec<f32>> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(decoded.len())
+        .map_err(|_| Error::Allocation)?;
+    data.extend(decoded.iter().map(|&v| f32::from(v)));
+    Ok(data)
 }
 
 /// Apply black offsets, channel gains and spatial tables in one pass.

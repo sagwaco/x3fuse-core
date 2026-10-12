@@ -45,8 +45,8 @@ the existing output; GPU floating-point accumulation can differ slightly.
 See [denoising performance and validation](docs/src/performance.md#gpu-denoising).
 
 This checkout prepares the **0.2.0** release. It adds `denoise_backend` to
-`ProcessOptions` and `SceneLinearOptions`, and GPU errors to the Rust error
-enums. Downstream exhaustive struct literals and error matches must be updated;
+`ProcessOptions` and `SceneLinearOptions`, `spp_denoise` to `ProcessOptions`,
+and GPU errors to the Rust error enums. Downstream exhaustive struct literals and error matches must be updated;
 use `..Default::default()` when constructing options. These source changes
 must not be published as a 0.1.x patch. The C ABI remains unchanged.
 
@@ -86,6 +86,7 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 | `-denoise <0-10>`         | NLM denoise intensity: `0` = off, `10` = full strength (**default**); intermediate values linearly scale the NLM sigma |
 | `-no-denoise`             | disable the NLM denoise pass (alias for `-denoise 0`)                               |
 | `-denoise-backend <auto\|cpu\|gpu>` | execution backend; `auto` falls back to CPU, `gpu` fails if acceleration is unavailable |
+| `-spp-denoise` | Merrill SPP float processing on CPU with neutral noise sliders; full-resolution color TIFF, PPM or histogram |
 | `-no-crop`                | do not crop to the active image area                                               |
 | `-no-sgain` / `-sgain`    | disable / force spatial-gain (lens color) compensation                             |
 | `-no-fix-bad`             | do not fix bad pixels                                                              |
@@ -122,6 +123,9 @@ x3f_extract -dng -denoise 5 input.X3F
 # Require GPU denoising (use -v to report the adapter and stage timings)
 x3f_extract -v -dng -denoise-backend gpu input.X3F
 
+# Merrill SPP processing with neutral noise sliders
+x3f_extract -tiff -color ProPhotoRGB -spp-denoise input.X3F
+
 # Metadata dump
 x3f_extract -meta input.X3F
 ```
@@ -132,7 +136,14 @@ For rendered RGB, `-chroma-lut` and `-no-chroma-lut` explicitly enable or disabl
 the scene-derived LUT, overriding `X3F_NO_CHROMA_LUT`. The default remains on
 unless that environment variable is present. Disabling the LUT retains the
 prior recovery and matrix gate; it does not select native Sigma recovery. These
-RGB options do not affect DNG or Cineon output.
+RGB options do not affect SPP, DNG or Cineon output.
+
+`-spp-denoise` selects the complete Merrill float path, including camera-based
+highlight repair, tiled denoise and sharpening. It requires an HI Merrill file,
+color output and denoise intensity 10. DNG, Cineon, monochrome, MED/LOW and a
+forced GPU backend return an error. Rust callers set `ProcessOptions::spp_denoise`.
+The default is false. See the [SPP alignment notes](docs/src/spp-alignment.md)
+for supported settings and native verification.
 
 ## DNG output
 

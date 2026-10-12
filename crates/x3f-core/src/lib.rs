@@ -143,12 +143,19 @@ pub struct ProcessOptions {
     /// Enable the `gpu` Cargo feature for native acceleration. Auto falls back
     /// to CPU when unavailable; Gpu fails instead. WASM always uses CPU in Auto.
     pub denoise_backend: DenoiseBackend,
+    /// Use the Merrill SPP float pipeline for full-resolution color TIFF, PPM or histogram output.
+    /// This CPU path uses neutral SPP noise sliders. The default is false.
+    /// Requires full denoise intensity; other sensor and output modes return an error.
+    /// Uses sharpness 0, fill light 0, saturation 0 and Highlight Control 1.
+    /// `fix_bad=false` skips listed and detected repairs; `crop=false` returns
+    /// the full Keep area. These modifiers extend the native export behavior.
+    pub spp_denoise: bool,
     /// Use scene-derived chroma-LUT recovery for sRGB, Adobe RGB or ProPhoto RGB.
     /// `None` (default) enables it unless `X3F_NO_CHROMA_LUT` is present;
     /// `Some(true)` or `Some(false)` overrides that environment setting for
     /// this conversion. Disabling the LUT retains the prior-based recovery
     /// and matrix-pathology gate; it does not select Sigma's native recovery.
-    /// Ignored by DNG, scene-linear, `ColorEncoding::None`, unprocessed and
+    /// Ignored by SPP, DNG, scene-linear, `ColorEncoding::None`, unprocessed and
     /// Cineon output. `X3F_NO_CHROMA_LUT` still controls the separate DNG
     /// recovery LUT, including camera-space (`None`) output.
     pub rgb_chroma_lut: Option<bool>,
@@ -208,6 +215,7 @@ impl Default for ProcessOptions {
             compress: false,
             denoise_intensity: 10,
             denoise_backend: DenoiseBackend::Auto,
+            spp_denoise: false,
             rgb_chroma_lut: None,
             opcodes_dir: None,
             dng_highlight_recovery: false,
@@ -625,6 +633,17 @@ impl Reader {
         opts: &ProcessOptions,
         log_exposure: bool,
     ) -> Result<(), Error> {
+        if opts.spp_denoise && opts.cineon {
+            return Err(Error::InvalidData(
+                "SPP denoise requires color output without Cineon".into(),
+            ));
+        }
+        #[cfg(target_arch = "wasm32")]
+        if opts.spp_denoise {
+            return Err(Error::InvalidData(
+                "SPP histogram output requires a native build".into(),
+            ));
+        }
         let cpath = path_to_cstring(out.as_ref())?;
         let cwb = wb_cstring(opts.wb.as_deref())?;
         let sgain = self.resolve_sgain(opts.apply_sgain);
@@ -643,6 +662,7 @@ impl Reader {
                 log_exposure as i32,
                 // DNG highlight and TIFF Cineon options do not apply to histograms.
                 sys::ProcessingOptions {
+                    spp_denoise: opts.spp_denoise,
                     rgb_chroma_lut: opts.rgb_chroma_lut,
                     ..sys::ProcessingOptions::default()
                 },

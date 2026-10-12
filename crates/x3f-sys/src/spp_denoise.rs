@@ -2,8 +2,7 @@
 //! `ReduceNoiseTiled.cpp` chain of `lib99_MerillDLLForMac.dylib`
 //! (archived captures and field maps: x3f-docs
 //! `followup-tiled-denoise/`). This is the explicit SPP denoise
-//! option under construction; the existing NLM/BM3D denoise stays
-//! the default and untouched.
+//! option. The existing NLM/BM3D selection remains the default.
 //!
 //! Stage 7b ports the two preparation kernels, each verified
 //! bit-for-bit against the native oracle battery
@@ -52,6 +51,12 @@
 //! and all non-NaN bits. The median helper matches 59,049 direct cases.
 
 use crate::{Error, Result};
+
+pub(crate) mod params;
+pub(crate) mod pipeline;
+pub(crate) mod pixmap;
+pub(crate) mod residual;
+pub(crate) mod tiling;
 
 /// One `GetTanhLUT` result: the table size and the three channel
 /// tables in the native object order `{A, C, B}` (the object stores
@@ -1390,6 +1395,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(panic = "unwind")]
     fn compute_resample_params_rejects_invalid_scales() {
         for scale in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert!(std::panic::catch_unwind(|| compute_resample_params(scale)).is_err());
@@ -1397,6 +1403,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(panic = "unwind")]
     #[should_panic(expected = "has no phase period within the 64-probe table")]
     fn compute_resample_params_rejects_native_period_overread() {
         compute_resample_params(0.374);

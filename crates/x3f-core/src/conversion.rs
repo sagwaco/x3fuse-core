@@ -56,6 +56,11 @@ pub fn convert_file(
 ) -> Result<ConversionReport, Error> {
     let control = Control::new(cancel);
     control.check()?;
+    if options.spp_denoise && format == OutputFormat::Jpeg {
+        return Err(Error::InvalidData(
+            "SPP denoise requires a color export".into(),
+        ));
+    }
     // Reserve ownership before any writer can truncate a caller's file.
     let reserved = OpenOptions::new()
         .write(true)

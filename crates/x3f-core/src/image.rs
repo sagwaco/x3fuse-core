@@ -138,6 +138,7 @@ impl Reader {
                 sgain,
                 cwb_ptr(&cwb),
                 sys::ProcessingOptions {
+                    spp_denoise: opts.spp_denoise,
                     dng_highlight_recovery: opts.dng_highlight_recovery,
                     dng_shoulder: opts.dng_highlight_mapping.to_raw() == 1,
                     cineon: opts.cineon,

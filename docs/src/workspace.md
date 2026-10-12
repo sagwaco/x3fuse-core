@@ -63,6 +63,9 @@ mirror of what used to be in `src/`:
 | `matrix.rs` | `x3f_matrix.c` (3×3 mul, color-space matrices, gamma LUT) | M6a |
 | `jpeg_exif.rs` | Shared JPEG EXIF reader for render calibration and DNG metadata | Native Rust |
 | `merrill.rs` | Reconstructed Sigma Merrill tone and RGB output kernels | SPP alignment |
+| `float_front.rs`, `float_front/repair.rs` | Merrill float gains, shading and ordered defect repair | SPP integration |
+| `spp_denoise.rs`, `spp_denoise/` | Native noise parameters, resampling, bilateral filters, residuals and tiling | SPP integration |
+| `process/spp.rs` | Per-conversion SPP metadata, float processing and color export | SPP integration |
 | `meta.rs` | `x3f_meta.c` (CAMF / property accessors) | M4a |
 | `print_meta.rs` | `x3f_print_meta.c` (tier-2-MD5-pinned text dump) | M4b |
 | `process.rs` | `x3f_process.c` master pipeline (preprocess, convert, expand, denoise) | M6e1–10 |

@@ -79,6 +79,10 @@ pub(crate) fn write_controlled(
 ) -> Result<(), Error> {
     control.check()?;
 
+    if opts.spp_denoise {
+        return Err(x3f_sys::Error::InvalidData("SPP denoise does not support DNG output").into());
+    }
+
     // Resolve white balance up front — used both for image processing and
     // for the matrix tags.
     let mut opts = opts.clone();
