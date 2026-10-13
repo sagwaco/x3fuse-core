@@ -70,7 +70,7 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
       - name: CPU-only denoising fallback
-        run: cargo test -p x3f-sys --no-default-features denoise::
+        run: 'cargo test -p x3f-sys --no-default-features denoise::'
       - name: CPU-only core API tests (camera cases require X3F_TEST_FILES)
         run: cargo test -p x3f-core --no-default-features
       - name: smoke test (x3f_extract --help)
@@ -199,7 +199,7 @@ jobs:
       - name: run portable denoising tests under WASM
         env:
           CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime run
-        run: cargo test --release -p x3f-sys --target wasm32-wasip1 --features gpu denoise:: -- --skip cancellation_preserves_sensor_buffer_without_cancelling_another_call
+        run: 'cargo test --release -p x3f-sys --target wasm32-wasip1 --features gpu denoise:: -- --skip cancellation_preserves_sensor_buffer_without_cancelling_another_call'
 
   # M9a: build the contributor mdbook so docs drift surfaces as a CI
   # failure rather than as a stale on-disk render. We pin a known-good
