@@ -35,7 +35,7 @@ use std::ptr::NonNull;
 
 use thiserror::Error;
 use x3f_sys as sys;
-pub use x3f_sys::DenoiseBackend;
+pub use x3f_sys::{DenoiseAlgorithm, DenoiseBackend, DenoiseOptions, NlmOptions};
 // Shadow the external libc crate with x3f-sys's compat shim. On every
 // target except wasm32-unknown-unknown this is `pub use libc::*;`; on
 // wasm32 it provides Rust-native equivalents for the few libc symbols
@@ -132,17 +132,19 @@ pub struct ProcessOptions {
     pub wb: Option<String>,
     /// ZIP-compress DNG/TIFF output.
     pub compress: bool,
-    /// Strength of the NLM denoise pass run before color conversion, on a
+    /// Strength of sensor denoising before color conversion, on a
     /// 0..=10 scale: `0` disables denoise entirely (equivalent to the legacy
     /// `-no-denoise`), `10` is full strength (the legacy default), and
-    /// intermediate values linearly attenuate each sensor's NLM sigma
+    /// intermediate values linearly attenuate filter strength
     /// (`scale = intensity / 10`). Values above 10 are clamped. Backed by the
-    /// Non-Local Means with portable Rust and optional native GPU backends.
+    /// selected NLM/BM3D algorithm with portable Rust and optional GPU backends.
     pub denoise_intensity: u8,
     /// Select GPU acceleration or portable CPU execution (default: Auto).
     /// Enable the `gpu` Cargo feature for native acceleration. Auto falls back
     /// to CPU when unavailable; Gpu fails instead. WASM always uses CPU in Auto.
     pub denoise_backend: DenoiseBackend,
+    /// Algorithm and advanced sensor-space denoising controls.
+    pub denoise_options: DenoiseOptions,
     /// Directory of pre-rendered DNG `OpcodeList3` blobs (Sigma's per-
     /// model / per-aperture flat-fielding gain maps). When set, the DNG
     /// writer looks up the blob matching the camera's model and aperture
@@ -199,6 +201,7 @@ impl Default for ProcessOptions {
             compress: false,
             denoise_intensity: 10,
             denoise_backend: DenoiseBackend::Auto,
+            denoise_options: DenoiseOptions::default(),
             opcodes_dir: None,
             dng_highlight_recovery: false,
             dng_highlight_mapping: DngHighlightMapping::default(),
@@ -636,7 +639,9 @@ impl Reader {
                 // Histogram output retains its legacy processing behavior;
                 // DNG highlight and TIFF Cineon options do not apply here.
                 sys::ProcessingOptions::default(),
-                sys::Control::none().with_denoise_backend(opts.denoise_backend),
+                sys::Control::none()
+                    .with_denoise_backend(opts.denoise_backend)
+                    .with_denoise_options(opts.denoise_options)?,
             )
         }?;
         #[cfg(target_arch = "wasm32")]

@@ -7,16 +7,18 @@ use crate::output::dng::{color::ColorCalibration, exif::CaptureMetadata, metadat
 use crate::{ConversionStage, Error, Reader};
 
 /// Sensor preparation choices. Creative adjustments belong to the renderer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SceneLinearOptions {
     /// Interpolate known bad sensor pixels (default true).
     pub fix_bad: bool,
     /// Lens shading; None uses the existing camera-specific default.
     pub apply_sgain: Option<bool>,
-    /// Existing sensor NLM intensity, 0 through 10 (default 10).
+    /// Sensor denoising intensity, 0 through 10 (default 10).
     pub denoise_intensity: u8,
     /// Select GPU acceleration or portable CPU execution (default: Auto).
     pub denoise_backend: crate::DenoiseBackend,
+    /// Algorithm and advanced sensor-space denoising controls.
+    pub denoise_options: crate::DenoiseOptions,
     /// Reconstruct clipped sensor layers (default false).
     pub highlight_recovery: bool,
 }
@@ -28,6 +30,7 @@ impl Default for SceneLinearOptions {
             apply_sgain: None,
             denoise_intensity: 10,
             denoise_backend: crate::DenoiseBackend::Auto,
+            denoise_options: crate::DenoiseOptions::default(),
             highlight_recovery: false,
         }
     }
@@ -138,7 +141,9 @@ pub fn prepare_scene_linear(
     cancel: &AtomicBool,
     mut on_stage: impl FnMut(ConversionStage),
 ) -> Result<SceneLinearImage, Error> {
-    let control = Control::new(cancel).with_denoise_backend(options.denoise_backend);
+    let control = Control::new(cancel)
+        .with_denoise_backend(options.denoise_backend)
+        .with_denoise_options(options.denoise_options)?;
     control.check()?;
     if options.denoise_intensity > 10 {
         return Err(Error::InvalidData(

@@ -44,8 +44,14 @@ acceleration and returns `Error::Gpu` when unavailable. CPU execution preserves
 the existing output; GPU floating-point accumulation can differ slightly.
 See [denoising performance and validation](docs/src/performance.md#gpu-denoising).
 
-This checkout prepares the **0.2.0** release. It adds `denoise_backend` to
-`ProcessOptions` and `SceneLinearOptions`, and GPU errors to the Rust error
+Select `DenoiseOptions::algorithm` (`Nlm` or `Bm3d`) through either options
+struct’s `denoise_options` field. NLM remains the default. Advanced controls
+include independent luminance/chroma toggles, strength, and NLM patch/search
+sizes. Both algorithms support native GPU execution and CPU/WASM fallback.
+Enable the optional `serde` feature to persist these settings.
+
+This checkout prepares the **0.2.0** release. It adds `denoise_backend` and
+`denoise_options` to `ProcessOptions` and `SceneLinearOptions`, and GPU errors to the Rust error
 enums. Downstream exhaustive struct literals and error matches must be updated;
 use `..Default::default()` when constructing options. These source changes
 must not be published as a 0.1.x patch. The C ABI remains unchanged.
@@ -83,8 +89,9 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 | `-v` / `-q`               | verbose / quiet (errors only)                                                      |
 | `-color <SPACE>`          | RGB color space: `none`, `sRGB`, `AdobeRGB`, `ProPhotoRGB` (does not affect DNG)   |
 | `-compress`               | lossless compression (DNG: lossless JPEG, TIFF: Deflate/ZIP)                       |
-| `-denoise <0-10>`         | NLM denoise intensity: `0` = off, `10` = full strength (**default**); intermediate values linearly scale the NLM sigma |
-| `-no-denoise`             | disable the NLM denoise pass (alias for `-denoise 0`)                               |
+| `-denoise <0-10>`         | Denoise intensity: `0` = off, `10` = full strength (**default**); intermediate values scale filter strength |
+| `-no-denoise`             | disable denoising (alias for `-denoise 0`)                               |
+| `-denoiser <nlm\|bm3d>` | algorithm (default: NLM); see [advanced controls](docs/src/performance.md#algorithm-and-advanced-controls) |
 | `-denoise-backend <auto\|cpu\|gpu>` | execution backend; `auto` falls back to CPU, `gpu` fails if acceleration is unavailable |
 | `-no-crop`                | do not crop to the active image area                                               |
 | `-no-sgain` / `-sgain`    | disable / force spatial-gain (lens color) compensation                             |

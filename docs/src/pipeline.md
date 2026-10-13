@@ -211,7 +211,7 @@ file list.
 ### Editor source
 
 `x3f_core::prepare_scene_linear` opens a fresh reader and runs the same sensor
-normalization, repair, Quattro expansion and optional NLM used by conversion.
+normalization, repair, Quattro expansion and optional NLM/BM3D used by conversion.
 It returns an owned, active-area-cropped, unrotated RGB `Vec<f32>` in extended
 linear sRGB/D65. As-shot WB and capture/digital ISO gains are already applied.
 Orientation and camera WB calibration accompany the pixels. The renderer must
@@ -286,7 +286,7 @@ Only two tiny C files remain in the cc-rs build:
 | [`csrc/x3f_printf.c`](../../crates/x3f-sys/csrc/x3f_printf.c) | logging shim (function-pointer hook calls into a Rust callback for mobile/WASM) |
 | [`csrc/x3f_version.c`](../../crates/x3f-sys/csrc/x3f_version.c) | version string |
 
-The remaining host pipeline is Rust. Denoise is Non-Local Means in
+The remaining host pipeline is Rust. The default denoiser is Non-Local Means in
 [`crates/x3f-sys/src/denoise.rs`](../../crates/x3f-sys/src/denoise.rs), called
 directly by [`run_denoising`](../../crates/x3f-sys/src/process.rs) and the
 Quattro upsampler on every target. It mirrors the algorithm of the original
@@ -311,21 +311,27 @@ sensor's base NLM sigma. `10` → `scale = 1.0` is full-strength denoise; `0`
 gates the pass out entirely. (Denoise output is not part of the byte-parity
 gate — every tier-2/3 test runs with `-no-denoise`.)
 
-Native CLI builds also include a wgpu implementation of both NLM windows in
+Native CLI builds also include wgpu implementations of NLM and BM3D in
 [`denoise/`](../../crates/x3f-sys/src/denoise/). `-denoise-backend auto` (default)
 tries Metal/Vulkan/DX12 and retries on CPU if initialization or execution fails.
 `cpu` forces the existing Rust path; `gpu` requires acceleration and fails
 explicitly. Backend selection travels through `ProcessOptions` or
 `SceneLinearOptions` and `Control`, so concurrent conversions can choose
-different backends. No legacy C struct or flag changes meaning.
+different backends. `DenoiseOptions` travels in the same per-call control and
+selects NLM/BM3D, luminance/chroma, strength, and NLM patch/search sizes.
+BM3D replaces the NLM/median/low-frequency stages with collaborative hard
+thresholding and Wiener filtering in sensor YUV; it estimates noise there
+rather than reusing the NLM profile as a standard deviation. See the
+[algorithm controls and profile](performance.md#algorithm-and-advanced-controls).
+Legacy C callers keep CPU NLM defaults; no C struct layout changes.
 
-The GPU uses globally reflected halos around 1024×1024 tiles, the same L1
+The NLM GPU backend uses globally reflected halos around 1024×1024 tiles, the same L1
 distances and quantized weights, and FP32 accumulation. Subgroup operations
 share patch-distance work when supported; a shared-memory shader covers other
 compute adapters. Median and resize operations use Rayon on native targets,
 preserving the existing per-pixel arithmetic order. WASM remains serial CPU
 with no GPU imports. See [performance notes](performance.md#gpu-denoising) for
-numerical tolerances, benchmarks, and the BM3D decision.
+numerical tolerances, benchmarks, and the BM3D implementation.
 
 Everything else under [`src/`](../../src/) is the legacy archive —
 header files are still consumed by bindgen for typedefs, but the `.c`

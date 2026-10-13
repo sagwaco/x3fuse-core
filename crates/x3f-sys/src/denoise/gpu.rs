@@ -5,11 +5,13 @@ use std::time::{Duration, Instant};
 
 use super::{reflect_101, Img3};
 use crate::{Control, Error, Result};
+#[path = "bm3d_gpu.rs"]
+mod bm3d_gpu;
 
 const TILE: usize = 1024;
-const INPUT_BYTES: u64 = ((TILE + 22) * (TILE + 22) * 8) as u64;
+const INPUT_BYTES: u64 = ((TILE + 38) * (TILE + 38) * 8) as u64;
 const OUTPUT_BYTES: u64 = (TILE * TILE * 8) as u64;
-const LUT_BYTES: u64 = 110_594 * 16;
+const LUT_BYTES: u64 = 196_609 * 16;
 
 type SharedGpu = Mutex<Option<std::result::Result<Gpu, String>>>;
 static GPU: SharedGpu = Mutex::new(None);
@@ -18,6 +20,7 @@ struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
+    general_pipeline: wgpu::ComputePipeline,
     bindings: wgpu::BindGroup,
     source: wgpu::Buffer,
     destination: wgpu::Buffer,
@@ -26,6 +29,7 @@ struct Gpu {
     params: wgpu::Buffer,
     failure: Arc<Mutex<Option<String>>>,
     workgroup: [u32; 2],
+    bm3d: std::sync::OnceLock<std::result::Result<bm3d_gpu::Resources, String>>,
 }
 
 fn gpu_error(error: impl std::fmt::Display) -> Error {
@@ -118,6 +122,23 @@ impl Gpu {
                 mapped_at_creation: false,
             })
         };
+        let general_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("x3f configurable NLM"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("nlm_general.wgsl").into()),
+        });
+        let general_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("NLM shared layout"),
+            bind_group_layouts: &[&pipeline.get_bind_group_layout(0)],
+            push_constant_ranges: &[],
+        });
+        let general_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("x3f configurable NLM"),
+            layout: Some(&general_layout),
+            module: &general_shader,
+            entry_point: Some("nlm"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
         let source = buffer(
             "NLM input",
             INPUT_BYTES,
@@ -169,6 +190,7 @@ impl Gpu {
             device,
             queue,
             pipeline,
+            general_pipeline,
             bindings,
             source,
             destination,
@@ -177,6 +199,7 @@ impl Gpu {
             params,
             failure,
             workgroup: if subgroups { [128, 1] } else { [16, 16] },
+            bm3d: std::sync::OnceLock::new(),
         };
         gpu.check().map_err(|e| e.to_string())?;
         let info = adapter.get_info();
@@ -222,11 +245,18 @@ impl Gpu {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-            pass.set_pipeline(&self.pipeline);
+            // Zero in slot 6 is the original 3x3 dispatch used by kernel tests.
+            let general = dimensions[6] != 0 || dimensions[4] > 10;
+            let workgroup = if general { [8, 8] } else { self.workgroup };
+            pass.set_pipeline(if general {
+                &self.general_pipeline
+            } else {
+                &self.pipeline
+            });
             pass.set_bind_group(0, &self.bindings, &[]);
             pass.dispatch_workgroups(
-                (width as u32).div_ceil(self.workgroup[0]),
-                (height as u32).div_ceil(self.workgroup[1]),
+                (width as u32).div_ceil(workgroup[0]),
+                (height as u32).div_ceil(workgroup[1]),
                 1,
             );
         }
@@ -265,6 +295,7 @@ impl Gpu {
                     return Err(gpu_error("GPU readback timed out"));
                 }
             }
+            self.check()?;
             let mapped = slice.get_mapped_range();
             let pixels: &[[u32; 2]] = bytemuck::cast_slice(&mapped);
             for row in 0..height {
@@ -303,12 +334,32 @@ fn nlm_on(
     control: Control<'_>,
 ) -> Result<Img3> {
     control.check()?;
-    if template != 3 || ![11, 21].contains(&search) {
+    if !(1..=9).contains(&template)
+        || template % 2 == 0
+        || !(1..=31).contains(&search)
+        || search % 2 == 0
+    {
         return Err(gpu_error("unsupported NLM window"));
     }
     if src.rows == 0 || src.cols == 0 {
         return Ok(Img3::new(src.rows, src.cols));
     }
+    with_gpu(shared, control, |gpu| {
+        run_nlm_windows(gpu, src, h, template, search, control)
+    })
+}
+
+pub(super) fn bm3d(src: &Img3, sigma: [f64; 3], control: Control<'_>) -> Result<Img3> {
+    with_gpu(&GPU, control, |gpu| {
+        bm3d_gpu::denoise(gpu, src, sigma, control)
+    })
+}
+
+fn with_gpu<T>(
+    shared: &SharedGpu,
+    control: Control<'_>,
+    run: impl FnOnce(&Gpu) -> Result<T>,
+) -> Result<T> {
     // ponytail: one GPU call at a time bounds scratch memory; add a resource
     // pool only if measured batch throughput warrants concurrent dispatch.
     let mut guard = loop {
@@ -326,14 +377,27 @@ fn nlm_on(
         .as_ref()
         .map_err(gpu_error)?;
     control.check()?;
-    run_nlm(gpu, src, h, search, control)
+    gpu.check()?;
+    run(gpu)
 }
 
 fn run_nlm(gpu: &Gpu, src: &Img3, h: [f64; 3], search: i32, control: Control<'_>) -> Result<Img3> {
+    run_nlm_windows(gpu, src, h, 3, search, control)
+}
+
+fn run_nlm_windows(
+    gpu: &Gpu,
+    src: &Img3,
+    h: [f64; 3],
+    template: i32,
+    search: i32,
+    control: Control<'_>,
+) -> Result<Img3> {
     gpu.check()?;
     // Above this distance every channel's fixed-point weight is zero. Keep a
     // zero sentinel so clamping larger indices exactly matches the CPU LUT.
-    let step = 16.0 / 9.0;
+    let shift = super::nearest_pow2(template * template);
+    let step = (1 << shift) as f64 / (template * template) as f64;
     let cutoff = h.into_iter().fold(0.0_f64, f64::max) * (3.0 * 1000.0_f64.ln()).sqrt();
     let len = ((cutoff / step).ceil() as usize + 2).min((LUT_BYTES / 16) as usize);
     let mut weights = vec![[0_f32; 4]; len];
@@ -354,7 +418,7 @@ fn run_nlm(gpu: &Gpu, src: &Img3, h: [f64; 3], search: i32, control: Control<'_>
     gpu.queue
         .write_buffer(&gpu.weights, 0, bytemuck::cast_slice(&weights));
     let mut out = Img3::new(src.rows, src.cols);
-    let halo = (search / 2 + 1) as usize;
+    let halo = (search / 2 + template / 2) as usize;
     let mut pixels = Vec::with_capacity((TILE + 2 * halo).pow(2));
     for y in (0..src.rows).step_by(TILE) {
         let height = TILE.min(src.rows - y);
@@ -383,8 +447,12 @@ fn run_nlm(gpu: &Gpu, src: &Img3, h: [f64; 3], search: i32, control: Control<'_>
                     height as u32,
                     search as u32 / 2,
                     len as u32,
-                    0,
-                    0,
+                    if template == 3 && search <= 21 {
+                        0
+                    } else {
+                        template as u32 / 2 + 1
+                    },
+                    shift,
                 ],
                 control,
                 &mut out,
@@ -400,6 +468,77 @@ fn run_nlm(gpu: &Gpu, src: &Img3, h: [f64; 3], search: i32, control: Control<'_>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a physical GPU"]
+    fn configurable_windows_and_bm3d_match_cpu() {
+        let gpu = Gpu::new(true).expect("physical GPU");
+        let mut seed = 42_u32;
+        let mut source = Img3::new(37, 39);
+        for pixel in source.data.chunks_exact_mut(3) {
+            for value in pixel {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                *value = 32000 + ((seed >> 16) % 800) as u16;
+            }
+        }
+        for (patch, search) in [(1, 1), (1, 7), (5, 7), (7, 15), (9, 31), (3, 31)] {
+            let cpu =
+                crate::denoise::fast_nlm_cpu(&source, [100.; 3], patch, search, Control::none())
+                    .unwrap();
+            let actual =
+                run_nlm_windows(&gpu, &source, [100.; 3], patch, search, Control::none()).unwrap();
+            let error = cpu
+                .data
+                .iter()
+                .zip(actual.data)
+                .map(|(a, b)| a.abs_diff(b))
+                .max()
+                .unwrap();
+            assert!(error <= 1, "NLM patch={patch} search={search}: {error}");
+        }
+        for (rows, cols) in [(1, 1), (3, 5), (37, 39), (259, 263)] {
+            let mut source = Img3::new(rows, cols);
+            for (i, pixel) in source.data.chunks_exact_mut(3).enumerate() {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                pixel.copy_from_slice(&[i as u16, 32000 + ((seed >> 16) % 800) as u16, 32768]);
+            }
+            let cpu = crate::denoise::bm3d::denoise_cpu(&source, [0., 230., 0.], Control::none())
+                .unwrap();
+            let actual = bm3d_gpu::denoise(&gpu, &source, [0., 230., 0.], Control::none()).unwrap();
+            let repeated =
+                bm3d_gpu::denoise(&gpu, &source, [0., 230., 0.], Control::none()).unwrap();
+            assert!(
+                actual.data == repeated.data,
+                "BM3D must reproduce the same pixels on repeated execution"
+            );
+            let error = cpu
+                .data
+                .iter()
+                .zip(&actual.data)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            // FP32 transforms and quantized weights can perturb match ordering. Bound
+            // both the worst pixel and RMS, rather than requiring bit identity.
+            let rms = (cpu
+                .data
+                .iter()
+                .zip(&actual.data)
+                .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
+                .sum::<f64>()
+                / cpu.data.len() as f64)
+                .sqrt();
+            assert!(
+                error <= 8 && rms < 0.6,
+                "BM3D {cols}x{rows}: max={error}, RMS={rms}"
+            );
+            assert!(source
+                .data
+                .chunks_exact(3)
+                .zip(actual.data.chunks_exact(3))
+                .all(|(a, b)| a[0] == b[0] && a[2] == b[2]));
+        }
+    }
 
     #[test]
     fn failed_or_poisoned_context_returns_an_error_without_a_gpu() {
@@ -454,6 +593,8 @@ mod tests {
         };
         for (source, caps) in [
             (include_str!("nlm.wgsl"), Capabilities::empty()),
+            (include_str!("nlm_general.wgsl"), Capabilities::empty()),
+            (include_str!("bm3d.wgsl"), Capabilities::empty()),
             (include_str!("nlm_subgroup.wgsl"), Capabilities::SUBGROUP),
         ] {
             let module = wgsl::parse_str(source).unwrap();

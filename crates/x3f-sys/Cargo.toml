@@ -20,6 +20,7 @@ all-features = true
 [features]
 default = []
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+serde = ["dep:serde"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 wgpu = { version = "27", optional = true, default-features = false, features = ["std", "wgsl", "metal", "vulkan", "dx12"] }
@@ -27,6 +28,7 @@ pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1", optional = true }
 
 [dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
 # libc::snprintf is used by src/print_meta.rs to match C `%g` float formatting
 # byte-for-byte (Rust's f64 Display uses Grisu/Ryu shortest-round-trip, which
 # differs from C's 6-significant-digit %g default and would invalidate the

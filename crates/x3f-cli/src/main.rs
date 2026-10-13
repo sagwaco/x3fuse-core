@@ -51,6 +51,7 @@ struct Args {
     /// 10 is full strength (legacy default).
     denoise_intensity: u8,
     denoise_backend: x3f_core::DenoiseBackend,
+    denoise_options: x3f_core::DenoiseOptions,
     apply_sgain: Option<bool>,
     file_type: FileType,
     color_encoding: ColorEncoding,
@@ -83,6 +84,7 @@ impl Default for Args {
             fix_bad: true,
             denoise_intensity: 10,
             denoise_backend: x3f_core::DenoiseBackend::Auto,
+            denoise_options: x3f_core::DenoiseOptions::default(),
             apply_sgain: None,
             file_type: FileType::Dng,
             color_encoding: ColorEncoding::Srgb,
@@ -130,11 +132,17 @@ fn usage(progname: &str) -> ! {
          \x20  -unprocessed    Dump RAW without any preprocessing\n\
          \x20  -qtop           Dump Quattro top layer without preprocessing\n\
          \x20  -no-crop        Do not crop to active area\n\
-         \x20  -no-denoise     Disable NLM denoise (same as -denoise 0)\n\
+         \x20  -no-denoise     Disable denoising (same as -denoise 0)\n\
+         \x20  -denoiser <nlm|bm3d>  Select algorithm (default: nlm)\n\
+         \x20  -denoise-luma / -no-denoise-luma  Luminance (default: off)\n\
+         \x20  -denoise-chroma / -no-denoise-chroma  Chroma (default: on)\n\
+         \x20  -denoise-strength <0.1-3>  Sensor strength multiplier (default: 1)\n\
+         \x20  -nlm-luma-patch / -nlm-chroma-patch <1-9>  Odd patch size\n\
+         \x20  -nlm-luma-search / -nlm-chroma-search <1-31>  Odd search size\n\
          \x20  -denoise-backend <auto|cpu|gpu>  Select execution backend\n\
-         \x20  -denoise <0-10> NLM denoise intensity. 0 = off,\n\
+         \x20  -denoise <0-10> Denoise intensity. 0 = off,\n\
          \x20                  10 = full strength (default). Intermediate\n\
-         \x20                  values linearly scale the NLM sigma.\n\
+         \x20                  values scale the selected filter strength.\n\
          \x20  -no-sgain       Do not apply spatial gain (color compensation)\n\
          \x20  -no-fix-bad     Do not fix bad pixels\n\
          \x20  -sgain          Apply spatial gain (default except for Quattro)\n\
@@ -289,6 +297,44 @@ fn parse_args(argv: &[String]) -> Args {
             "-no-crop" => args.crop = false,
             "-no-fix-bad" => args.fix_bad = false,
             "-no-denoise" => args.denoise_intensity = 0,
+            "-denoiser" => {
+                i += 1;
+                args.denoise_options.algorithm = argv
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| usage(progname));
+            }
+            "-denoise-luma" => args.denoise_options.luminance = true,
+            "-no-denoise-luma" => args.denoise_options.luminance = false,
+            "-denoise-chroma" => args.denoise_options.chroma = true,
+            "-no-denoise-chroma" => args.denoise_options.chroma = false,
+            "-denoise-strength" => {
+                i += 1;
+                args.denoise_options.strength = argv
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| usage(progname));
+                args.denoise_options
+                    .validate()
+                    .unwrap_or_else(|_| usage(progname));
+            }
+            "-nlm-luma-patch" | "-nlm-chroma-patch" | "-nlm-luma-search" | "-nlm-chroma-search" => {
+                let flag = argv[i].as_str();
+                i += 1;
+                let value = argv
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| usage(progname));
+                match flag {
+                    "-nlm-luma-patch" => args.denoise_options.nlm.luma_patch = value,
+                    "-nlm-chroma-patch" => args.denoise_options.nlm.chroma_patch = value,
+                    "-nlm-luma-search" => args.denoise_options.nlm.luma_search = value,
+                    _ => args.denoise_options.nlm.chroma_search = value,
+                }
+                args.denoise_options
+                    .validate()
+                    .unwrap_or_else(|_| usage(progname));
+            }
             "-denoise-backend" => {
                 i += 1;
                 let v = argv.get(i).unwrap_or_else(|| usage(progname));
@@ -479,6 +525,7 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
         fix_bad: args.fix_bad,
         denoise_intensity: args.denoise_intensity,
         denoise_backend: args.denoise_backend,
+        denoise_options: args.denoise_options,
         apply_sgain: args.apply_sgain,
         wb: args.wb.clone(),
         compress: args.compress,
@@ -526,7 +573,7 @@ fn main() -> ExitCode {
         set_max_printed_matrix_elements(n);
     }
     // -ocl is a no-op, preserved only so legacy scripts don't error. There is
-    // no OpenCL backend (the denoise pass is the pure-Rust NLM in x3f-sys).
+    // no OpenCL backend (native acceleration uses wgpu in x3f-sys).
     let _ = args.use_opencl;
 
     if let Some(dir) = args.outdir.as_deref() {
@@ -765,6 +812,34 @@ mod tests {
             DenoiseBackend::Gpu
         );
         assert!("opencl".parse::<DenoiseBackend>().is_err());
+    }
+
+    #[test]
+    fn algorithm_and_advanced_denoise_flags_are_independent() {
+        let options = parse(&[
+            "-denoiser",
+            "bm3d",
+            "-denoise-luma",
+            "-no-denoise-chroma",
+            "-denoise-strength",
+            "1.5",
+            "-nlm-luma-patch",
+            "7",
+            "-nlm-chroma-search",
+            "21",
+            "in.X3F",
+        ])
+        .denoise_options;
+        assert_eq!(options.algorithm, x3f_core::DenoiseAlgorithm::Bm3d);
+        assert!(options.luminance);
+        assert!(!options.chroma);
+        assert_eq!(options.strength, 1.5);
+        assert_eq!(options.nlm.luma_patch, 7);
+        assert_eq!(options.nlm.chroma_search, 21);
+        assert_eq!(
+            parse(&["in.X3F"]).denoise_options,
+            x3f_core::DenoiseOptions::default()
+        );
     }
 
     #[test]
