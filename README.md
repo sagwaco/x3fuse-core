@@ -40,8 +40,10 @@ the output they created.
 For native GPU denoising in this checkout, enable the library's optional `gpu` Cargo feature.
 `ProcessOptions::denoise_backend` and `SceneLinearOptions::denoise_backend`
 accept `DenoiseBackend::{Auto, Cpu, Gpu}`. `Auto` is the default; `Gpu` requires
-acceleration and returns `Error::Gpu` when unavailable. CPU execution preserves
-the existing output; GPU floating-point accumulation can differ slightly.
+acceleration and returns `Error::Gpu` when unavailable. Default NLM now copies
+luminance without filtering, so CPU output can differ slightly from earlier
+releases in nearly constant regions. Output with `-no-denoise` remains
+byte-identical. GPU floating-point accumulation can also differ slightly.
 See [denoising performance and validation](docs/src/performance.md#gpu-denoising).
 
 Select `DenoiseOptions::algorithm` (`Nlm` or `Bm3d`) through either options
@@ -50,7 +52,7 @@ include independent luminance/chroma toggles, strength, and NLM patch/search
 sizes. Both algorithms support native GPU execution and CPU/WASM fallback.
 Enable the optional `serde` feature to persist these settings.
 
-This checkout prepares the **0.2.0** release. It adds `denoise_backend` and
+Version **0.2.0** adds `denoise_backend` and
 `denoise_options` to `ProcessOptions` and `SceneLinearOptions`, and GPU errors to the Rust error
 enums. Downstream exhaustive struct literals and error matches must be updated;
 use `..Default::default()` when constructing options. These source changes

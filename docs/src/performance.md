@@ -177,8 +177,8 @@ unsupported on WASM.
 
 Kernel output must be within one 16-bit code value of the CPU reference.
 Downstream matrix and tone processing can amplify that difference. On the
-local `DP2M0981.X3F` and `DP0Q0010.X3F` samples, CPU output and denoising-disabled
-output matched the pre-update binary (`00d326f`) byte for byte for DNG and TIFF.
+local `DP2M0981.X3F` and `DP0Q0010.X3F` samples, denoising-disabled output matched
+the pre-update binary (`00d326f`) byte for byte for DNG and TIFF.
 GPU versus CPU raster differences at strength 10 were:
 
 | Sample | Output | Maximum absolute difference (16-bit codes) | RMSE (16-bit codes) | PSNR against CPU |
@@ -224,6 +224,12 @@ Disabled planes are copied from the input, including around the refinement;
 sensor BMT/YUV transforms retain their existing integer rounding. Both planes
 off bypasses denoising. Larger windows cost more time and may smooth detail.
 Custom windows run on GPU too; the optimized 3x3 shader remains the fast default.
+
+Default NLM output can differ from 0.1.6 even on CPU. The old zero-strength
+luminance filter could average small sample differences because it rounded patch
+distances into bins. Disabled luminance now copies the input exactly. This can
+change denoised pixels in nearly constant regions; output with `-no-denoise`
+remains byte-identical.
 
 ### BM3D implementation
 

@@ -30,8 +30,11 @@ cargo build --release -p x3f-ffi-c
 
 A whole-workspace build also enables the CLI's default `gpu` feature; Cargo
 unifies that feature into `x3f-core`/`x3f-sys` and their linked dependencies.
-Legacy C processing entry points explicitly use CPU regardless, preserving
-their output and ABI. GPU backend selection is exposed by the Rust 0.2 API;
+Legacy C processing entry points explicitly use CPU regardless, so feature
+unification does not change their backend. The C ABI is unchanged. Default NLM
+output can differ from earlier releases because disabled luminance is now copied
+exactly; see [denoising controls](performance.md#algorithm-and-advanced-controls).
+GPU backend selection is exposed by the Rust 0.2 API;
 the opaque-handle C API above still only provides metadata and thumbnails.
 
 ## C ABI surface
