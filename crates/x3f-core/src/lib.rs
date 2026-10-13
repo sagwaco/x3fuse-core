@@ -42,12 +42,16 @@ pub use x3f_sys::{DenoiseAlgorithm, DenoiseBackend, DenoiseOptions, NlmOptions};
 // we touch here (FILE / fopen / fclose / free).
 use x3f_sys::sysabi as libc;
 
+mod color_mode;
 mod conversion;
+pub mod dcp;
 mod globals;
 mod icc;
 mod image;
 pub mod output;
 mod scene;
+
+pub use color_mode::ColorMode;
 
 pub use conversion::{convert_file, ConversionReport, ConversionStage, OutputFormat};
 pub use globals::{
@@ -152,15 +156,43 @@ pub struct ProcessOptions {
     /// expected in the x3fuse layout: `<MODEL>[_<LENSID>]_FF_DNG_Opcodelist3_<APERTURE>`.
     /// `None` (default) skips opcode embedding.
     pub opcodes_dir: Option<std::path::PathBuf>,
-    /// Enable the DNG-path Foveon highlight-recovery pipeline. Recovered
-    /// headroom is preserved linearly by default; `dng_highlight_mapping`
-    /// can select the legacy baked shoulder. This also applies after
-    /// Quattro expansion.
+    /// Optional DCP file whose look table and tone curve replace those in the
+    /// default DNG profile, regardless of camera model. Leaves calibration,
+    /// raw samples, and the thumbnail unchanged. Defaults to `None`.
+    pub dng_look: Option<std::path::PathBuf>,
+    /// Embed a camera profile for the selected DP1, DP2 or DP3 Merrill color mode.
+    /// Build it from CAMF, the camera metadata stored in the X3F. Any white-balance
+    /// preset with valid calibration in the file can be used. Auto uses the saved
+    /// calibration rather than estimating white balance again.
     ///
-    /// Default is `false`. Enable this for clipped Foveon highlights:
-    /// without recovery, unequal channel saturation can produce a
-    /// lime/yellow cast even with correct white balance and matrices.
+    /// The file's sRGB or Adobe RGB setting chooses the profile's internal color
+    /// conversion, not the reader's output space. Raw samples, camera calibration,
+    /// exposure metadata and previews stay unchanged with the same processing options.
+    ///
+    /// Defaults to `None`, leaving conversion unchanged. Requires linear highlight
+    /// mapping and cannot be combined with `dng_look`. Selecting a mode does not
+    /// enable recovery or change the denoising and bad-pixel repair settings.
+    pub dng_color_mode: Option<ColorMode>,
+    /// Estimate missing highlight brightness and color when writing DNG.
+    /// Defaults to `false`. Merrill uses gradient-based reconstruction.
+    /// Older cameras and Quattro use separate reconstruction paths.
+    ///
+    /// Linear mapping preserves recovered brightness differences by default.
+    /// Use the `dng_highlight_mapping` field to select shoulder compression instead.
     pub dng_highlight_recovery: bool,
+    /// Optional file path for a binary Portable Graymap (PGM) mask of unreliable
+    /// source layers. Defaults to no export. Requires DNG recovery and native layer data.
+    /// Direct calls to the `Reader::get_image` method require `ColorEncoding::None`
+    /// without Cineon.
+    ///
+    /// The mask covers the active area before orientation. A value of 255 marks
+    /// any pixel with a layer below full reliability. It is not a map of changed
+    /// output pixels or recoverable detail.
+    ///
+    /// An existing mask or an export failure returns an error. A partial or
+    /// complete mask can remain if conversion fails. Check the conversion result:
+    /// the DNG and mask do not succeed or fail as a pair.
+    pub dng_recovery_mask: Option<std::path::PathBuf>,
     /// Mapping applied to recovered DNG highlights (default: `Linear`).
     /// Ignored unless `dng_highlight_recovery` is enabled.
     pub dng_highlight_mapping: DngHighlightMapping,
@@ -203,7 +235,10 @@ impl Default for ProcessOptions {
             denoise_backend: DenoiseBackend::Auto,
             denoise_options: DenoiseOptions::default(),
             opcodes_dir: None,
+            dng_look: None,
+            dng_color_mode: None,
             dng_highlight_recovery: false,
+            dng_recovery_mask: None,
             dng_highlight_mapping: DngHighlightMapping::default(),
             cineon: false,
         }

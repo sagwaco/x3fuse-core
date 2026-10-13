@@ -5,9 +5,8 @@
 //! corresponding tag or, in a few cases, hard-failing the conversion). The
 //! caller decides which behaviour to apply.
 //!
-//! The 3×3 matrix helpers are exposed alongside because they're used in the
-//! same call-chains; a future native port of `x3f_matrix.c` can replace
-//! these without touching the writer.
+//! The matrix helpers here support the writer's color conversions. A 3×3 matrix
+//! mixes three input channels into three output channels.
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -39,6 +38,32 @@ impl Reader {
         // intact (no free).
         let s = unsafe { CStr::from_ptr(out) };
         Some(s.to_string_lossy().into_owned())
+    }
+
+    /// Look up a name in a CAMF list and copy the corresponding value.
+    /// For example, a white-balance list maps Shade to its calibration entry name.
+    pub(crate) fn dng_camf_property(&self, list: &str, key: &str) -> Option<String> {
+        let list = cstr(list);
+        let key = cstr(key);
+        let mut value: *mut c_char = ptr::null_mut();
+        // SAFETY: the loaded reader owns the property and both names outlive the call.
+        let ok = unsafe {
+            sys::x3f_get_camf_property(
+                self.x3f.as_ptr(),
+                list.as_ptr() as *mut _,
+                key.as_ptr() as *mut _,
+                &mut value,
+            )
+        };
+        if ok == 0 || value.is_null() {
+            return None;
+        }
+        // SAFETY: the successful accessor returns a reader-owned NUL-terminated string.
+        Some(
+            unsafe { CStr::from_ptr(value) }
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 
     pub(crate) fn dng_camf_float(&self, name: &str) -> Option<f64> {
@@ -79,6 +104,27 @@ impl Reader {
             )
         };
         (ok != 0).then_some(buf)
+    }
+
+    /// Read the color matrix named by the selected white-balance preset.
+    /// The CAMF list maps preset names to calibration entries. If Daylight is
+    /// absent, the existing accessor tries Sunlight instead.
+    pub(crate) fn dng_camf_wb_matrix_3x3(&self, list: &str, wb: &str) -> Option<[f64; 9]> {
+        let list = cstr(list);
+        let wb = cstr(wb);
+        let mut matrix = [0.0; 9];
+        // SAFETY: the loaded reader owns the metadata and the output has nine slots.
+        let ok = unsafe {
+            sys::x3f_get_camf_matrix_for_wb(
+                self.x3f.as_ptr(),
+                list.as_ptr() as *mut _,
+                wb.as_ptr() as *mut _,
+                3,
+                3,
+                matrix.as_mut_ptr(),
+            )
+        };
+        (ok != 0).then_some(matrix)
     }
 
     /// Read a `MultiAxisTable_<mode>` CAMF entry: a `float[2][5][21]` table

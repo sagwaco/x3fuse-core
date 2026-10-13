@@ -243,6 +243,17 @@ When highlight-recovery research lands, expect the tight bounds to
 loosen for affected images. Document the loosening in the commit
 message; don't quietly bump the threshold to the new max.
 
+Merrill DNG recovery uses separate brightness and color reconstruction.
+See [DNG highlight recovery](./highlight-recovery.md) for the stages and limits.
+Check that reconstruction leaves fully reliable pixels unchanged, unsupported
+pixels keep their tone anchors, and adding color preserves the chosen brightness.
+Check solver failures as errors, not a switch to another reconstruction method.
+These checks precede shared output scaling and 16-bit encoding.
+
+For [recovery masks](./recovery-mask.md), check native dimensions, pixel values,
+source association, and export failures. Requesting a mask must not change DNG
+output. A mask marks unreliable source measurements, not changed output pixels.
+
 The highlight mapping tests in
 [`tier3_highlight_recovery.rs`](../../crates/x3f-cli/tests/tier3_highlight_recovery.rs)
 decode the **raw SubIFD**, not the IFD0 preview. They check recovered
@@ -277,7 +288,7 @@ manual baseline table from guesses or from recovery-enabled runs: measure
 the exact documented recovery-off commands, and record intentional changes
 separately from stale historical file hashes.
 
-Include matrix-pathology cases in highlight validation. Foveon layers can
+Include matrix-pathology cases when validating older sensors. Foveon layers can
 retain nominal headroom while their combined color projection is already
 unreliable, so a hard-clipping mask alone is insufficient. Exercise
 near-clipped BMT vectors with severe color-matrix cancellation as well as
@@ -400,6 +411,25 @@ saturated colors; successful decoding or an acceptable midtone average
 does not establish correct color throughout the image. Default exposure
 and tone can differ between readers; these checks do not establish
 calibrated color accuracy or identical JPEG appearance.
+
+## DCP look checks
+
+Run the parser tests without camera files:
+
+```sh
+cargo test -p x3f-core --lib dcp
+```
+
+Use a local camera file to check embedding and failure handling:
+
+```sh
+X3F_TEST_FILES=/path/to/fixtures cargo test --release -p x3f-core --test dcp
+```
+
+The conversion tests use the first X3F in that directory. They compare raw strips,
+thumbnail strips, and calibration with and without a look, using both compression
+settings and both recovery settings. Also validate a converted DNG with the Adobe
+SDK. A valid container does not establish the quality of its rendered look.
 
 ## Filing a PR
 

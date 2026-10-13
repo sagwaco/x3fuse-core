@@ -5,6 +5,7 @@
 //! raster would clip otherwise usable samples at the published white level.
 
 use super::metadata::{mat3_diag, mat3_mul};
+use super::profiles::srational_pair;
 use crate::Reader;
 
 const WB_CALIBRATION: &str = "Overcast";
@@ -68,6 +69,31 @@ impl ColorCalibration {
         })
     }
 
+    /// The exact AsShotNeutral rationals published in the DNG.
+    pub(super) fn neutral_tag(&self) -> [(u32, u32); 3] {
+        self.neutral
+            .map(|v| ((v * 10_000.0).round().max(1.0) as u32, 10_000))
+    }
+
+    /// Coefficients for calculating brightness from sensor-layer samples.
+    /// Use rounded tag values so recovery and DNG readers share the calibration.
+    pub(super) fn recovery_luminance(&self, forward: [f32; 9]) -> Option<[f64; 3]> {
+        if forward.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        let neutral = self.neutral_tag().map(|(n, d)| n as f64 / d as f64);
+        let maximum = neutral.into_iter().fold(0.0_f64, f64::max);
+        let neutral = neutral.map(|v| v / maximum);
+        let row: [f64; 3] = std::array::from_fn(|c| {
+            let (n, d) = srational_pair(forward[3 + c] as f64, 10_000);
+            n as f64 / d as f64
+        });
+        let sum: f64 = row.iter().sum();
+        let y: [f64; 3] = std::array::from_fn(|c| (row[c] / sum) / neutral[c]);
+        let neutral_y: f64 = (0..3).map(|c| neutral[c] * y[c]).sum();
+        (y.iter().all(|v| v.is_finite()) && (neutral_y - 1.0).abs() < 1e-12).then_some(y)
+    }
+
     /// Absorb CameraCalibration into ColorMatrix, so readers need only the
     /// mandatory matrix tag. This is a row scale because ColorMatrix maps
     /// XYZ into camera coordinates. A diagonal calibration cancels from the
@@ -115,6 +141,48 @@ mod tests {
                 expected[i]
             );
         }
+    }
+
+    #[test]
+    fn recovery_luminance_matches_published_daylight_and_auto_calibration_exactly() {
+        // DP2 Merrill cloud fixture: perturb within the tag rounding intervals
+        // so this also catches accidentally using unrounded calibration.
+        let forward = [
+            0.3122, -0.0065, 0.6585, -0.7552123, 2.0028123, -0.2476123, 0.7729, -3.2655, 3.3179,
+        ];
+        for (neutral, tags, expected) in [
+            (
+                [0.403912, 0.864112, 1.435412],
+                [4039, 8641, 14354],
+                [-2.6838674919534533, 3.326951880569378, -0.24759999999999993],
+            ),
+            (
+                [0.398012, 0.864112, 1.473212],
+                [3980, 8641, 14732],
+                [-2.7953784924623104, 3.414564240249971, -0.24759999999999993],
+            ),
+        ] {
+            let calibration = ColorCalibration {
+                neutral,
+                digital_gain_ev: 0.0,
+                calibration_diagonal: [1.0; 3],
+            };
+            assert_eq!(calibration.neutral_tag(), tags.map(|n| (n, 10_000)));
+            assert_eq!(calibration.recovery_luminance(forward), Some(expected));
+        }
+    }
+
+    #[test]
+    fn invalid_forward_calibration_cannot_enable_recovery() {
+        let calibration =
+            ColorCalibration::from_gains(SHOT_GAIN, CALIBRATION_GAIN, [1.0; 3]).unwrap();
+        for value in [0.0, f32::NAN, f32::INFINITY] {
+            assert!(calibration.recovery_luminance([value; 9]).is_none());
+        }
+        let mut forward = [0.0; 9];
+        forward[3] = -1.0;
+        forward[4] = 1.0;
+        assert!(calibration.recovery_luminance(forward).is_none());
     }
 
     #[test]

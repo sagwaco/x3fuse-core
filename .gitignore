@@ -3,6 +3,7 @@ deps/lib/
 deps/src/
 dist/
 target/
+/target-*/
 Cargo.lock
 *~
 a.out

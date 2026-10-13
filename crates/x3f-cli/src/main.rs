@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use x3f_core::{set_max_printed_matrix_elements, set_offset_legacy, set_verbosity};
-use x3f_core::{ColorEncoding, DngHighlightMapping, ProcessOptions, Reader, Verbosity};
+use x3f_core::{ColorEncoding, ColorMode, DngHighlightMapping, ProcessOptions, Reader, Verbosity};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum FileType {
@@ -61,11 +61,14 @@ struct Args {
     use_opencl: bool,
     outdir: Option<PathBuf>,
     opcodes_dir: Option<PathBuf>,
+    dng_look: Option<PathBuf>,
+    dng_color_mode: Option<ColorMode>,
     files: Vec<PathBuf>,
     verbosity: Option<Verbosity>,
     legacy_offset: Option<i32>,
     matrix_max: Option<u32>,
     dng_highlight_recovery: bool,
+    dng_recovery_mask: bool,
     dng_highlight_mapping: DngHighlightMapping,
     cineon: bool,
     /// Set when the user explicitly passed `-color <space>`. Used to
@@ -94,11 +97,14 @@ impl Default for Args {
             use_opencl: false,
             outdir: None,
             opcodes_dir: None,
+            dng_look: None,
+            dng_color_mode: None,
             files: Vec::new(),
             verbosity: None,
             legacy_offset: None,
             matrix_max: None,
             dng_highlight_recovery: false,
+            dng_recovery_mask: false,
             dng_highlight_mapping: DngHighlightMapping::Linear,
             cineon: false,
             color_explicit: false,
@@ -154,12 +160,23 @@ fn usage(progname: &str) -> ! {
          \x20                  per-(model, aperture[, lens]) blob is embedded\n\
          \x20                  into the DNG raw IFD's OpcodeList3 tag. Files\n\
          \x20                  follow the x3fuse layout: <MODEL>[_<LENS>]_FF_DNG_Opcodelist3_<APERTURE>.\n\
+         \x20  -dng-color-mode <MODE> Embed a camera profile from X3F color-mode metadata.\n\
+         \x20                  Supported cameras: DP1, DP2 and DP3 Merrill.\n\
+         \x20                  Standard, Neutral, Vivid, Portrait, Landscape or FCBlue.\n\
+         \x20                  WB: any preset with calibration in the file.\n\
+         \x20                  Source: sRGB or AdobeRGB.\n\
+         \x20  -dng-look <FILE> Embed a DCP look table and tone curve in the DNG.\n\
+         \x20                  Leaves calibration and the thumbnail unchanged.\n\
          \x20  -dng-highlight-recovery\n\
          \x20                  Recover clipped Foveon highlights when writing\n\
          \x20                  DNG, preserving linear highlight headroom.\n\
          \x20                  BaselineExposure restores default brightness;\n\
          \x20                  readers that ignore it show a darker image.\n\
          \x20                  Default: off (matches the pre-Rust C writer).\n\
+         \x20  -dng-recovery-mask\n\
+         \x20                  Write <input basename>.mask.pgm beside the DNG.\n\
+         \x20                  Requires -dng-highlight-recovery; default off.\n\
+         \x20                  Existing masks are never overwritten.\n\
          \x20  -dng-highlight-mapping <linear|shoulder>\n\
          \x20                  Choose recovered highlight mapping (default:\n\
          \x20                  linear). Requires -dng-highlight-recovery to\n\
@@ -361,7 +378,21 @@ fn parse_args(argv: &[String]) -> Args {
                 let v = argv.get(i).unwrap_or_else(|| usage(progname));
                 args.opcodes_dir = Some(PathBuf::from(v));
             }
+            "-dng-look" => {
+                i += 1;
+                let v = argv.get(i).unwrap_or_else(|| usage(progname));
+                args.dng_look = Some(PathBuf::from(v));
+            }
+            "-dng-color-mode" => {
+                i += 1;
+                let value = argv.get(i).unwrap_or_else(|| usage(progname));
+                args.dng_color_mode = Some(value.parse().unwrap_or_else(|error| {
+                    eprintln!("{error}");
+                    usage(progname);
+                }));
+            }
             "-dng-highlight-recovery" => args.dng_highlight_recovery = true,
+            "-dng-recovery-mask" => args.dng_recovery_mask = true,
             "-dng-highlight-mapping" => {
                 i += 1;
                 let v = argv
@@ -417,6 +448,41 @@ fn normalize(args: &mut Args) {
 /// usage()-style exit. Kept as a pure function so the unit tests can
 /// exercise it without `process::exit`.
 fn validate_args(args: &Args) -> Result<(), String> {
+    if args.dng_color_mode.is_some()
+        && (args.file_type != FileType::Dng
+            || args.dng_look.is_some()
+            || args.dng_highlight_mapping != DngHighlightMapping::Linear)
+    {
+        return Err("-dng-color-mode requires DNG, linear mapping and no -dng-look".into());
+    }
+    if args.dng_look.is_some() && args.file_type != FileType::Dng {
+        return Err("-dng-look requires DNG output".into());
+    }
+    if args.dng_recovery_mask {
+        if args.file_type != FileType::Dng || !args.dng_highlight_recovery || args.cineon {
+            return Err("-dng-recovery-mask requires DNG output and -dng-highlight-recovery, without -cineon".to_string());
+        }
+        let mut destinations = std::collections::HashSet::new();
+        for input in &args.files {
+            let (_, path) = make_paths(input, args.outdir.as_deref(), ".mask.pgm");
+            // Resolve existing parent aliases before workers start. Exclusive
+            // creation remains the final guard against collisions at write time.
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let key = parent
+                .canonicalize()
+                .map(|p| p.join(path.file_name().unwrap()))
+                .unwrap_or_else(|_| path.clone());
+            if !destinations.insert(key) {
+                return Err(format!(
+                    "multiple inputs would write the same recovery mask: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
     if args.cineon && args.file_type != FileType::Tiff {
         return Err(
             "-cineon is only meaningful with -tiff (other formats apply their own gamma/profile)"
@@ -530,7 +596,12 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
         wb: args.wb.clone(),
         compress: args.compress,
         opcodes_dir: args.opcodes_dir.clone(),
+        dng_look: args.dng_look.clone(),
+        dng_color_mode: args.dng_color_mode,
         dng_highlight_recovery: args.dng_highlight_recovery,
+        dng_recovery_mask: args
+            .dng_recovery_mask
+            .then(|| make_paths(infile, args.outdir.as_deref(), ".mask.pgm").1),
         dng_highlight_mapping: args.dng_highlight_mapping,
         cineon: args.cineon,
     };
@@ -640,6 +711,68 @@ mod tests {
     }
 
     #[test]
+    fn mask_export_is_opt_in_and_requires_dng_recovery() {
+        assert!(!Args::default().dng_recovery_mask);
+        for switches in [
+            vec!["-dng-recovery-mask"],
+            vec!["-tiff", "-dng-highlight-recovery", "-dng-recovery-mask"],
+            vec!["-dng-highlight-recovery", "-dng-recovery-mask", "-cineon"],
+        ] {
+            let argv: Vec<String> = std::iter::once("x3f_extract")
+                .chain(switches)
+                .map(str::to_string)
+                .collect();
+            assert!(validate_args(&parse_args(&argv)).is_err());
+        }
+        let argv = [
+            "x3f_extract",
+            "-dng-recovery-mask",
+            "-dng-highlight-recovery",
+            "a.X3F",
+        ];
+        let args = parse_args(&argv.map(str::to_string));
+        assert!(args.dng_recovery_mask);
+        assert!(validate_args(&args).is_ok());
+    }
+
+    #[test]
+    fn mask_batch_rejects_duplicate_output_names() {
+        let argv = [
+            "x3f_extract",
+            "-dng-recovery-mask",
+            "-dng-highlight-recovery",
+            "-o",
+            ".",
+            "a/photo.X3F",
+            "b/photo.X3F",
+        ];
+        assert!(validate_args(&parse_args(&argv.map(str::to_string)))
+            .unwrap_err()
+            .contains("same recovery mask"));
+        let argv = [
+            "x3f_extract",
+            "-dng-recovery-mask",
+            "-dng-highlight-recovery",
+            "photo.X3F",
+            "./photo.X3F",
+        ];
+        assert!(validate_args(&parse_args(&argv.map(str::to_string))).is_err());
+    }
+
+    #[test]
+    fn mask_names_follow_final_output_directory_not_dng_temporary_name() {
+        let input = Path::new("card/photo.X3F");
+        assert_eq!(
+            make_paths(input, None, ".mask.pgm").1,
+            Path::new("card/photo.X3F.mask.pgm")
+        );
+        assert_eq!(
+            make_paths(input, Some(Path::new("out")), ".mask.pgm").1,
+            Path::new("out/photo.X3F.mask.pgm")
+        );
+    }
+
+    #[test]
     fn dng_recovery_defaults_to_linear_headroom() {
         let args = parse(&["-dng-highlight-recovery", "in.X3F"]);
         assert!(args.dng_highlight_recovery);
@@ -718,6 +851,72 @@ mod tests {
         assert_eq!(a.color_encoding, ColorEncoding::Unprocessed);
         let a = parse(&["-color", "sRGB", "-qtop", "in.X3F"]);
         assert_eq!(a.color_encoding, ColorEncoding::Qtop);
+    }
+
+    #[test]
+    fn color_modes_are_opt_in_and_exclusive() {
+        assert!(parse(&["in.X3F"]).dng_color_mode.is_none());
+        for mode in [
+            ColorMode::Standard,
+            ColorMode::Neutral,
+            ColorMode::Vivid,
+            ColorMode::Portrait,
+            ColorMode::Landscape,
+            ColorMode::FcBlue,
+        ] {
+            let args = parse(&["-dng-color-mode", mode.as_str(), "in.X3F"]);
+            assert_eq!(args.dng_color_mode, Some(mode));
+            assert!(validate_args(&args).is_ok());
+            assert!(!args.dng_highlight_recovery);
+            assert_eq!(args.denoise_intensity, Args::default().denoise_intensity);
+            assert_eq!(args.fix_bad, Args::default().fix_bad);
+            for flags in [
+                vec!["-tiff", "-dng-color-mode", mode.as_str(), "in.X3F"],
+                vec![
+                    "-dng-color-mode",
+                    mode.as_str(),
+                    "-dng-look",
+                    "look.dcp",
+                    "in.X3F",
+                ],
+                vec![
+                    "-dng-color-mode",
+                    mode.as_str(),
+                    "-dng-highlight-mapping",
+                    "shoulder",
+                    "in.X3F",
+                ],
+            ] {
+                assert!(validate_args(&parse(&flags)).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn dng_look_is_opt_in_and_dng_only() {
+        assert!(parse(&["in.X3F"]).dng_look.is_none());
+        let args = parse(&["-dng-look", "look.dcp", "in.X3F"]);
+        assert_eq!(args.dng_look, Some(PathBuf::from("look.dcp")));
+        assert!(validate_args(&args).is_ok());
+        let args = parse(&["-dng", "-dng-look", "色 look.dcp", "in.X3F"]);
+        assert_eq!(args.dng_look, Some(PathBuf::from("色 look.dcp")));
+        assert!(validate_args(&args).is_ok());
+        for file_type in [
+            FileType::Tiff,
+            FileType::Jpeg,
+            FileType::Raw,
+            FileType::Meta,
+            FileType::PpmP3,
+            FileType::PpmP6,
+            FileType::Histogram,
+        ] {
+            let args = Args {
+                file_type,
+                dng_look: Some(PathBuf::from("look.dcp")),
+                ..Args::default()
+            };
+            assert!(validate_args(&args).is_err());
+        }
     }
 
     #[test]

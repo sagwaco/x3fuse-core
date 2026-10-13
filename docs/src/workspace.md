@@ -71,6 +71,12 @@ mirror of what used to be in `src/`:
 | `wasm_c_shims.rs` | Rust no-op shim for the variadic `x3f_printf` on wasm32 | M8d-α-2 |
 | `histogram_wasm_stub.rs`, `print_meta_wasm_stub.rs` | wasm32 fallbacks (no variadics) | M8d-α |
 
+Merrill DNG recovery uses `tone_anchor.rs` for brightness estimates,
+`gradient_tone.rs` for spatial detail, and `color_field.rs` with
+`highlight_color.rs` for color. `recovery_mask.rs` exports the optional
+source-reliability mask. See [DNG highlight recovery](./highlight-recovery.md)
+and [recovery masks](./recovery-mask.md).
+
 Most of the ported modules export `#[no_mangle] extern "C"` symbols so
 the bindgen forward declarations resolve at link time without churn
 in callsites — even partially-ported files compile cleanly because
@@ -95,6 +101,8 @@ legacy C entry points and produce the conversion outputs.
 
 Submodules:
 
+- [`dcp.rs`](../../crates/x3f-core/src/dcp.rs) reads DCP look tables and tone curves.
+  [Embedding a look](./dng-look.md) leaves camera calibration unchanged.
 - [`output/`](../../crates/x3f-core/src/output/) — pure-Rust DNG, TIFF,
   and PPM writers (M3).
 - [`globals.rs`](../../crates/x3f-core/src/globals.rs) — wraps C-side
@@ -102,8 +110,11 @@ Submodules:
   `max_printed_matrix_elements`) in safe setters, plus
   `set_log_callback` for mobile/WASM logging.
 - [`image.rs`](../../crates/x3f-core/src/image.rs) — `Image` struct
-  that snapshots `DNG_HIGHLIGHT_SCALE` immediately after
-  `x3f_get_image` returns (M5e fix for batch determinism).
+  that receives encoding metadata from `get_image_controlled` through
+  per-conversion `ProcessingInfo`. The wrapper also checks that
+  conversion's recovery-mask export result.
+
+Camera color-mode rendering uses [`color_mode.rs`](../../crates/x3f-core/src/color_mode.rs) for the public mode selector and [`output/dng/color_mode.rs`](../../crates/x3f-core/src/output/dng/color_mode.rs) for calibration and camera-profile embedding. Its `mode` module reads the selected matrix and tone parameters, `tone` builds the native and Adobe tone representations, `color_dq` applies the pointwise color correction, and `look` bakes the color residual. Each module declares its algorithm constants and numerical limits before its entry points.
 
 ## `crates/x3f-cli`
 
