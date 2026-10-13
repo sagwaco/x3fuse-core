@@ -479,14 +479,15 @@ unsafe fn decode_camf(camf: &mut x3f_camf_t, control: Control<'_>) -> Result<()>
     if camf.type_ == 2 {
         camf.decoded_data_size = camf.data_size;
         camf.decoded_data = unsafe { alloc::<u8>(data.len()) }?.cast();
-        let mut key = unsafe { camf.__bindgen_anon_1.t2.crypt_key } as u64;
+        let mut key = unsafe { camf.__bindgen_anon_1.t2.crypt_key };
         for (i, &old) in data.iter().enumerate() {
             if i % 4096 == 0 {
                 control.check()?;
             }
-            key = (key * 1597 + 51749) % 244944;
+            // The type-2 cipher wraps at 32 bits before the modulus.
+            key = key.wrapping_mul(1597).wrapping_add(51749) % 244944;
             let tmp = ((key as i64) * 301_593_171_i64 >> 24) as u32;
-            let a = ((key as u32) << 8).wrapping_sub(tmp);
+            let a = (key << 8).wrapping_sub(tmp);
             let mix = ((a >> 1).wrapping_add(tmp)) >> 17;
             unsafe { *camf.decoded_data.cast::<u8>().add(i) = old ^ mix as u8 };
         }
@@ -970,6 +971,47 @@ mod tests {
             let result = setup_camf(camf, Control::none());
             crate::io::cleanup_entry(&mut entry);
             result
+        }
+    }
+
+    #[test]
+    fn type2_camf_wraps_an_overflowing_initial_key() {
+        // Fixed ciphertext uses the legacy C cipher and an SD9 key.
+        let encoded: [u8; 34] = [
+            0x08, 0xac, 0x59, 0x55, 0x94, 0x93, 0xf1, 0x3d, 0xf4, 0xa5, 0x14, 0xe9, 0xbb, 0x53,
+            0xb0, 0x9b, 0x2b, 0x0d, 0xf8, 0xeb, 0x8b, 0x34, 0xdb, 0x7e, 0x3e, 0xc9, 0x93, 0x44,
+            0x66, 0x44, 0x96, 0xc4, 0xa1, 0xdb,
+        ];
+        let mut expected = Vec::new();
+        for value in [X3F_CMBT, 0x10000, 34, 20, 25] {
+            expected.extend_from_slice(&value.to_le_bytes());
+        }
+        expected.extend_from_slice(b"name\0");
+        expected.extend_from_slice(&5u32.to_le_bytes());
+        expected.extend_from_slice(b"text\0");
+        unsafe {
+            let mut entry: x3f_directory_entry_t = std::mem::zeroed();
+            entry.header.identifier = X3F_SECC;
+            let camf = &mut entry.header.data_subsection.camf;
+            camf.type_ = 2;
+            camf.__bindgen_anon_1.t2.crypt_key = 642_884_653;
+            camf.data = copy_alloc(&encoded).unwrap().cast();
+            camf.data_size = encoded.len() as u32;
+            decode_camf(camf, Control::none()).unwrap();
+            assert_eq!(
+                std::slice::from_raw_parts(
+                    camf.decoded_data.cast::<u8>(),
+                    camf.decoded_data_size as usize,
+                ),
+                expected,
+            );
+            setup_camf(camf, Control::none()).unwrap();
+            assert_eq!(camf.entry_table.size, 1);
+            assert_eq!(
+                core::ffi::CStr::from_ptr((*camf.entry_table.element).text.cast()),
+                c"text"
+            );
+            crate::io::cleanup_entry(&mut entry);
         }
     }
 

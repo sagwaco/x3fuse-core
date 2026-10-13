@@ -157,8 +157,10 @@ Section type `CAMF` (`0x464d_4143`); payload starts with `SECc`
 (`0x6343_4553`). The 28-byte CAMF header carries an `info_type`
 (2 / 4 / 5) and a `data_size`. Three encodings are in the wild:
 
-- **Type 2** — stream cipher with a key derived from a 32-bit value
-  in the header. Used on early bodies.
+- **Type 2**: stream cipher used on early bodies, including SD9, SD10,
+  and SD14. The initial 32-bit key is at byte 24 of the `SECc` header.
+  Each byte updates the key with `(key * 1597 + 51749) % 244944`.
+  The multiplication and addition must wrap at 32 bits before the modulus.
 - **Type 4** — zigzag predictor + Huffman. Used on Merrill and later.
 - **Type 5** — 1-D predictor + Huffman. Used on Quattro.
 
