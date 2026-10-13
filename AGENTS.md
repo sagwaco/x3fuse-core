@@ -4,7 +4,7 @@ This file provides guidance to Agents like Claude Code (claude.ai/code) when wor
 
 ## Project: x3fuse-core
 
-`x3fuse-core` converts Sigma Foveon X3F raw files to DNG / TIFF / PPM / JPEG / metadata. It began as a ~10K-LOC C/C++ codebase and has been **fully ported to a Rust Cargo workspace**; the only non-Rust code left is two tiny C log/version shims (in [crates/x3f-sys/csrc/](crates/x3f-sys/csrc/)). Denoise is a pure-Rust Non-Local Means pass ([crates/x3f-sys/src/denoise.rs](crates/x3f-sys/src/denoise.rs)) called directly by the pipeline on every target — OpenCV was removed. Read [ARCHITECTURE.md](ARCHITECTURE.md) (pipeline + workspace) before non-trivial work; [docs/PORT-PLAN.md](docs/PORT-PLAN.md) is retained as a historical record of the port.
+`x3fuse-core` converts Sigma Foveon X3F raw files to DNG / TIFF / PPM / JPEG / metadata. It began as a ~10K-LOC C/C++ codebase and has been **fully ported to a Rust Cargo workspace**, with two tiny C log/version shims (in [crates/x3f-sys/csrc/](crates/x3f-sys/csrc/)). Denoise supports Non-Local Means and two-stage BM3D ([crates/x3f-sys/src/denoise.rs](crates/x3f-sys/src/denoise.rs)) with portable Rust CPU implementations and optional native wgpu/WGSL acceleration; OpenCV was removed. Native CLI builds enable GPU support by default, libraries opt in with `gpu`, and WASM stays CPU-only. Read [ARCHITECTURE.md](ARCHITECTURE.md) (pipeline + workspace) before non-trivial work; [docs/PORT-PLAN.md](docs/PORT-PLAN.md) is retained as a historical record of the port.
 
 ### Build, test, lint
 
@@ -18,6 +18,11 @@ cargo test --workspace -- --nocapture                   # show which tier-2/3 te
 
 cargo fmt --all --check                                 # CI gate
 cargo clippy --workspace --all-targets -- -D warnings   # CI gate
+
+# Explicit physical-GPU comparisons (ignored in ordinary CI):
+cargo test --release -p x3f-sys --features gpu denoise:: -- --include-ignored
+# Build and test the portable fallback independently:
+cargo test -p x3f-sys --no-default-features denoise::
 ```
 
 ### Workspace shape
@@ -36,8 +41,10 @@ x3f-cli  ──depends-on──▶  x3f-core  ──depends-on──▶  x3f-sys
 - **Highlight-recovery is the actively-iterated hot loop.** The chroma LUT, RepairPix, and matrix-pathology gate live in [crates/x3f-sys/src/highlight.rs](crates/x3f-sys/src/highlight.rs) and [process.rs](crates/x3f-sys/src/process.rs). Don't refactor while changing behavior; pair-review changes there.
 - **Byte-identical parity is the gate.** Tier-2 pins metadata/JPEG-thumbnail/PPM hashes automatically; DNG and TIFF have manual `-no-denoise` reference baselines on three corpus files (SD1M DNG `a2427c1db46066d7201f7499d46bb02d` TIFF `277cf4b4…`, older raw `_SDI8040` DNG `94c64ebc524077d4f51e96df868d9271` TIFF `b4cc09aa…`, Quattro `_SDI8284` DNG `7259dd2e0b4c5cde7e4e5c2531defa9f` TIFF `661df021…`) that must match unless a change is an _intentional_ algorithm change — when it is, re-pin the table in [docs/src/contributing.md](docs/src/contributing.md) in the same commit.
 - **Legacy CLI flag syntax is preserved.** Single-dash flags (`-dng`, `-tiff`, `-color sRGB`, `-no-denoise`, …) are kept verbatim so existing scripts and the test corpus continue to work. A modern subcommand interface is deferred.
+- **Denoise backends are per conversion.** Carry `DenoiseBackend` in options/`Control`, never a mutable global preference. `Auto` retries a failed GPU stage on CPU from its unchanged input; `Gpu` fails explicitly. GPU scratch is tiled, and cancellation must discard uncommitted results. Output with `-no-denoise` remains byte-identical; NLM GPU kernel comparisons allow at most one 16-bit code value; BM3D uses the documented FP32 agreement gate. Algorithm, channel selection, strength, and NLM windows live in `DenoiseOptions` and travel with `Control`. See [performance notes](docs/src/performance.md#gpu-denoising), including the change to default CPU luminance handling.
 - **`X3F_*` env vars are preserved.** Tunables like `X3F_NO_CHROMA_LUT`, `X3F_REPAIR_PIX`, `X3F_EV`, `X3F_GATE_THR`, `X3F_GATE_WIDTH`, `X3F_CHROMA_LUT_TRACE`, `X3F_DNG_SHOULDER_KNEE` keep working.
 - **C-ABI layouts stay stable.** The legacy C call graph (and the `x3f-ffi-c` public header) resolves through `#[no_mangle] extern "C"` Rust functions, so struct layouts must stay byte-compatible: `x3f_area16_t` is mirrored as `Area16` with `#[repr(C)]` and bindgen generates the rest of the layouts from the headers in `csrc/`. Heap allocations passed across the ABI use `libc::malloc`/`free`. (Denoise no longer crosses any boundary — it's pure Rust in `src/denoise.rs`.)
+- **Legacy C denoising stays CPU-only.** C entry points select `Cpu` explicitly even when a workspace build unifies the CLI's `gpu` feature into the libraries. Build `cargo build --release -p x3f-ffi-c` separately to exclude GPU dependencies. Rust 0.2 callers select their backend through options; preserve `Error::Gpu` through all controlled processing paths.
 
 ### Test corpus
 

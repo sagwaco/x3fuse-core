@@ -1,5 +1,5 @@
-//! Portable, dependency-free Non-Local Means denoise — the sole denoise
-//! implementation, called directly by the pipeline (`run_denoising` in
+//! NLM and two-stage BM3D with portable Rust CPU implementations and an optional
+//! native wgpu backend. Called directly by the pipeline (`run_denoising` in
 //! `process.rs` and the two Quattro passes in `quattro.rs`).
 //!
 //! ## History
@@ -22,10 +22,154 @@
 //! INTER_CUBIC fixed-point and rounding differ), and no parity baseline pins
 //! it: every tier-2/tier-3 test runs with `-no-denoise`. The goal is a visually
 //! equivalent denoise, not a bit-exact clone.
+//!
+//! GPU kernels retain the same distances and weights, using FP32 weighted
+//! sums. Tests allow at most one u16 code of kernel error against the Rust
+//! CPU reference. Automatic fallback and WASM use the CPU implementation.
 
 use crate::Control;
 
 use crate::quattro::Area16;
+
+mod bm3d;
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+mod gpu;
+
+/// Denoising algorithm, independent of execution backend.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "lowercase")
+)]
+pub enum DenoiseAlgorithm {
+    #[default]
+    Nlm,
+    Bm3d,
+}
+
+impl std::str::FromStr for DenoiseAlgorithm {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "nlm" => Ok(Self::Nlm),
+            "bm3d" => Ok(Self::Bm3d),
+            _ => Err("denoiser must be nlm or bm3d"),
+        }
+    }
+}
+
+/// Full, odd NLM window sizes in pixels. These tune the main pass; the
+/// legacy low-frequency chroma pass retains its 21-pixel search window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default, deny_unknown_fields, rename_all = "camelCase")
+)]
+pub struct NlmOptions {
+    pub luma_patch: u8,
+    pub chroma_patch: u8,
+    pub luma_search: u8,
+    pub chroma_search: u8,
+}
+
+impl NlmOptions {
+    pub const DEFAULT: Self = Self {
+        luma_patch: 3,
+        chroma_patch: 3,
+        luma_search: 11,
+        chroma_search: 11,
+    };
+}
+impl Default for NlmOptions {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Sensor-space denoising. Defaults retain NLM's chroma-oriented Foveon
+/// profile. `strength` multiplies the camera profile and intensity (0..10);
+/// NLM windows do not affect BM3D's fixed 8x8 block profile.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default, deny_unknown_fields, rename_all = "camelCase")
+)]
+pub struct DenoiseOptions {
+    pub algorithm: DenoiseAlgorithm,
+    pub luminance: bool,
+    pub chroma: bool,
+    pub strength: f32,
+    pub nlm: NlmOptions,
+}
+impl DenoiseOptions {
+    pub const DEFAULT: Self = Self {
+        algorithm: DenoiseAlgorithm::Nlm,
+        luminance: false,
+        chroma: true,
+        strength: 1.0,
+        nlm: NlmOptions::DEFAULT,
+    };
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.strength.is_finite() || !(0.1..=3.0).contains(&self.strength) {
+            return Err("denoise strength must be finite and between 0.1 and 3.0");
+        }
+        for patch in [self.nlm.luma_patch, self.nlm.chroma_patch] {
+            if !(1..=9).contains(&patch) || patch % 2 == 0 {
+                return Err("NLM patch sizes must be odd, from 1 through 9");
+            }
+        }
+        for search in [self.nlm.luma_search, self.nlm.chroma_search] {
+            if !(1..=31).contains(&search) || search % 2 == 0 {
+                return Err("NLM search sizes must be odd, from 1 through 31");
+            }
+        }
+        Ok(())
+    }
+}
+impl Default for DenoiseOptions {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Execution preference for one conversion. `Auto` falls back to portable CPU
+/// denoising; `Gpu` reports an error when acceleration cannot be used.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DenoiseBackend {
+    /// Try the native GPU backend, retry on CPU if unavailable or unsuccessful.
+    #[default]
+    Auto,
+    /// Always use the portable Rust implementation, without initializing a GPU.
+    Cpu,
+    /// Require GPU execution; return an error instead of falling back to CPU.
+    Gpu,
+}
+
+impl std::str::FromStr for DenoiseBackend {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "cpu" => Ok(Self::Cpu),
+            "gpu" => Ok(Self::Gpu),
+            _ => Err("denoise backend must be auto, cpu, or gpu"),
+        }
+    }
+}
+
+fn log(level: crate::x3f_verbosity_t, message: &str) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Ok(message) = std::ffi::CString::new(message) {
+        unsafe { crate::x3f_printf(level, c"%s\n".as_ptr(), message.as_ptr()) };
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = (level, message);
+}
 
 // ----------------------------------------------------------------------
 // Denoise type table (mirror of `denoise_types[]` in x3f_denoise_utils.h)
@@ -82,6 +226,7 @@ const O_UV: i32 = 32768;
 /// Owned, tightly-packed (no row padding) interleaved 3-channel `u16` image.
 /// `Area16` carries an arbitrary `row_stride`; we copy into this packed form
 /// for the resize/median/NLM kernels and copy back.
+#[derive(Clone)]
 struct Img3 {
     rows: usize,
     cols: usize,
@@ -95,6 +240,17 @@ impl Img3 {
             rows,
             cols,
             data: vec![0u16; rows * cols * 3],
+        }
+    }
+
+    fn area(&mut self) -> Area16 {
+        Area16 {
+            data: self.data.as_mut_ptr(),
+            buf: std::ptr::null_mut(),
+            rows: self.rows as u32,
+            columns: self.cols as u32,
+            channels: 3,
+            row_stride: (self.cols * 3) as u32,
         }
     }
 }
@@ -283,6 +439,16 @@ impl NlmCtx<'_> {
     /// `dst` (packed, `(row - row_from)` indexing). Mirrors
     /// `FastNlMeansDenoisingInvoker::operator()` over one `cv::Range`.
     fn process_rows(&self, row_from: i32, row_to: i32, dst: &mut [u16]) {
+        self.process_rows_until(row_from, row_to, dst, || self.control.check().is_err());
+    }
+
+    fn process_rows_until(
+        &self,
+        row_from: i32,
+        row_to: i32,
+        dst: &mut [u16],
+        mut cancelled: impl FnMut() -> bool,
+    ) {
         let sw = self.sw;
         let tw = self.tw as i32;
         let cols = self.cols as i32;
@@ -296,11 +462,11 @@ impl NlmCtx<'_> {
         let mut first_col_num = -1i32;
 
         for i in row_from..=row_to {
-            if self.control.check().is_err() {
+            if cancelled() {
                 return;
             }
             for j in 0..cols {
-                if j % 64 == 0 && self.control.check().is_err() {
+                if j % 64 == 0 && cancelled() {
                     return;
                 }
                 if j == 0 {
@@ -466,10 +632,75 @@ impl NlmCtx<'_> {
 /// as passed to OpenCV (e.g. `3, 11`).
 #[cfg(test)]
 fn fast_nlm_denoise(src: &Img3, h: [f64; 3], template_window: i32, search_window: i32) -> Img3 {
-    fast_nlm_denoise_controlled(src, h, template_window, search_window, Control::none()).unwrap()
+    fast_nlm_cpu(src, h, template_window, search_window, Control::none()).unwrap()
 }
 
 fn fast_nlm_denoise_controlled(
+    src: &Img3,
+    h: [f64; 3],
+    template_window: i32,
+    search_window: i32,
+    control: Control<'_>,
+) -> crate::Result<Img3> {
+    fast_nlm_with_gpu(src, h, template_window, search_window, control, || {
+        #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+        return gpu::nlm(src, h, template_window, search_window, control);
+        #[cfg(not(all(feature = "gpu", not(target_arch = "wasm32"))))]
+        Err(crate::Error::Gpu("this build has no GPU denoiser".into()))
+    })
+}
+
+fn fast_nlm_with_gpu(
+    src: &Img3,
+    h: [f64; 3],
+    template_window: i32,
+    search_window: i32,
+    control: Control<'_>,
+    accelerated: impl FnOnce() -> crate::Result<Img3>,
+) -> crate::Result<Img3> {
+    control.check()?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let started = std::time::Instant::now();
+    let mut backend = "cpu";
+    let result = if control.denoise_backend == DenoiseBackend::Cpu {
+        fast_nlm_cpu(src, h, template_window, search_window, control)
+    } else {
+        match accelerated() {
+            Ok(image) => {
+                backend = "gpu";
+                Ok(image)
+            }
+            Err(crate::Error::Cancelled) => Err(crate::Error::Cancelled),
+            Err(error) if control.denoise_backend == DenoiseBackend::Gpu => {
+                log(crate::x3f_verbosity_t_ERR, &error.to_string());
+                Err(error)
+            }
+            Err(error) => {
+                log(
+                    crate::x3f_verbosity_t_DEBUG,
+                    &format!("NLM: CPU fallback ({error})"),
+                );
+                control.check()?;
+                fast_nlm_cpu(src, h, template_window, search_window, control)
+            }
+        }
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    log(
+        crate::x3f_verbosity_t_DEBUG,
+        &format!(
+            "NLM: {backend}, {}x{}, search={search_window}, {:.3} ms",
+            src.cols,
+            src.rows,
+            started.elapsed().as_secs_f64() * 1000.0,
+        ),
+    );
+    #[cfg(target_arch = "wasm32")]
+    let _ = backend;
+    result
+}
+
+fn fast_nlm_cpu(
     src: &Img3,
     h: [f64; 3],
     template_window: i32,
@@ -594,6 +825,21 @@ fn fast_nlm_denoise_controlled(
 // medianBlur (single channel, 3×3, BORDER_REPLICATE)
 // ----------------------------------------------------------------------
 
+/// Independent rows keep their existing arithmetic order. WASM remains serial.
+fn for_rows_mut<T: Send>(data: &mut [T], stride: usize, f: impl Fn(usize, &mut [T]) + Sync + Send) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        data.par_chunks_mut(stride)
+            .enumerate()
+            .for_each(|(row, data)| f(row, data));
+    }
+    #[cfg(target_arch = "wasm32")]
+    for (row, data) in data.chunks_mut(stride).enumerate() {
+        f(row, data);
+    }
+}
+
 /// In-place 3×3 median filter of one channel of `img` (OpenCV `medianBlur`
 /// with `ksize = 3`, which uses `BORDER_REPLICATE`).
 fn median_blur_channel_3x3(img: &mut Img3, ch: usize) {
@@ -610,7 +856,8 @@ fn median_blur_channel_3x3(img: &mut Img3, ch: usize) {
             plane[r * img.cols + c] = img.data[(r * img.cols + c) * 3 + ch];
         }
     }
-    for r in 0..rows {
+    for_rows_mut(&mut img.data, cols as usize * 3, |r, row| {
+        let r = r as i32;
         for c in 0..cols {
             let mut vals = [0u16; 9];
             let mut n = 0;
@@ -618,14 +865,14 @@ fn median_blur_channel_3x3(img: &mut Img3, ch: usize) {
                 for dx in -1..=1 {
                     let yy = (r + dy).clamp(0, rows - 1) as usize;
                     let xx = (c + dx).clamp(0, cols - 1) as usize;
-                    vals[n] = plane[yy * img.cols + xx];
+                    vals[n] = plane[yy * cols as usize + xx];
                     n += 1;
                 }
             }
             vals.sort_unstable();
-            img.data[(r as usize * img.cols + c as usize) * 3 + ch] = vals[4];
+            row[c as usize * 3 + ch] = vals[4];
         }
-    }
+    });
 }
 
 // ----------------------------------------------------------------------
@@ -668,7 +915,7 @@ fn resize_area(src: &Img3, dst_rows: usize, dst_cols: usize) -> Img3 {
 
     // Horizontal pass: src.rows × dst_cols, kept in f64.
     let mut tmp = vec![0f64; src.rows * dst_cols * 3];
-    for sy in 0..src.rows {
+    for_rows_mut(&mut tmp, dst_cols * 3, |sy, row| {
         for (dx, taps) in xtab.iter().enumerate() {
             let mut acc = [0f64; 3];
             for &(sx, wx) in taps {
@@ -677,16 +924,14 @@ fn resize_area(src: &Img3, dst_rows: usize, dst_cols: usize) -> Img3 {
                 acc[1] += wx * src.data[si + 1] as f64;
                 acc[2] += wx * src.data[si + 2] as f64;
             }
-            let ti = (sy * dst_cols + dx) * 3;
-            tmp[ti] = acc[0];
-            tmp[ti + 1] = acc[1];
-            tmp[ti + 2] = acc[2];
+            row[dx * 3..dx * 3 + 3].copy_from_slice(&acc);
         }
-    }
+    });
 
     // Vertical pass: dst_rows × dst_cols → u16.
     let mut out = Img3::new(dst_rows, dst_cols);
-    for (dy, taps) in ytab.iter().enumerate() {
+    for_rows_mut(&mut out.data, dst_cols * 3, |dy, row| {
+        let taps = &ytab[dy];
         for dx in 0..dst_cols {
             let mut acc = [0f64; 3];
             for &(sy, wy) in taps {
@@ -695,12 +940,9 @@ fn resize_area(src: &Img3, dst_rows: usize, dst_cols: usize) -> Img3 {
                 acc[1] += wy * tmp[ti + 1];
                 acc[2] += wy * tmp[ti + 2];
             }
-            let oi = (dy * dst_cols + dx) * 3;
-            out.data[oi] = round_sat_u16(acc[0]);
-            out.data[oi + 1] = round_sat_u16(acc[1]);
-            out.data[oi + 2] = round_sat_u16(acc[2]);
+            row[dx * 3..dx * 3 + 3].copy_from_slice(&acc.map(round_sat_u16));
         }
-    }
+    });
     out
 }
 
@@ -734,7 +976,7 @@ fn resize_cubic_i16(src: &Img3i16, dst_rows: usize, dst_cols: usize) -> Img3i16 
 
     // Horizontal pass: src.rows × dst_cols in f64.
     let mut tmp = vec![0f64; src.rows * dst_cols * 3];
-    for sy in 0..src.rows {
+    for_rows_mut(&mut tmp, dst_cols * 3, |sy, row| {
         for (dx, (taps, w)) in xtab.iter().enumerate() {
             let mut acc = [0f64; 3];
             for k in 0..4 {
@@ -743,12 +985,9 @@ fn resize_cubic_i16(src: &Img3i16, dst_rows: usize, dst_cols: usize) -> Img3i16 
                 acc[1] += w[k] * src.data[si + 1] as f64;
                 acc[2] += w[k] * src.data[si + 2] as f64;
             }
-            let ti = (sy * dst_cols + dx) * 3;
-            tmp[ti] = acc[0];
-            tmp[ti + 1] = acc[1];
-            tmp[ti + 2] = acc[2];
+            row[dx * 3..dx * 3 + 3].copy_from_slice(&acc);
         }
-    }
+    });
 
     // Vertical pass → i16.
     let mut out = Img3i16 {
@@ -756,7 +995,8 @@ fn resize_cubic_i16(src: &Img3i16, dst_rows: usize, dst_cols: usize) -> Img3i16 
         cols: dst_cols,
         data: vec![0i16; dst_rows * dst_cols * 3],
     };
-    for (dy, (taps, w)) in ytab.iter().enumerate() {
+    for_rows_mut(&mut out.data, dst_cols * 3, |dy, row| {
+        let (taps, w) = &ytab[dy];
         for dx in 0..dst_cols {
             let mut acc = [0f64; 3];
             for k in 0..4 {
@@ -765,13 +1005,12 @@ fn resize_cubic_i16(src: &Img3i16, dst_rows: usize, dst_cols: usize) -> Img3i16 
                 acc[1] += w[k] * tmp[ti + 1];
                 acc[2] += w[k] * tmp[ti + 2];
             }
-            let oi = (dy * dst_cols + dx) * 3;
             for c in 0..3 {
                 let v = acc[c].round_ties_even();
-                out.data[oi + c] = v.clamp(-32768.0, 32767.0) as i16;
+                row[dx * 3 + c] = v.clamp(-32768.0, 32767.0) as i16;
             }
         }
-    }
+    });
     out
 }
 
@@ -808,26 +1047,114 @@ fn subtract_u16_inplace(out: &mut Img3, res: &Img3i16) {
 ///      (search 21) → signed residual → cubic upscale → subtract.
 fn denoise_nlm(img: &mut Img3, h: f64, control: Control<'_>) -> crate::Result<()> {
     control.check()?;
+    let options = control.denoise_options;
     // 1. main NLM.
-    let mut out = fast_nlm_denoise_controlled(img, [0.0, h, h], 3, 11, control)?;
+    let mut out = configured_nlm(img, [h; 3], control)?;
 
     // 2. V-channel median.
-    median_blur_channel_3x3(&mut out, 2);
+    if options.chroma {
+        median_blur_channel_3x3(&mut out, 2);
+    }
 
     // 3. low-frequency denoising.
     let sub_rows = ((out.rows as f64) * 0.25).round_ties_even() as usize;
     let sub_cols = ((out.cols as f64) * 0.25).round_ties_even() as usize;
-    if sub_rows >= 1 && sub_cols >= 1 {
+    if options.chroma && sub_rows >= 1 && sub_cols >= 1 {
         let sub = resize_area(&out, sub_rows, sub_cols);
-        let sub_dn = fast_nlm_denoise_controlled(&sub, [0.0, h / 8.0, h / 4.0], 3, 21, control)?;
+        let sub_dn = fast_nlm_denoise_controlled(
+            &sub,
+            [0.0, h / 8.0, h / 4.0],
+            options.nlm.chroma_patch as i32,
+            21,
+            control,
+        )?;
         let sub_res = subtract_to_i16(&sub, &sub_dn);
         let res = resize_cubic_i16(&sub_res, out.rows, out.cols);
         subtract_u16_inplace(&mut out, &res);
     }
 
+    preserve_disabled_channels(img, &mut out, options);
     control.check()?;
     *img = out;
     Ok(())
+}
+
+fn channel_strengths(mut h: [f64; 3], options: DenoiseOptions) -> [f64; 3] {
+    if !options.luminance {
+        h[0] = 0.0;
+    }
+    if !options.chroma {
+        h[1] = 0.0;
+        h[2] = 0.0;
+    }
+    h
+}
+
+fn denoise_bm3d(img: &Img3, scale: f32, control: Control<'_>) -> crate::Result<Img3> {
+    let options = control.denoise_options;
+    let noise = bm3d::estimate_noise(img, control)?;
+    let sigma = channel_strengths(
+        noise.map(|s| s * scale as f64 * options.strength as f64),
+        options,
+    );
+    log(
+        crate::x3f_verbosity_t_DEBUG,
+        &format!("BM3D estimated sigma Y/U/V: {sigma:?}"),
+    );
+    bm3d::denoise(img, sigma, control)
+}
+
+fn preserve_disabled_channels(src: &Img3, out: &mut Img3, options: DenoiseOptions) {
+    for (source, result) in src.data.chunks_exact(3).zip(out.data.chunks_exact_mut(3)) {
+        if !options.luminance {
+            result[0] = source[0];
+        }
+        if !options.chroma {
+            result[1..].copy_from_slice(&source[1..]);
+        }
+    }
+}
+
+fn configured_nlm(img: &Img3, h: [f64; 3], control: Control<'_>) -> crate::Result<Img3> {
+    let options = control.denoise_options;
+    let h = channel_strengths(h, options);
+    let nlm = options.nlm;
+    let mut out = if options.chroma {
+        let same = nlm.luma_patch == nlm.chroma_patch && nlm.luma_search == nlm.chroma_search;
+        let strengths = if same { h } else { [0.0, h[1], h[2]] };
+        let mut out = fast_nlm_denoise_controlled(
+            img,
+            strengths,
+            nlm.chroma_patch as i32,
+            nlm.chroma_search as i32,
+            control,
+        )?;
+        if options.luminance && !same {
+            let luma = fast_nlm_denoise_controlled(
+                img,
+                [h[0], 0.0, 0.0],
+                nlm.luma_patch as i32,
+                nlm.luma_search as i32,
+                control,
+            )?;
+            for (result, source) in out.data.chunks_exact_mut(3).zip(luma.data.chunks_exact(3)) {
+                result[0] = source[0];
+            }
+        }
+        out
+    } else if options.luminance {
+        fast_nlm_denoise_controlled(
+            img,
+            h,
+            nlm.luma_patch as i32,
+            nlm.luma_search as i32,
+            control,
+        )?
+    } else {
+        img.clone()
+    };
+    preserve_disabled_channels(img, &mut out, options);
+    Ok(out)
 }
 
 // ----------------------------------------------------------------------
@@ -917,19 +1244,41 @@ pub(crate) unsafe fn denoise_area_controlled(
     control: Control<'_>,
 ) -> crate::Result<()> {
     control.check()?;
-    if image.is_null() {
+    if image.is_null()
+        || scale <= 0.0
+        || (!control.denoise_options.luminance && !control.denoise_options.chroma)
+    {
         return Ok(());
     }
     debug_assert_eq!(unsafe { (*image).channels }, 3);
+    #[cfg(not(target_arch = "wasm32"))]
+    let started = std::time::Instant::now();
     let dt = DType::from_u32(dtype);
-    let h = dt.base_h() * scale as f64;
+    let h = dt.base_h() * scale as f64 * control.denoise_options.strength as f64;
 
-    unsafe { bmt_to_yuv(image, dt) };
     let mut img = unsafe { area_to_img3(image) };
-    denoise_nlm(&mut img, h, control)?;
+    // Work on owned storage: cancellation or a failed GPU attempt must never
+    // leave the caller's sensor buffer in YUV or partially denoised.
+    unsafe { bmt_to_yuv(&mut img.area(), dt) };
+    if control.denoise_options.algorithm == DenoiseAlgorithm::Bm3d {
+        img = denoise_bm3d(&img, scale, control)?;
+    } else {
+        denoise_nlm(&mut img, h, control)?;
+    }
+    unsafe { yuv_to_bmt(&mut img.area(), dt) };
+    control.check()?;
     unsafe { img3_to_area(&img, image) };
-    unsafe { yuv_to_bmt(image, dt) };
-    control.check()
+    #[cfg(not(target_arch = "wasm32"))]
+    log(
+        crate::x3f_verbosity_t_DEBUG,
+        &format!(
+            "Denoise stage: sensor, {}x{}, {:.3} ms",
+            img.cols,
+            img.rows,
+            started.elapsed().as_secs_f64() * 1000.0
+        ),
+    );
+    Ok(())
 }
 
 /// Active-area Quattro pass: the area is already YUV (was the OpenCV
@@ -947,23 +1296,45 @@ pub(crate) unsafe fn denoise_active_area(
     control: Control<'_>,
 ) -> crate::Result<()> {
     control.check()?;
-    if area.is_null() {
+    if area.is_null()
+        || scale <= 0.0
+        || (!control.denoise_options.luminance && !control.denoise_options.chroma)
+    {
         return Ok(());
     }
     debug_assert_eq!(unsafe { (*area).channels }, 3);
+    #[cfg(not(target_arch = "wasm32"))]
+    let started = std::time::Instant::now();
     let dt = DType::from_u32(dtype);
-    let sigma = dt.base_h() * scale as f64;
+    let sigma = dt.base_h() * scale as f64 * control.denoise_options.strength as f64;
 
-    if stage == 0 {
+    if control.denoise_options.algorithm == DenoiseAlgorithm::Bm3d {
+        let img = unsafe { area_to_img3(area) };
+        let out = denoise_bm3d(&img, scale, control)?;
+        control.check()?;
+        unsafe { img3_to_area(&out, area) };
+    } else if stage == 0 {
         let mut img = unsafe { area_to_img3(area) };
         denoise_nlm(&mut img, sigma, control)?;
+        control.check()?;
         unsafe { img3_to_area(&img, area) };
     } else {
         let img = unsafe { area_to_img3(area) };
-        let out = fast_nlm_denoise_controlled(&img, [0.0, sigma, sigma * 2.0], 3, 11, control)?;
+        let out = configured_nlm(&img, [sigma, sigma, sigma * 2.0], control)?;
+        control.check()?;
         unsafe { img3_to_area(&out, area) };
     }
-    control.check()
+    #[cfg(not(target_arch = "wasm32"))]
+    log(
+        crate::x3f_verbosity_t_DEBUG,
+        &format!(
+            "Denoise stage: quattro-{stage}, {}x{}, {:.3} ms",
+            unsafe { (*area).columns },
+            unsafe { (*area).rows },
+            started.elapsed().as_secs_f64() * 1000.0
+        ),
+    );
+    Ok(())
 }
 
 // ----------------------------------------------------------------------
@@ -975,32 +1346,194 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cancellation_interrupts_nlm_without_cancelling_another_call() {
+    fn advanced_settings_validate_and_disabled_planes_are_exact() {
+        for strength in [f32::NAN, f32::INFINITY, 0.0, 3.1] {
+            assert!(DenoiseOptions {
+                strength,
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+        for size in [0, 2, 10, 255] {
+            let mut options = DenoiseOptions::default();
+            options.nlm.luma_patch = size;
+            assert!(options.validate().is_err());
+            options.nlm = NlmOptions::default();
+            options.nlm.chroma_search = size;
+            assert!(options.validate().is_err());
+        }
+        let mut source = Img3::new(17, 19);
+        for (i, pixel) in source.data.chunks_exact_mut(3).enumerate() {
+            pixel.copy_from_slice(&[
+                20000 + ((i * 71) % 200) as u16,
+                32000 + ((i * 37) % 200) as u16,
+                33000 + ((i * 23) % 200) as u16,
+            ]);
+        }
+        for (luminance, chroma) in [(false, true), (true, false), (true, true), (false, false)] {
+            let options = DenoiseOptions {
+                luminance,
+                chroma,
+                nlm: NlmOptions {
+                    luma_patch: 5,
+                    luma_search: 7,
+                    chroma_patch: 3,
+                    chroma_search: 9,
+                },
+                ..Default::default()
+            };
+            let control = Control::none()
+                .with_denoise_backend(DenoiseBackend::Cpu)
+                .with_denoise_options(options)
+                .unwrap();
+            let mut out = source.clone();
+            denoise_nlm(&mut out, 100.0, control).unwrap();
+            for channel in 0..3 {
+                let changed = source
+                    .data
+                    .chunks_exact(3)
+                    .zip(out.data.chunks_exact(3))
+                    .any(|(a, b)| a[channel] != b[channel]);
+                assert_eq!(changed, if channel == 0 { luminance } else { chroma });
+            }
+        }
+        let mut raw = source.clone();
+        let control = Control::none()
+            .with_denoise_options(DenoiseOptions {
+                luminance: false,
+                chroma: false,
+                ..Default::default()
+            })
+            .unwrap();
+        unsafe {
+            denoise_area_controlled(&mut raw.area(), DENOISE_STD, 1.0, control).unwrap();
+        }
+        assert_eq!(raw.data, source.data);
+    }
+
+    #[test]
+    fn cancellation_preserves_sensor_buffer_without_cancelling_another_call() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::{Duration, Instant};
 
         let cancel = AtomicBool::new(false);
-        let image = Img3::new(512, 512);
+        let mut data = vec![12000; 1024 * (1024 * 3 + 4)];
+        let original = data.clone();
+        let mut area = Area16 {
+            data: data.as_mut_ptr(),
+            buf: std::ptr::null_mut(),
+            rows: 1024,
+            columns: 1024,
+            channels: 3,
+            row_stride: 1024 * 3 + 4,
+        };
         let started = Instant::now();
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(Duration::from_millis(1));
                 cancel.store(true, Ordering::Relaxed);
             });
-            let result = fast_nlm_denoise_controlled(
-                &image,
-                [0.0, 80.0, 80.0],
-                3,
-                21,
-                Control::new(&cancel),
-            );
+            let result = unsafe {
+                denoise_area_controlled(&mut area, DENOISE_STD, 1.0, Control::new(&cancel))
+            };
             assert!(matches!(result, Err(crate::Error::Cancelled)));
         });
         assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            data, original,
+            "cancelled stage must preserve sensor data and padding"
+        );
         let other = Img3::new(8, 8);
         let result =
             fast_nlm_denoise_controlled(&other, [0.0, 80.0, 80.0], 3, 11, Control::none()).unwrap();
         assert_eq!(result.data, other.data);
+    }
+
+    #[test]
+    fn cancellation_interrupts_cpu_inside_a_row() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancel = AtomicBool::new(false);
+        let cols = 129;
+        let rows = 4;
+        let ext = vec![500; (rows + 12) * (cols + 12) * 3];
+        let ctx = NlmCtx {
+            control: Control::new(&cancel),
+            ext: &ext,
+            ext_cols: cols + 12,
+            rows,
+            cols,
+            border: 6,
+            tr: 1,
+            sr: 5,
+            tw: 3,
+            sw: 11,
+            bin_shift: 4,
+            lut: &[[i32::MAX; 3]],
+        };
+        let mut out = vec![0; rows * cols * 3];
+        let mut polls = 0;
+        // The third poll is at column 64, after real NLM work. This does not
+        // depend on thread scheduling or time spent copying the sensor data.
+        ctx.process_rows_until(0, rows as i32 - 1, &mut out, || {
+            polls += 1;
+            if polls == 3 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            ctx.control.check().is_err()
+        });
+        assert!(out[..64 * 3].iter().all(|&value| value == 500));
+        assert!(out[64 * 3..].iter().all(|&value| value == 0));
+        let other = NlmCtx {
+            control: Control::none(),
+            ..ctx
+        };
+        other.process_rows(0, rows as i32 - 1, &mut out);
+        assert!(out.iter().all(|&value| value == 500));
+    }
+
+    #[test]
+    fn failed_gpu_request_preserves_input_and_backend_selection() {
+        let mut image = Img3::new(7, 13);
+        for (i, value) in image.data.iter_mut().enumerate() {
+            *value = 32700 + (i % 101) as u16;
+        }
+        let original = image.data.clone();
+        let h = [0.0, 100.0, 100.0];
+        let cpu = fast_nlm_cpu(&image, h, 3, 11, Control::none()).unwrap();
+        for backend in [
+            DenoiseBackend::Cpu,
+            DenoiseBackend::Auto,
+            DenoiseBackend::Gpu,
+        ] {
+            let result = fast_nlm_with_gpu(
+                &image,
+                h,
+                3,
+                11,
+                Control::none().with_denoise_backend(backend),
+                || {
+                    assert_ne!(
+                        backend,
+                        DenoiseBackend::Cpu,
+                        "CPU selection initialized a GPU"
+                    );
+                    Err(crate::Error::Gpu("injected device failure".into()))
+                },
+            );
+            if backend == DenoiseBackend::Gpu {
+                assert!(
+                    matches!(result, Err(crate::Error::Gpu(message)) if message == "injected device failure")
+                );
+            } else {
+                assert_eq!(result.unwrap().data, cpu.data);
+            }
+            assert_eq!(image.data, original);
+        }
+        let cancelled = fast_nlm_with_gpu(&image, h, 3, 11, Control::none(), || {
+            Err(crate::Error::Cancelled)
+        });
+        assert!(matches!(cancelled, Err(crate::Error::Cancelled)));
     }
 
     /// Tiny deterministic LCG so tests don't need an RNG crate.
@@ -1188,5 +1721,81 @@ mod tests {
         // Mean should be roughly preserved (denoise of a flat field).
         let mean = data.iter().map(|&v| v as f64).sum::<f64>() / data.len() as f64;
         assert!((mean - 20000.0).abs() < 500.0, "mean drifted to {mean}");
+    }
+
+    #[test]
+    fn cancelled_denoising_preserves_strided_sensor_buffer() {
+        use std::sync::atomic::AtomicBool;
+        let mut data = vec![12000; 7 * 10];
+        let original = data.clone();
+        let mut area = Area16 {
+            data: data.as_mut_ptr(),
+            buf: std::ptr::null_mut(),
+            rows: 7,
+            columns: 2,
+            channels: 3,
+            row_stride: 10,
+        };
+        let cancel = AtomicBool::new(true);
+        let result =
+            unsafe { denoise_area_controlled(&mut area, DENOISE_STD, 1.0, Control::new(&cancel)) };
+        assert!(matches!(result, Err(crate::Error::Cancelled)));
+        assert_eq!(data, original);
+    }
+
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    #[test]
+    #[ignore = "requires a physical GPU; run explicitly on GPU test hosts"]
+    fn gpu_matches_cpu_at_edges_and_tile_seams() {
+        let control = Control::none().with_denoise_backend(DenoiseBackend::Gpu);
+        for (rows, cols) in [(1, 1), (1, 29), (23, 1), (31, 43), (1037, 1049)] {
+            for (search, h) in [(11, [0.0, 300.0, 600.0]), (21, [0.0, 37.5, 75.0])] {
+                let mut rng = Lcg(12345);
+                let mut img = Img3::new(rows, cols);
+                // Coarse-pass noise must be low enough to admit neighbours,
+                // otherwise every weight except the self-match would be zero.
+                let divisor = if search == 21 { 8 } else { 1 };
+                for (i, p) in img.data.chunks_exact_mut(3).enumerate() {
+                    let edge = if i % cols < cols / 2 { 12000 } else { 58000 };
+                    p[0] = (edge + rng.noise(100 / divisor)).clamp(0, 65535) as u16;
+                    p[1] = (32768 + rng.noise(250 / divisor)) as u16;
+                    p[2] = (32768 + rng.noise(200 / divisor)) as u16;
+                }
+                let expected = fast_nlm_cpu(&img, h, 3, search, Control::none()).unwrap();
+                let actual = fast_nlm_denoise_controlled(&img, h, 3, search, control).unwrap();
+                let max_error = expected
+                    .data
+                    .iter()
+                    .zip(&actual.data)
+                    .map(|(&a, &b)| a.abs_diff(b))
+                    .max()
+                    .unwrap();
+                assert!(
+                    max_error <= 1,
+                    "{cols}x{rows}, search={search}: max error {max_error}"
+                );
+                let repeat = fast_nlm_denoise_controlled(&img, h, 3, search, control).unwrap();
+                assert_eq!(actual.data, repeat.data);
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_gpu_falls_back_only_in_auto_mode() {
+        let image = Img3::new(7, 13);
+        // Unsupported GPU window also exercises error fallback on GPU hosts.
+        // CPU-only/WASM builds reject any forced GPU request before dispatch.
+        let cpu = fast_nlm_cpu(&image, [0.0, 100.0, 100.0], 11, 7, Control::none()).unwrap();
+        let auto = fast_nlm_denoise_controlled(&image, [0.0, 100.0, 100.0], 11, 7, Control::none())
+            .unwrap();
+        assert_eq!(cpu.data, auto.data);
+        let forced = fast_nlm_denoise_controlled(
+            &image,
+            [0.0, 100.0, 100.0],
+            11,
+            7,
+            Control::none().with_denoise_backend(DenoiseBackend::Gpu),
+        );
+        assert!(matches!(forced, Err(crate::Error::Gpu(_))));
     }
 }

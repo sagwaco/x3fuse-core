@@ -172,6 +172,20 @@ reimplementation of the original opencv-mobile `fastNlMeansDenoising`
 (floating-point `exp`, INTER_AREA / INTER_CUBIC rounding differ); on real
 images it tracked OpenCV to ~99.98% of bytes before OpenCV was removed.
 
+Native GPU NLM is checked separately against this Rust CPU reference. Run
+`cargo test --release -p x3f-sys --features gpu denoise:: -- --include-ignored`
+on a physical GPU to cover all shaders, configurable windows, edges, and tile seams. Kernels may
+differ by one 16-bit code value due to FP32 accumulation; downstream color
+processing can amplify that difference, so also compare actual DNG/TIFF
+rasters. Shader validation, cancellation, and forced-GPU failure/automatic
+fallback checks run without a GPU in ordinary CI. Use
+`cargo test -p x3f-sys --no-default-features denoise::` to test a CPU-only build.
+BM3D has its own transform/noise-reduction tests and GPU agreement gate
+(maximum eight codes, RMS below 0.6 on the synthetic fixtures); see the
+[BM3D profile and limits](performance.md#bm3d-implementation).
+The [benchmark script](../../scripts/bench_denoise.py) measures complete
+denoising stages, including initialization and transfers.
+
 ### Legacy CLI flag syntax is preserved
 
 Single-dash flags (`-dng`, `-tiff`, `-color sRGB`, `-no-denoise`, …)

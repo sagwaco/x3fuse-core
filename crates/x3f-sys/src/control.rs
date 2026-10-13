@@ -8,6 +8,7 @@ pub enum Error {
     InvalidData(&'static str),
     Io(std::io::Error),
     Allocation,
+    Gpu(String),
 }
 
 impl std::fmt::Display for Error {
@@ -19,6 +20,7 @@ impl std::fmt::Display for Error {
             Self::Allocation => {
                 f.write_str("X3F allocation exceeds available memory or safety limit")
             }
+            Self::Gpu(message) => write!(f, "GPU denoising unavailable: {message}"),
         }
     }
 }
@@ -43,16 +45,29 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Clone, Copy, Default)]
 pub struct Control<'a> {
     cancel: Option<&'a AtomicBool>,
+    pub(crate) denoise_backend: crate::DenoiseBackend,
+    pub(crate) denoise_options: crate::DenoiseOptions,
 }
 
 impl<'a> Control<'a> {
     pub const fn new(cancel: &'a AtomicBool) -> Self {
         Self {
             cancel: Some(cancel),
+            denoise_backend: crate::DenoiseBackend::Auto,
+            denoise_options: crate::DenoiseOptions::DEFAULT,
         }
     }
     pub const fn none() -> Self {
-        Self { cancel: None }
+        Self {
+            cancel: None,
+            denoise_backend: crate::DenoiseBackend::Auto,
+            denoise_options: crate::DenoiseOptions::DEFAULT,
+        }
+    }
+    /// Choose a denoising backend without changing another conversion's state.
+    pub const fn with_denoise_backend(mut self, backend: crate::DenoiseBackend) -> Self {
+        self.denoise_backend = backend;
+        self
     }
     pub fn check(self) -> Result<()> {
         if self.cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
@@ -60,5 +75,11 @@ impl<'a> Control<'a> {
         } else {
             Ok(())
         }
+    }
+
+    pub fn with_denoise_options(mut self, options: crate::DenoiseOptions) -> Result<Self> {
+        options.validate().map_err(Error::InvalidData)?;
+        self.denoise_options = options;
+        Ok(self)
     }
 }

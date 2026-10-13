@@ -105,6 +105,9 @@ impl Reader {
         opts: &ProcessOptions,
         control: sys::Control<'_>,
     ) -> Result<Image, Error> {
+        let control = control
+            .with_denoise_backend(opts.denoise_backend)
+            .with_denoise_options(opts.denoise_options)?;
         control.check()?;
         let cwb = wb_cstring(opts.wb.as_deref())?;
         let sgain = self.resolve_sgain(opts.apply_sgain);

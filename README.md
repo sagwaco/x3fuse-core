@@ -15,22 +15,53 @@ target/release/x3f_extract -dng photo.X3F
 
 This produces `target/release/x3f_extract`. Multiple input files are processed in parallel.
 
+Native CLI builds include GPU NLM denoising through wgpu (Metal, Vulkan,
+or DirectX 12), with automatic CPU fallback. To build a CPU-only CLI:
+`cargo build --release -p x3f-cli --no-default-features`. WASM always uses the
+portable CPU denoiser, even when the `gpu` feature is enabled.
+
 ## Rust library
 
 Add the safe API crate to your application's `Cargo.toml`:
 
 ```toml
 [dependencies]
-x3f-core = "0.1.5"
+x3f-core = "0.2.0"
 ```
 
-[`convert_file`](https://docs.rs/x3f-core/0.1.5/x3f_core/fn.convert_file.html)
+[`convert_file`](crates/x3f-core/src/conversion.rs)
 synchronously converts one file to DNG, TIFF, or its embedded JPEG. Pass an
 `AtomicBool` for cooperative cancellation and a callback for the four
 `ConversionStage` updates. Each call owns its reader and processing options,
 so a desktop application can run independent conversions on blocking workers.
 The destination must not already exist; failed or cancelled conversions remove
 the output they created.
+
+For native GPU denoising in this checkout, enable the library's optional `gpu` Cargo feature.
+`ProcessOptions::denoise_backend` and `SceneLinearOptions::denoise_backend`
+accept `DenoiseBackend::{Auto, Cpu, Gpu}`. `Auto` is the default; `Gpu` requires
+acceleration and returns `Error::Gpu` when unavailable. Default NLM now copies
+luminance without filtering, so CPU output can differ slightly from earlier
+releases in nearly constant regions. Output with `-no-denoise` remains
+byte-identical. GPU floating-point accumulation can also differ slightly.
+See [denoising performance and validation](docs/src/performance.md#gpu-denoising).
+
+Select `DenoiseOptions::algorithm` (`Nlm` or `Bm3d`) through either options
+struct’s `denoise_options` field. NLM remains the default. Advanced controls
+include independent luminance/chroma toggles, strength, and NLM patch/search
+sizes. Both algorithms support native GPU execution and CPU/WASM fallback.
+Enable the optional `serde` feature to persist these settings.
+
+Version **0.2.0** adds `denoise_backend` and
+`denoise_options` to `ProcessOptions` and `SceneLinearOptions`, and GPU errors to the Rust error
+enums. Downstream exhaustive struct literals and error matches must be updated;
+use `..Default::default()` when constructing options. These source changes
+must not be published as a 0.1.x patch. The C ABI remains unchanged.
+
+Build C-library artifacts separately with `cargo build --release -p x3f-ffi-c`
+to exclude GPU dependencies. A whole-workspace build unifies the CLI's `gpu`
+feature into the libraries too; legacy C processing entry points still select
+CPU explicitly so their output does not depend on that feature unification.
 
 ## Usage
 
@@ -60,8 +91,10 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 | `-v` / `-q`               | verbose / quiet (errors only)                                                      |
 | `-color <SPACE>`          | RGB color space: `none`, `sRGB`, `AdobeRGB`, `ProPhotoRGB` (does not affect DNG)   |
 | `-compress`               | lossless compression (DNG: lossless JPEG, TIFF: Deflate/ZIP)                       |
-| `-denoise <0-10>`         | NLM denoise intensity: `0` = off, `10` = full strength (**default**); intermediate values linearly scale the NLM sigma |
-| `-no-denoise`             | disable the NLM denoise pass (alias for `-denoise 0`)                               |
+| `-denoise <0-10>`         | Denoise intensity: `0` = off, `10` = full strength (**default**); intermediate values scale filter strength |
+| `-no-denoise`             | disable denoising (alias for `-denoise 0`)                               |
+| `-denoiser <nlm\|bm3d>` | algorithm (default: NLM); see [advanced controls](docs/src/performance.md#algorithm-and-advanced-controls) |
+| `-denoise-backend <auto\|cpu\|gpu>` | execution backend; `auto` falls back to CPU, `gpu` fails if acceleration is unavailable |
 | `-no-crop`                | do not crop to the active image area                                               |
 | `-no-sgain` / `-sgain`    | disable / force spatial-gain (lens color) compensation                             |
 | `-no-fix-bad`             | do not fix bad pixels                                                              |
@@ -90,6 +123,9 @@ x3f_extract -tiff -compress -o out/ input.X3F
 
 # DNG with a lighter denoise pass (half the default strength)
 x3f_extract -dng -denoise 5 input.X3F
+
+# Require GPU denoising (use -v to report the adapter and stage timings)
+x3f_extract -v -dng -denoise-backend gpu input.X3F
 
 # Metadata dump
 x3f_extract -meta input.X3F

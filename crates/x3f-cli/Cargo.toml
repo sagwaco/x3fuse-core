@@ -13,6 +13,10 @@ description = "Command-line tool for converting Sigma Foveon X3F raw images."
 name = "x3f_extract"
 path = "src/main.rs"
 
+[features]
+default = ["gpu"]
+gpu = ["x3f-core/gpu"]
+
 [dependencies]
 x3f-core.workspace = true
 # M7b: rayon par_iter over args.files for batch-mode parallelism. Each
