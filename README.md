@@ -103,6 +103,8 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 | `-qtop`                   | dump the Quattro top layer, unprocessed                                            |
 | `-opcodes-dir <DIR>`      | embed pre-rendered DNG `OpcodeList3` flat-fielding blobs (see [opcodes/](opcodes)) |
 | `-dng-highlight-recovery` | Foveon highlight recovery for DNG (see [DNG output](#dng-output))                |
+| `-dng-highlight-mapping <MODE>` | store recovered highlights with `linear` (default) or `shoulder` mapping |
+| `-dng-recovery-mask`      | write a source-reliability mask beside the DNG (requires recovery)             |
 | `-cineon`                 | 16-bit TIFF with a Cineon-style log tone curve baked in (requires `-tiff`)         |
 | `-offset <OFF>`           | RAW offset for SD14 and older (automatic if omitted)                               |
 | `-matrixmax <M>`          | max matrix elements in metadata dump (default 100)                                 |
@@ -133,10 +135,14 @@ x3f_extract -meta input.X3F
 
 ## DNG output
 
-Foveon sensors have no demosaicing step, so DNGs are written as **Linear DNGs** (`PhotometricInterpretation = LinearRaw`). To render consistently across RAW engines (Adobe Camera Raw / Lightroom, LibRaw / RawTherapee, Capture One, and Apple's RAW engine) the writer bakes per-channel saturation into the raster and tags a uniform `BlackLevel = 0` / `WhiteLevel = 65535`, and never relies on optional hints like `BaselineExposure`.
+See [DNG highlight recovery](docs/src/highlight-recovery.md) for usage, sensor
+support, and reconstruction stages. Recovery is off by default.
+
+Foveon sensors have no demosaicing step, so DNGs are written as **Linear DNGs** (`PhotometricInterpretation = LinearRaw`). To render consistently across RAW engines (Adobe Camera Raw / Lightroom, LibRaw / RawTherapee, Capture One, and Apple's RAW engine) the writer bakes per-channel saturation into the raster and tags a uniform `BlackLevel = 0` / `WhiteLevel = 65535`. Linear highlight recovery uses `BaselineExposure` to compensate for its shared encoding scale.
 
 - **`-compress`**: lossless compression. TIFF uses Deflate/ZIP; DNG uses **lossless JPEG** (`Compression = 7`), the only 16-bit integer raw compression the spec allows and the one every engine decodes. Compressed output is bit-identical to uncompressed.
-- **`-dng-highlight-recovery`**: reconstructs clipped channels from a scene-derived chroma LUT and folds recovered highlights back under `WhiteLevel` via a soft shoulder baked into the raster (published as `LinearResponseLimit`).
+- **`-dng-highlight-recovery`**: on Merrill, estimates brightness, reconstructs spatial detail, and adds color from nearby reliable pixels. Older sensors and Quattro retain separate recovery paths. Linear mapping preserves relative brightness by default, with shoulder compression available through `-dng-highlight-mapping shoulder`.
+- **`-dng-recovery-mask`**: writes a separate mask of unreliable source measurements for training exclusions. See the [recovery mask guide](docs/src/recovery-mask.md).
 
 See the [conversion pipeline](docs/src/pipeline.md) chapter for the full DNG writer design.
 

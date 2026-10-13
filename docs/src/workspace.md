@@ -71,6 +71,12 @@ mirror of what used to be in `src/`:
 | `wasm_c_shims.rs` | Rust no-op shim for the variadic `x3f_printf` on wasm32 | M8d-α-2 |
 | `histogram_wasm_stub.rs`, `print_meta_wasm_stub.rs` | wasm32 fallbacks (no variadics) | M8d-α |
 
+Merrill DNG recovery uses `tone_anchor.rs` for brightness estimates,
+`gradient_tone.rs` for spatial detail, and `color_field.rs` with
+`highlight_color.rs` for color. `recovery_mask.rs` exports the optional
+source-reliability mask. See [DNG highlight recovery](./highlight-recovery.md)
+and [recovery masks](./recovery-mask.md).
+
 Most of the ported modules export `#[no_mangle] extern "C"` symbols so
 the bindgen forward declarations resolve at link time without churn
 in callsites — even partially-ported files compile cleanly because
@@ -102,8 +108,9 @@ Submodules:
   `max_printed_matrix_elements`) in safe setters, plus
   `set_log_callback` for mobile/WASM logging.
 - [`image.rs`](../../crates/x3f-core/src/image.rs) — `Image` struct
-  that snapshots `DNG_HIGHLIGHT_SCALE` immediately after
-  `x3f_get_image` returns (M5e fix for batch determinism).
+  that receives encoding metadata from `get_image_controlled` through
+  per-conversion `ProcessingInfo`. The wrapper also checks that
+  conversion's recovery-mask export result.
 
 ## `crates/x3f-cli`
 

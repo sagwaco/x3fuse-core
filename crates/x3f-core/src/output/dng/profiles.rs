@@ -334,6 +334,21 @@ pub(crate) fn default_profile_index(reader: &Reader) -> usize {
     0
 }
 
+/// Reuse the emitted default profile's matrix for recovery calibration.
+pub(super) fn default_forward_matrix(
+    reader: &Reader,
+    wb: &str,
+    calibration: &ColorCalibration,
+) -> Option<[f32; 9]> {
+    compute_matrices(
+        reader,
+        wb,
+        calibration,
+        &PROFILES[default_profile_index(reader)],
+    )
+    .map(|(_, forward)| forward)
+}
+
 /// Add ColorMatrix1 + ForwardMatrix1 + ProfileName + DefaultBlackRender
 /// for a single profile to an existing IFD writer.
 fn add_profile_tags(ifd: &mut DirectoryWriter, name: &str, color: [f32; 9], forward: [f32; 9]) {
@@ -679,7 +694,7 @@ fn build_mmcr_profile(
     buf
 }
 
-fn srational_pair(v: f64, denom: i32) -> (i32, i32) {
+pub(super) fn srational_pair(v: f64, denom: i32) -> (i32, i32) {
     // Saturating cast — matrix values are bounded by [-2, 2] in practice;
     // anything outside i32 here would mean the source matrix is broken.
     let num = (v * denom as f64).round();

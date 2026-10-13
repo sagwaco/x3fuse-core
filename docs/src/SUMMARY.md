@@ -16,5 +16,7 @@
 # Project
 
 - [Contributor guide](./contributing.md)
+- [DNG highlight recovery](./highlight-recovery.md)
+- [Recovery mask](./recovery-mask.md)
 - [Releasing](./releasing.md)
 - [Port plan](./port-plan.md)

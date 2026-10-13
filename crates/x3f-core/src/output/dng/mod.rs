@@ -52,6 +52,16 @@ use tiff_writer::{DirectoryWriter, TiffWriter, Value};
 const ROWS_PER_STRIP: u32 = 32;
 const PREVIEW_MAX_WIDTH: u32 = 300;
 
+/// Shared by DNG writing and direct image extraction; no preliminary DNG needed.
+pub(crate) fn recovery_luminance(reader: &Reader, wb: Option<&str>) -> Option<[f64; 3]> {
+    let wb = wb
+        .map(str::to_owned)
+        .unwrap_or_else(|| reader.dng_default_wb());
+    let calibration = ColorCalibration::new(reader, &wb)?;
+    let forward = profiles::default_forward_matrix(reader, &wb, &calibration)?;
+    calibration.recovery_luminance(forward)
+}
+
 /// Write `reader`'s processed image to `path` as a DNG file.
 ///
 /// `opts` is honoured the same way the legacy CLI honoured its DNG flags:
@@ -78,6 +88,9 @@ pub(crate) fn write_controlled(
     warnings: &mut Vec<String>,
 ) -> Result<(), Error> {
     control.check()?;
+    if let Some(mask) = &opts.dng_recovery_mask {
+        check_mask_destination(path, mask)?;
+    }
 
     // Resolve white balance up front — used both for image processing and
     // for the matrix tags.
@@ -181,6 +194,11 @@ pub(crate) fn write_controlled(
     let orientation = capture_meta.orientation.unwrap_or(1);
 
     control.check()?;
+    // The sidecar now exists: also catch an output symlink that was dangling
+    // during preflight but now resolves to the newly created mask.
+    if let Some(mask) = &opts.dng_recovery_mask {
+        check_mask_destination(path, mask)?;
+    }
     let f = BufWriter::new(File::create(path).map_err(|source| Error::Io {
         path: path.display().to_string(),
         source,
@@ -303,6 +321,31 @@ pub(crate) fn write_controlled(
     control.check()?;
     let mut inner = tiff.finalize(ifd0_offset).map_err(io_err(path))?;
     inner.flush().map_err(io_err(path))?;
+    Ok(())
+}
+
+// A library caller must not ask the DNG writer to overwrite its own sidecar.
+// Resolve parent aliases even though neither output file need exist yet.
+fn check_mask_destination(dng: &Path, mask: &Path) -> Result<(), Error> {
+    let resolve = |path: &Path| {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        path.canonicalize()
+            .or_else(|_| {
+                parent
+                    .canonicalize()
+                    .map(|p| p.join(path.file_name().unwrap_or_default()))
+            })
+            .map_err(io_err(path))
+    };
+    if resolve(dng)? == resolve(mask)? {
+        return Err(io_err(mask)(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "DNG and recovery mask destinations must differ",
+        )));
+    }
     Ok(())
 }
 
@@ -578,13 +621,7 @@ fn add_dng_top_level_tags(
     // Include the residual digital gain without clipping the raw samples.
     ifd.add(
         tags::AS_SHOT_NEUTRAL,
-        Value::Rational(
-            calibration
-                .neutral
-                .iter()
-                .map(|&v| ((v * 10_000.0).round().max(1.0) as u32, 10_000_u32))
-                .collect(),
-        ),
+        Value::Rational(calibration.neutral_tag().to_vec()),
     );
 
     // CameraCalibration defaults to identity. Its diagonal is folded into
@@ -718,6 +755,36 @@ fn baseline_exposure(iso_be: Option<f64>, gain_be: f64, highlight_scale: f64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_dng_symlink_cannot_overwrite_new_mask() {
+        let directory = std::env::temp_dir().join(format!(
+            "x3f-mask-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let dng = directory.join("image.dng");
+        let mask = directory.join("image.mask.pgm");
+        std::os::unix::fs::symlink(&mask, &dng).unwrap();
+        assert!(check_mask_destination(&dng, &mask).is_ok());
+        std::fs::write(&mask, b"mask sentinel").unwrap();
+        assert!(check_mask_destination(&dng, &mask).is_err());
+        assert_eq!(std::fs::read(&mask).unwrap(), b"mask sentinel");
+        std::fs::remove_file(dng).unwrap();
+        std::fs::remove_file(mask).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn mask_destination_must_differ_from_dng_including_parent_aliases() {
+        assert!(check_mask_destination(Path::new("test.dng"), Path::new("./test.dng")).is_err());
+        assert!(check_mask_destination(Path::new("test.dng"), Path::new("test.mask.pgm")).is_ok());
+    }
     use crate::ImageLevels;
 
     #[test]

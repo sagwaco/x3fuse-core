@@ -728,7 +728,7 @@ pub unsafe extern "C" fn interpolate_bad_pixels(
     image: *mut x3f_area16_t,
     colors: libc::c_int,
 ) {
-    unsafe { interpolate_bad_pixels_controlled(x3f, image, colors, Control::none()) }
+    unsafe { interpolate_bad_pixels_controlled(x3f, image, colors, Control::none(), None) }
 }
 
 unsafe fn interpolate_bad_pixels_controlled(
@@ -736,6 +736,7 @@ unsafe fn interpolate_bad_pixels_controlled(
     image: *mut x3f_area16_t,
     colors: libc::c_int,
     control: Control<'_>,
+    repair_marked: Option<&mut [bool]>,
 ) {
     let img = unsafe { &*image };
     let cs = img.columns as i32;
@@ -1020,6 +1021,15 @@ unsafe fn interpolate_bad_pixels_controlled(
 
     // ---- END — collecting; BEGIN — fixing ----
 
+    // Keep repair provenance after the interpolation loop consumes this list.
+    // Even an unresolved repair site cannot supply independent donor evidence.
+    if let Some(marked) = repair_marked {
+        assert_eq!(marked.len(), cs as usize * rs as usize);
+        for pixel in &bad_pixels {
+            marked[pixel.r as usize * cs as usize + pixel.c as usize] = true;
+        }
+    }
+
     if !bad_pixels.is_empty() {
         unsafe {
             x3f_printf(
@@ -1188,12 +1198,19 @@ struct WbColorShading {
     denom: f64,
 }
 
-unsafe fn is_merrill_model(x3f: *mut x3f_t) -> bool {
+/// Shared Merrill classification for source processing and recovery calibration.
+///
+/// # Safety
+/// `x3f` must be a valid handle whose property list is loaded.
+pub unsafe fn is_merrill_model(x3f: *mut x3f_t) -> bool {
     let mut cammodel: *mut libc::c_char = ptr::null_mut();
     if unsafe { x3f_get_prop_entry(x3f, c"CAMMODEL".as_ptr() as *mut _, &mut cammodel) } == 0 {
         return false;
     }
-    let model = unsafe { CStr::from_ptr(cammodel) }.to_bytes();
+    is_merrill_name(unsafe { CStr::from_ptr(cammodel) }.to_bytes())
+}
+
+fn is_merrill_name(model: &[u8]) -> bool {
     matches!(
         model,
         b"SIGMA DP1 Merrill" | b"SIGMA DP2 Merrill" | b"SIGMA DP3 Merrill" | b"SIGMA SD1 Merrill"
@@ -1392,7 +1409,7 @@ pub unsafe extern "C" fn preprocess_data(
     wb: *mut libc::c_char,
     ilevels: *mut x3f_image_levels_t,
 ) -> libc::c_int {
-    unsafe { preprocess_data_impl(x3f, fix_bad, wb, ilevels, None, Control::none()) }
+    unsafe { preprocess_data_impl(x3f, fix_bad, wb, ilevels, None, false, Control::none()) }
 }
 
 // Provenance belongs to one conversion, never to the C image layout or a
@@ -1403,6 +1420,7 @@ unsafe fn preprocess_data_impl(
     wb: *mut libc::c_char,
     ilevels: *mut x3f_image_levels_t,
     provenance: Option<&mut Option<SensorReliability>>,
+    track_repaired_donors: bool,
     control: Control<'_>,
 ) -> libc::c_int {
     if control.check().is_err() {
@@ -1683,7 +1701,7 @@ unsafe fn preprocess_data_impl(
             }
         });
         if fix_bad != 0 {
-            unsafe { interpolate_bad_pixels_controlled(x3f, &mut qtop, 1, control) };
+            unsafe { interpolate_bad_pixels_controlled(x3f, &mut qtop, 1, control, None) };
         }
     }
 
@@ -1716,7 +1734,11 @@ unsafe fn preprocess_data_impl(
     }
 
     if fix_bad != 0 {
-        unsafe { interpolate_bad_pixels_controlled(x3f, &mut image, 3, control) };
+        let repair_marked = reliability
+            .as_mut()
+            .filter(|_| track_repaired_donors)
+            .map(|mask| mask.repair_marked.as_mut_slice());
+        unsafe { interpolate_bad_pixels_controlled(x3f, &mut image, 3, control, repair_marked) };
     }
 
     if let Some(output) = provenance {
@@ -2689,8 +2711,19 @@ pub unsafe extern "C" fn x3f_set_cineon(enabled: libc::c_int) {
     CINEON.with(|c| c.set(enabled != 0));
 }
 
+#[path = "color_field.rs"]
+mod color_field;
+#[path = "gradient_tone.rs"]
+mod gradient_tone;
+#[path = "highlight_color.rs"]
+mod highlight_color;
+#[path = "recovery_mask.rs"]
+mod recovery_mask;
+#[path = "tone_anchor.rs"]
+mod tone_anchor;
+
 #[derive(Copy, Clone)]
-struct DngCtx {
+struct DngCtx<'a> {
     sgain: *mut x3f_spatial_gain_corr_t,
     sgain_num: libc::c_int,
     conv_matrix: *mut f64,
@@ -2709,18 +2742,45 @@ struct DngCtx {
     cols: i32,
     channels: usize,
     recovery: bool,
+    camera_y: Option<[f64; 3]>,
+    gradient: Option<&'a gradient_tone::Field>,
+    color_field: Option<&'a color_field::Field>,
+}
+
+impl DngCtx<'_> {
+    /// Read normalized, spatial-gain-corrected source layers while building the
+    /// immutable recovery fields. Never call this on an already encoded neighbor.
+    unsafe fn measured(&self, data: &[u16], stride: usize, row: usize, col: usize) -> [f64; 3] {
+        let off = row * stride + col * self.channels;
+        std::array::from_fn(|c| {
+            let sample =
+                (data[off + c] as f64 - self.black[c]) / (self.white[c] as f64 - self.black[c]);
+            sample
+                * unsafe {
+                    x3f_calc_spatial_gain(
+                        self.sgain,
+                        self.sgain_num,
+                        row as i32,
+                        col as i32,
+                        c as i32,
+                        self.rows,
+                        self.cols,
+                    )
+                }
+        })
+    }
 }
 
 // All pointed-to tables are immutable for the lifetime of both row passes.
-unsafe impl Send for DngCtx {}
-unsafe impl Sync for DngCtx {}
+unsafe impl Send for DngCtx<'_> {}
+unsafe impl Sync for DngCtx<'_> {}
 
-/// Both encoding passes evaluate the same original pixel against the same
-/// frozen model. No neighboring raster access, environment reads, or model
-/// updates are allowed here, so the second pass can write rows in place.
+/// Both passes evaluate each source pixel using the same read-only model.
+/// Do not read neighboring pixels, read environment settings, or update the model
+/// here. The encoding pass overwrites source pixels as it proceeds.
 #[inline]
 unsafe fn dng_evaluate_pixel(
-    ctx: &DngCtx,
+    ctx: &DngCtx<'_>,
     local: Option<&LocalRecovery>,
     row: usize,
     col: usize,
@@ -2743,6 +2803,41 @@ unsafe fn dng_evaluate_pixel(
             ctx.cols,
         )
     });
+    // x3f_get_image supplies these coefficients only for Merrill cameras.
+    // Other sensors use the reconstruction below this branch.
+    if let Some(camera_y) = ctx.camera_y.filter(|_| ctx.recovery) {
+        let model = local.expect("tone anchor requires native reliability");
+        let mask = model.mask(row, col);
+        let measured = std::array::from_fn(|c| sg[c] * original[c]);
+        // Anchor brightness, reconstruct its spatial gradients, then add color.
+        let mut tone = tone_anchor::recover_severe(measured, mask, *prior, camera_y);
+        if let Some(field) = ctx.gradient {
+            field.apply(row, col, &mut tone, measured, *prior);
+        }
+        if tone.available {
+            if let Some(field) = ctx.color_field {
+                let target_y = tone.amplitude
+                    * camera_y
+                        .into_iter()
+                        .zip(*prior)
+                        .map(|(a, b)| a * b)
+                        .sum::<f64>();
+                if let Some(direction) = field.estimate(
+                    row,
+                    col,
+                    measured,
+                    mask,
+                    model.repaired_site(row, col),
+                    target_y,
+                    camera_y,
+                ) {
+                    return highlight_color::apply(measured, &tone, *prior, camera_y, direction);
+                }
+            }
+        }
+        // Keep the reconstructed tone if no valid color direction is available.
+        return tone.samples;
+    }
     let mut samples = original;
     let mut confident = false;
     let mut damaged = true;
@@ -2920,7 +3015,7 @@ fn encode_dng_recovered(
 
 /// Recovery-off encoding deliberately retains the original arithmetic and
 /// per-channel intermediate quantization for the byte-parity contract.
-unsafe fn dng_encode_off_row(ctx: &DngCtx, row: usize, data: &mut [u16]) {
+unsafe fn dng_encode_off_row(ctx: &DngCtx<'_>, row: usize, data: &mut [u16]) {
     for col in 0..ctx.cols as usize {
         let off = col * ctx.channels;
         let values = unsafe {
@@ -2998,6 +3093,37 @@ unsafe fn dng_active_bounds(x3f: *mut x3f_t, image: &x3f_area16_t) -> [usize; 4]
     }
 }
 
+fn report_dng_recovery_error(message: &'static str) {
+    // Static Rust error text need not be NUL-terminated: printf receives its length.
+    unsafe {
+        x3f_printf(
+            x3f_verbosity_t_ERR,
+            c"DNG recovery failed: %.*s\n".as_ptr(),
+            message.len() as libc::c_int,
+            message.as_ptr().cast::<libc::c_char>(),
+        );
+    }
+}
+
+// On failure, buf must be NULL or an independently owned malloc allocation.
+unsafe fn dng_recovery_status(image: &mut x3f_area16_t, result: crate::Result<()>) -> libc::c_int {
+    match result {
+        Ok(()) => 1,
+        Err(error) => {
+            // A borrowed decoder raster has buf=NULL. Only an independently
+            // owned (e.g. expanded) allocation may be freed here, never data.
+            unsafe {
+                libc::free(image.buf.cast());
+                *image = std::mem::zeroed();
+            }
+            if let crate::Error::InvalidData(message) = error {
+                report_dng_recovery_error(message);
+            }
+            0
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn apply_highlight_clip_dng(
     x3f: *mut x3f_t,
@@ -3010,13 +3136,16 @@ pub unsafe extern "C" fn apply_highlight_clip_dng(
     let mut info = ProcessingInfo {
         highlight_scale: 1.0,
         shoulder_ceiling: 1.0,
+        recovery_mask: None,
     };
-    unsafe {
+    let result = unsafe {
+        // This legacy image-only entry has no native source provenance.
         apply_highlight_clip_dng_impl(
             x3f,
             image,
             ilevels,
             wb,
+            None,
             None,
             recovery,
             mapping,
@@ -3025,8 +3154,13 @@ pub unsafe extern "C" fn apply_highlight_clip_dng(
             &mut info,
             None,
             true,
+            None,
         )
     };
+    // Its legacy void ABI cannot return a status or take ownership of the image.
+    if let Err(crate::Error::InvalidData(message)) = result {
+        report_dng_recovery_error(message);
+    }
     DNG_HIGHLIGHT_SCALE.with(|c| c.set(info.highlight_scale));
     DNG_SHOULDER_CEILING.with(|c| c.set(info.shoulder_ceiling));
 }
@@ -3037,6 +3171,7 @@ unsafe fn apply_highlight_clip_dng_impl(
     ilevels: *mut x3f_image_levels_t,
     wb: *mut libc::c_char,
     provenance: Option<SensorReliability>,
+    camera_y: Option<[f64; 3]>,
     recovery: bool,
     mapping: DngMapping,
     already_cropped: bool,
@@ -3044,12 +3179,11 @@ unsafe fn apply_highlight_clip_dng_impl(
     info: &mut ProcessingInfo,
     linear: Option<&mut SceneLinearData>,
     apply_sgain: bool,
-) {
-    if control.check().is_err() {
-        return;
-    }
+    mask_path: Option<&std::path::Path>,
+) -> crate::Result<()> {
+    control.check()?;
     if image.is_null() || ilevels.is_null() {
-        return;
+        return Err(crate::Error::InvalidData("missing image or levels"));
     }
     let img = unsafe { &mut *image };
     let il = unsafe { &mut *ilevels };
@@ -3059,17 +3193,17 @@ unsafe fn apply_highlight_clip_dng_impl(
         || img.columns == 0
         || (0..3).any(|c| !il.black[c].is_finite() || il.white[c] as f64 <= il.black[c])
     {
-        return;
+        return Err(crate::Error::InvalidData("invalid image or levels"));
     }
     let stride = img.row_stride as usize;
     let channels = img.channels as usize;
     let cols = img.columns as usize;
     let rows = img.rows as usize;
     let Some(row_len) = cols.checked_mul(channels) else {
-        return;
+        return Err(crate::Error::InvalidData("image row length overflow"));
     };
     if stride < row_len {
-        return;
+        return Err(crate::Error::InvalidData("invalid image row stride"));
     }
     // Cropped views need not own padding after their final visible row.
     let Some(total) = (rows - 1)
@@ -3077,7 +3211,7 @@ unsafe fn apply_highlight_clip_dng_impl(
         .and_then(|length| length.checked_add(row_len))
         .filter(|length| *length <= isize::MAX as usize / std::mem::size_of::<u16>())
     else {
-        return;
+        return Err(crate::Error::InvalidData("image extent overflow"));
     };
     let mut conv_matrix = [0.0_f64; 9];
     let mut lut_dummy = [0.0_f64; LUTSIZE as usize];
@@ -3094,7 +3228,7 @@ unsafe fn apply_highlight_clip_dng_impl(
         )
     } == 0
     {
-        return;
+        return Err(crate::Error::InvalidData("unavailable conversion matrix"));
     }
 
     let mut sgain: [x3f_spatial_gain_corr_t; MAX_CORR] = unsafe { std::mem::zeroed() };
@@ -3136,6 +3270,18 @@ unsafe fn apply_highlight_clip_dng_impl(
     });
     if let Some(model) = local.as_mut() {
         model.set_chroma_enabled(!no_chroma);
+    }
+
+    if let Err(error) = control.check() {
+        unsafe { x3f_cleanup_spatial_gain(sgain.as_mut_ptr(), sgain_num) };
+        return Err(error);
+    }
+    if local.is_none() && mask_path.is_some() {
+        // A requested mask needs real native evidence, never a fallback estimate.
+        unsafe { x3f_cleanup_spatial_gain(sgain.as_mut_ptr(), sgain_num) };
+        return Err(crate::Error::InvalidData(
+            "mask export requires native source reliability",
+        ));
     }
 
     let mut clut: chroma_lut_t = unsafe { std::mem::zeroed() };
@@ -3182,7 +3328,11 @@ unsafe fn apply_highlight_clip_dng_impl(
         .unwrap_or(0.30)
         .max(1e-6);
     let knee = dng_shoulder_knee();
-    let ctx = DngCtx {
+    // The Merrill reconstruction is DNG-only; editor preparation retains the
+    // upstream recovery path and does not use DNG storage calibration.
+    let camera_y = camera_y.filter(|_| recovery && linear.is_none());
+    let gradient_enabled = camera_y.is_some();
+    let mut ctx = DngCtx {
         sgain: sgain.as_mut_ptr(),
         sgain_num,
         conv_matrix: conv_matrix.as_mut_ptr(),
@@ -3201,13 +3351,74 @@ unsafe fn apply_highlight_clip_dng_impl(
         cols: cols as i32,
         channels,
         recovery,
+        camera_y,
+        gradient: None,
+        color_field: None,
     };
+    let gradient = if gradient_enabled {
+        match unsafe {
+            gradient_tone::Field::build(
+                &ctx,
+                local.as_ref(),
+                std::slice::from_raw_parts(img.data, total),
+                stride,
+                control,
+            )
+        } {
+            Ok(field) => Some(field),
+            Err(message) => {
+                // Field construction failed before encoding or mask export.
+                // Release the same manually owned tables as the success path.
+                unsafe {
+                    x3f_cleanup_spatial_gain(sgain.as_mut_ptr(), sgain_num);
+                    libc::free(sat_map.cast());
+                }
+                return Err(message);
+            }
+        }
+    } else {
+        None
+    };
+    ctx.gradient = gradient.as_ref();
+    let color_field = if ctx.camera_y.is_some() && !no_chroma {
+        match unsafe {
+            color_field::Field::build(
+                &ctx,
+                local.as_ref().expect("Merrill reliability"),
+                std::slice::from_raw_parts(img.data, total),
+                stride,
+                control,
+            )
+        } {
+            Ok(field) => Some(field),
+            Err(error) => {
+                // This conversion owns these allocations even when field construction fails.
+                unsafe {
+                    x3f_cleanup_spatial_gain(sgain.as_mut_ptr(), sgain_num);
+                    libc::free(sat_map.cast());
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    ctx.color_field = color_field.as_ref();
     let bounds = if already_cropped {
         [0, 0, rows, cols]
     } else {
         unsafe { dng_active_bounds(x3f, img) }
     };
     let data = unsafe { std::slice::from_raw_parts_mut(img.data, total) };
+    if let Some(path) = mask_path {
+        info.recovery_mask = Some(recovery_mask::write(
+            path,
+            &ctx,
+            local.as_ref(),
+            bounds,
+            control,
+        ));
+    }
     if trace && recovery {
         for (row, col) in [
             (rows / 20, cols / 2),
@@ -3374,6 +3585,7 @@ unsafe fn apply_highlight_clip_dng_impl(
             local.is_some()
         );
     }
+    control.check()?;
     info.highlight_scale = if recovery && mapping == DngMapping::Linear {
         maximum
     } else {
@@ -3384,6 +3596,7 @@ unsafe fn apply_highlight_clip_dng_impl(
     } else {
         1.0
     };
+    Ok(())
 }
 
 fn crop_reliability(
@@ -3423,6 +3636,9 @@ fn crop_reliability_view(
     for r in 0..rows {
         cropped.data[r * cols..(r + 1) * cols].copy_from_slice(
             &mask.data[(row + r) * mask.cols + col..(row + r) * mask.cols + col + cols],
+        );
+        cropped.repair_marked[r * cols..(r + 1) * cols].copy_from_slice(
+            &mask.repair_marked[(row + r) * mask.cols + col..(row + r) * mask.cols + col + cols],
         );
     }
     Some(cropped)
@@ -3482,6 +3698,7 @@ pub unsafe extern "C" fn x3f_get_image(
         dng_highlight_recovery: DNG_HIGHLIGHT_RECOVERY.with(|c| c.get()),
         dng_shoulder: DNG_HIGHLIGHT_MAPPING.with(|c| c.get()) == DngMapping::Shoulder,
         cineon: CINEON.with(|c| c.get()),
+        ..ProcessingOptions::default()
     };
     match unsafe {
         get_image_controlled(
@@ -3509,16 +3726,22 @@ pub unsafe extern "C" fn x3f_get_image(
 
 /// Options passed directly to one image processing operation.
 #[derive(Clone, Copy, Default)]
-pub struct ProcessingOptions {
+pub struct ProcessingOptions<'a> {
     pub dng_highlight_recovery: bool,
     pub dng_shoulder: bool,
     pub cineon: bool,
+    /// Camera luminance from the selected DNG calibration; Merrill DNG only.
+    pub dng_recovery_luminance: Option<[f64; 3]>,
+    /// Optional native reliability mask, belonging only to this conversion.
+    pub dng_recovery_mask: Option<&'a std::path::Path>,
 }
 
 /// Encoding metadata belonging to the returned image, never to a worker thread.
 pub struct ProcessingInfo {
     pub highlight_scale: f64,
     pub shoulder_ceiling: f64,
+    /// Sidecar write result. A requested mask must be checked by the caller.
+    pub recovery_mask: Option<std::io::Result<()>>,
 }
 
 /// Owned, active-area, unrotated extended-linear sRGB with as-shot WB and ISO.
@@ -3555,6 +3778,7 @@ pub unsafe fn get_scene_linear_controlled(
     let mut info = ProcessingInfo {
         highlight_scale: 1.0,
         shoulder_ceiling: 1.0,
+        recovery_mask: None,
     };
     let mut output = SceneLinearData::default();
     let result = unsafe {
@@ -3606,7 +3830,7 @@ pub unsafe fn get_image_controlled(
     denoise: libc::c_int,
     apply_sgain: libc::c_int,
     wb: *mut libc::c_char,
-    options: ProcessingOptions,
+    options: ProcessingOptions<'_>,
     control: Control<'_>,
 ) -> crate::Result<ProcessingInfo> {
     control.check()?;
@@ -3616,6 +3840,7 @@ pub unsafe fn get_image_controlled(
     let mut info = ProcessingInfo {
         highlight_scale: 1.0,
         shoulder_ceiling: 1.0,
+        recovery_mask: None,
     };
     let result = unsafe {
         get_image_impl(
@@ -3655,7 +3880,7 @@ unsafe fn get_image_impl(
     denoise: libc::c_int,
     apply_sgain: libc::c_int,
     mut wb: *mut libc::c_char,
-    options: ProcessingOptions,
+    options: ProcessingOptions<'_>,
     control: Control<'_>,
     info: &mut ProcessingInfo,
     linear: Option<&mut SceneLinearData>,
@@ -3667,6 +3892,13 @@ unsafe fn get_image_impl(
         DngMapping::Linear
     };
     let cineon = options.cineon;
+    let recovery_y = options.dng_recovery_luminance.filter(|_| {
+        dng_recovery
+            && encoding == x3f_color_encoding_e_NONE
+            && !cineon
+            && linear.is_none()
+            && unsafe { is_merrill_model(x3f) }
+    });
     if wb.is_null() {
         wb = unsafe { x3f_get_wb(x3f) };
     }
@@ -3732,6 +3964,7 @@ unsafe fn get_image_impl(
             wb,
             &mut il,
             if capture { Some(&mut provenance) } else { None },
+            recovery_y.is_some(),
             control,
         )
     } == 0
@@ -3783,13 +4016,14 @@ unsafe fn get_image_impl(
         let provenance =
             provenance.and_then(|mask| crop_reliability(mask, &original_image, unsafe { &*image }));
         let spatial_gain = linear.is_none() || apply_sgain != 0;
-        unsafe {
+        let result = unsafe {
             apply_highlight_clip_dng_impl(
                 x3f,
                 image,
                 &mut il,
                 wb,
                 provenance,
+                recovery_y,
                 dng_recovery,
                 dng_mapping,
                 already_cropped,
@@ -3797,8 +4031,12 @@ unsafe fn get_image_impl(
                 info,
                 linear,
                 spatial_gain,
+                options.dng_recovery_mask,
             )
         };
+        if unsafe { dng_recovery_status(&mut *image, result) } == 0 {
+            return 0;
+        }
     }
 
     if encoding != x3f_color_encoding_e_NONE
@@ -4164,6 +4402,704 @@ static _A_X3F_GET_PREVIEW: unsafe extern "C" fn(
 mod tests {
     use super::{intermediate_levels, shoulder_compress, INTERMEDIATE_UNIT};
 
+    const MERRILL_PRIOR: [f64; 3] = [0.284206, 0.604436, 1.0];
+    const MERRILL_Y: [f64; 3] = [-2.6575486148565814, 3.313530567081604, -0.2476];
+
+    fn merrill_recovery(pixels: &[[u16; 3]], columns: usize, chroma: bool) -> Vec<[f64; 3]> {
+        use super::*;
+        let mut matrix = [
+            4.45774, -1.90728, 0.581922, -4.22818, 4.30012, -0.701463, 3.1376, -5.81127, 3.31683,
+        ];
+        let mut ctx = recovery_test_context(&MERRILL_PRIOR);
+        ctx.conv_matrix = matrix.as_mut_ptr();
+        ctx.camera_y = Some(MERRILL_Y);
+        ctx.rows = (pixels.len() / columns) as i32;
+        ctx.cols = columns as i32;
+        let data: Vec<_> = pixels.iter().flatten().copied().collect();
+        let mut reliability =
+            SensorReliability::new(ctx.rows as usize, columns, [0.001; 3]).unwrap();
+        for (mask, pixel) in reliability.data.iter_mut().zip(pixels) {
+            *mask = pixel.map(|v| channel_reliability(v as f64 / 10000.0, 0.0, 0.99, 0.04));
+        }
+        let local = LocalRecovery::build(
+            reliability,
+            |r, c| pixels[r * columns + c].map(|v| v as f64 / 10000.0),
+            None,
+        )
+        .unwrap();
+        let gradient = unsafe {
+            gradient_tone::Field::build(&ctx, Some(&local), &data, columns * 3, Control::none())
+        }
+        .unwrap();
+        ctx.gradient = Some(&gradient);
+        let field = chroma.then(|| {
+            unsafe { color_field::Field::build(&ctx, &local, &data, columns * 3, Control::none()) }
+                .unwrap()
+        });
+        ctx.color_field = field.as_ref();
+        pixels
+            .iter()
+            .enumerate()
+            .map(|(i, pixel)| unsafe {
+                dng_evaluate_pixel(
+                    &ctx,
+                    Some(&local),
+                    i / columns,
+                    i % columns,
+                    pixel,
+                    ptr::null_mut(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merrill_color_cancellation_does_not_exceed_encoder_headroom() {
+        use super::*;
+        let pixels = [[100, 5600, 10000]; 256];
+        let color = merrill_recovery(&pixels, 16, true);
+        let tone = merrill_recovery(&pixels, 16, false);
+        for (a, b) in color.iter().zip(&tone) {
+            assert!(a.iter().all(|v| v.is_finite() && *v <= DNG_MAX_HEADROOM));
+            let dy: f64 = (0..3).map(|c| MERRILL_Y[c] * (a[c] - b[c])).sum();
+            assert!(dy.abs() < 1e-10, "color fallback changed brightness");
+        }
+    }
+
+    #[test]
+    fn merrill_recovery_is_continuous_at_half_reliability() {
+        let a = merrill_recovery(&[[9700, 4000, 10000]; 256], 16, true);
+        let b = merrill_recovery(&[[9701, 4000, 10000]; 256], 16, true);
+        assert!(a
+            .iter()
+            .flatten()
+            .zip(b.iter().flatten())
+            .all(|(x, y)| (x - y).abs() < 0.01));
+    }
+
+    #[test]
+    fn merrill_stripes_keep_white_and_colored_highlights_separate() {
+        let rows = 45;
+        for (width, diagonal, transpose) in [
+            (1, false, false),
+            (2, false, true),
+            (4, false, false),
+            (8, false, false),
+            (4, true, false),
+        ] {
+            // Leave room for diagonal bands to reach intact donors in the top
+            // rows. Bands entering through the clipped side have no known hue.
+            let cols = if diagonal { 77 } else { 29 }; // Partial edge cells.
+            let pixels: Vec<[u16; 3]> = (0..rows)
+                .flat_map(|r| {
+                    (0..cols).map(move |c| {
+                        let exposure = 0.65 + 0.02 * r as f64;
+                        let yellow = (c + if diagonal { r } else { 0 }) / width % 2 == 1;
+                        std::array::from_fn(|k| {
+                            let color = if yellow && k < 2 { 1.25 } else { 1.0 };
+                            (10000.0 * (MERRILL_PRIOR[k] * color * exposure).min(1.0)).round()
+                                as u16
+                        })
+                    })
+                })
+                .collect();
+            let out = if transpose {
+                let transposed: Vec<_> = (0..cols)
+                    .flat_map(|c| {
+                        (0..rows).map({
+                            let pixels = &pixels;
+                            move |r| pixels[r * cols + c]
+                        })
+                    })
+                    .collect();
+                let recovered = merrill_recovery(&transposed, rows, true);
+                (0..rows)
+                    .flat_map(|r| {
+                        (0..cols).map({
+                            let recovered = &recovered;
+                            move |c| recovered[c * rows + r]
+                        })
+                    })
+                    .collect()
+            } else {
+                merrill_recovery(&pixels, cols, true)
+            };
+            let tone = merrill_recovery(&pixels, cols, false);
+            for ((source, color), tone) in pixels.iter().zip(&out).zip(tone) {
+                let dy: f64 = (0..3).map(|k| MERRILL_Y[k] * (color[k] - tone[k])).sum();
+                assert!(dy.abs() < 1e-7, "edge refinement changed brightness");
+                if source.iter().all(|v| *v < 9500) {
+                    assert_eq!(*color, source.map(|v| v as f64 / 10000.0));
+                }
+            }
+            let mut white_error = 0.0_f64;
+            let mut yellow_error = 0.0_f64;
+            for r in 30..40 {
+                for c in 0..29 {
+                    let p = out[r * cols + c];
+                    let yellow = (c + if diagonal { r } else { 0 }) / width % 2 == 1;
+                    let expected = if yellow { 1.25_f64.ln() } else { 0.0 };
+                    let error = (p[0] / p[2] / MERRILL_PRIOR[0]).ln() - expected;
+                    if yellow {
+                        yellow_error = yellow_error.max(error.abs());
+                    } else {
+                        white_error = white_error.max(error.abs());
+                    }
+                }
+            }
+            eprintln!("stripe width={width}, diagonal={diagonal}, transpose={transpose}: white error={white_error}, yellow error={yellow_error}");
+            assert!(
+                white_error < 0.025,
+                "borrowed yellow color contaminated white stripes"
+            );
+            assert!(
+                yellow_error < 0.08,
+                "boundary handling erased colored stripes"
+            );
+        }
+    }
+
+    // Minimal context for field construction/export only; not the pixel evaluator.
+    fn recovery_test_context(prior: &[f64; 3]) -> super::DngCtx<'_> {
+        use super::*;
+        DngCtx {
+            sgain: ptr::null_mut(),
+            sgain_num: 0,
+            conv_matrix: ptr::null_mut(),
+            prior: prior.as_ptr(),
+            hp: ptr::null(),
+            clut: ptr::null(),
+            use_clut: false,
+            repair: ptr::null(),
+            use_repair: false,
+            sat_map: ptr::null(),
+            gate_thr: 0.20,
+            gate_width: 0.30,
+            black: [0.0; 3],
+            white: [10000; 3],
+            rows: 1,
+            cols: 1,
+            channels: 3,
+            recovery: true,
+            camera_y: Some([0.0, 1.0, 0.0]),
+            gradient: None,
+            color_field: None,
+        }
+    }
+
+    #[test]
+    fn repair_provenance_follows_cropped_and_full_sensor_views() {
+        use super::*;
+        let mut pixels = [0u16; 4 * 5 * 3];
+        let source = x3f_area16_t {
+            data: pixels.as_mut_ptr(),
+            buf: ptr::null_mut(),
+            rows: 4,
+            columns: 5,
+            channels: 3,
+            row_stride: 15,
+        };
+        let cropped_view = x3f_area16_t {
+            data: unsafe { pixels.as_mut_ptr().add(18) },
+            buf: ptr::null_mut(),
+            rows: 2,
+            columns: 3,
+            channels: 3,
+            row_stride: 15,
+        };
+        let make_mask = || {
+            let mut mask = SensorReliability::new(4, 5, [0.001; 3]).unwrap();
+            mask.repair_marked[0] = true;
+            mask.repair_marked[7] = true;
+            mask.data[8] = [255, 100, 0];
+            mask.camera_map_channels = 4;
+            mask
+        };
+        let cropped = crop_reliability(make_mask(), &source, &cropped_view).unwrap();
+        assert_eq!(
+            cropped.repair_marked,
+            [false, true, false, false, false, false]
+        );
+        assert_eq!(
+            cropped.data,
+            [
+                [255; 3],
+                [255; 3],
+                [255, 100, 0],
+                [255; 3],
+                [255; 3],
+                [255; 3]
+            ]
+        );
+        assert_eq!(cropped.camera_map_channels, 4);
+        assert_eq!(cropped.noise, [0.001; 3]);
+        let full = crop_reliability(make_mask(), &source, &source).unwrap();
+        let expected = make_mask();
+        assert_eq!(full.repair_marked, expected.repair_marked);
+        assert_eq!(full.data, expected.data);
+        assert_eq!(full.camera_map_channels, 4);
+    }
+
+    #[test]
+    fn excluding_repaired_donors_does_not_change_gradient_tone() {
+        use super::*;
+        let prior = [1.0; 3];
+        let mut ctx = recovery_test_context(&prior);
+        ctx.rows = 3;
+        ctx.cols = 3;
+        let make_model = |exclude: bool| {
+            let mut mask = SensorReliability::new(3, 3, [0.001; 3]).unwrap();
+            mask.data.fill([255, 255, 0]);
+            mask.data[0] = [255; 3];
+            mask.repair_marked.fill(exclude);
+            LocalRecovery::build(mask, |_, _| [0.2; 3], None).unwrap()
+        };
+        let before = make_model(false);
+        let after = make_model(true);
+        let data: Vec<u16> = (0..9).flat_map(|i| [2000 + i * 100; 3]).collect();
+        let first =
+            unsafe { gradient_tone::Field::build(&ctx, Some(&before), &data, 9, Control::none()) }
+                .unwrap();
+        let second =
+            unsafe { gradient_tone::Field::build(&ctx, Some(&after), &data, 9, Control::none()) }
+                .unwrap();
+        for r in 0..3 {
+            for c in 0..3 {
+                let measured = [data[(r * 3 + c) * 3] as f64 / 10000.0; 3];
+                let mut a = tone_anchor::recover_severe(
+                    measured,
+                    before.mask(r, c),
+                    prior,
+                    ctx.camera_y.unwrap(),
+                );
+                let mut b = tone_anchor::recover_severe(
+                    measured,
+                    after.mask(r, c),
+                    prior,
+                    ctx.camera_y.unwrap(),
+                );
+                first.apply(r, c, &mut a, measured, prior);
+                second.apply(r, c, &mut b, measured, prior);
+                assert_eq!(a.samples, b.samples);
+                assert_eq!(a.amplitude, b.amplitude);
+                assert_eq!(a.strength, b.strength);
+                assert_eq!(a.available, b.available);
+            }
+        }
+    }
+
+    #[test]
+    fn continuous_color_keeps_tone_healthy_pixels_and_two_pass_results() {
+        use super::*;
+        let prior = [1.0; 3];
+        let matrix = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let mut ctx = recovery_test_context(&prior);
+        ctx.rows = 16;
+        ctx.cols = 24;
+        ctx.conv_matrix = matrix.as_ptr() as *mut _;
+        let stride = ctx.cols as usize * 3 + 6;
+        let mut data = vec![0u16; ctx.rows as usize * stride];
+        let mut mask = SensorReliability::new(16, 24, [0.001; 3]).unwrap();
+        for r in 0..16 {
+            for c in 0..24 {
+                let i = r * stride + c * 3;
+                data[i..i + 3].copy_from_slice(if c < 8 {
+                    &[2300, 5200, 8000]
+                } else {
+                    &[7000, 9500, 10000]
+                });
+                if c >= 8 {
+                    mask.data[r * 24 + c] = [255, 255, 0];
+                }
+            }
+        }
+        let local = LocalRecovery::build(
+            mask,
+            |r, c| std::array::from_fn(|k| data[r * stride + c * 3 + k] as f64 / 10000.0),
+            None,
+        )
+        .unwrap();
+        let gradient = unsafe {
+            gradient_tone::Field::build(&ctx, Some(&local), &data, stride, Control::none())
+        }
+        .unwrap();
+        ctx.gradient = Some(&gradient);
+        let color =
+            unsafe { color_field::Field::build(&ctx, &local, &data, stride, Control::none()) }
+                .unwrap();
+        ctx.color_field = Some(&color);
+        let mut first = Vec::new();
+        let mut changed = 0;
+        for r in 0..16 {
+            for c in 0..24 {
+                let i = r * stride + c * 3;
+                let measured = std::array::from_fn(|k| data[i + k] as f64 / 10000.0);
+                let mut tone = tone_anchor::recover_severe(
+                    measured,
+                    local.mask(r, c),
+                    prior,
+                    ctx.camera_y.unwrap(),
+                );
+                gradient.apply(r, c, &mut tone, measured, prior);
+                let result = unsafe {
+                    dng_evaluate_pixel(&ctx, Some(&local), r, c, &data[i..i + 3], ptr::null_mut())
+                };
+                assert!((result[1] - tone.samples[1]).abs() < 1e-12);
+                if c < 8 {
+                    assert_eq!(result, measured);
+                } else if result != tone.samples {
+                    changed += 1;
+                }
+                first.push(result);
+            }
+        }
+        assert!(changed > 0);
+        // Poison already-encoded neighbors. The second pass may only read its
+        // current source pixel and the immutable fields, never those neighbors.
+        for r in 0..16 {
+            for c in 0..24 {
+                let i = r * stride + c * 3;
+                assert_eq!(first[r * 24 + c], unsafe {
+                    dng_evaluate_pixel(&ctx, Some(&local), r, c, &data[i..i + 3], ptr::null_mut())
+                });
+                data[i..i + 3].fill(u16::MAX);
+            }
+        }
+    }
+
+    #[test]
+    fn gradient_build_reports_missing_evidence_and_invalid_luminance() {
+        use super::*;
+        let prior = [1.0; 3];
+        let mut ctx = recovery_test_context(&prior);
+        let mask = SensorReliability::new(1, 1, [0.001; 3]).unwrap();
+        let model = LocalRecovery::build(mask, |_, _| [0.2; 3], None).unwrap();
+        let build = |ctx: &DngCtx<'_>, model| unsafe {
+            gradient_tone::Field::build(ctx, model, &[2000; 3], 3, Control::none())
+                .err()
+                .map(|error| match error {
+                    crate::Error::InvalidData(message) => message,
+                    error => panic!("unexpected field error: {error}"),
+                })
+        };
+        assert_eq!(
+            build(&ctx, None),
+            Some("gradient tone requires native source reliability")
+        );
+        ctx.camera_y = None;
+        assert_eq!(
+            build(&ctx, Some(&model)),
+            Some("gradient tone requires camera luminance")
+        );
+        for y in [[0.0; 3], [-1.0; 3], [f64::NAN; 3], [f64::INFINITY; 3]] {
+            ctx.camera_y = Some(y);
+            assert_eq!(
+                build(&ctx, Some(&model)),
+                Some("gradient tone requires positive finite neutral luminance")
+            );
+        }
+        ctx.camera_y = Some([0.0, 1.0, 0.0]);
+        assert_eq!(build(&ctx, Some(&model)), None);
+    }
+
+    #[test]
+    fn cancelled_field_stops_before_reading_source_or_calibration() {
+        use super::*;
+        let prior = [1.0; 3];
+        let ctx = recovery_test_context(&prior);
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        assert!(matches!(
+            unsafe { gradient_tone::Field::build(&ctx, None, &[], 0, Control::new(&cancel)) },
+            Err(crate::Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn recovery_failure_clears_the_view_and_releases_only_owned_memory() {
+        use super::*;
+        let mut pixels = [123_u16; 3];
+        let mut image: x3f_area16_t = unsafe { std::mem::zeroed() };
+        image.data = pixels.as_mut_ptr(); // decoder-owned view: buf remains NULL
+        assert_eq!(unsafe { dng_recovery_status(&mut image, Ok(())) }, 1);
+        assert_eq!(image.data, pixels.as_mut_ptr());
+        assert_eq!(
+            unsafe {
+                dng_recovery_status(
+                    &mut image,
+                    Err(crate::Error::InvalidData("test borrowed raster failure")),
+                )
+            },
+            0
+        );
+        assert!(image.buf.is_null() && image.data.is_null());
+        assert_eq!(pixels, [123; 3]);
+
+        let allocation = unsafe { libc::malloc(6) };
+        assert!(!allocation.is_null());
+        image.buf = allocation.cast();
+        image.data = allocation.cast();
+        assert_eq!(unsafe { dng_recovery_status(&mut image, Ok(())) }, 1);
+        assert_eq!(image.buf.cast::<libc::c_void>(), allocation);
+        assert_eq!(
+            unsafe {
+                dng_recovery_status(
+                    &mut image,
+                    Err(crate::Error::InvalidData("test owned raster failure")),
+                )
+            },
+            0
+        );
+        assert!(image.buf.is_null() && image.data.is_null());
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn recovery_logging_obeys_verbosity_and_callback() {
+        use super::*;
+        // Logger configuration is process-global. Isolate it from parallel tests.
+        const CHILD: &str = "X3F_TEST_RECOVERY_LOGGER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::tests::recovery_logging_obeys_verbosity_and_callback",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        static MESSAGES: std::sync::Mutex<Vec<(x3f_verbosity_t, String)>> =
+            std::sync::Mutex::new(Vec::new());
+        unsafe extern "C" fn capture(level: x3f_verbosity_t, message: *const libc::c_char) {
+            let text = unsafe { CStr::from_ptr(message) }.to_str().unwrap();
+            MESSAGES.lock().unwrap().push((level, text.to_owned()));
+        }
+        let prior = [1.0; 3];
+        let ctx = recovery_test_context(&prior);
+        let model = LocalRecovery::build(
+            SensorReliability::new(1, 1, [0.001; 3]).unwrap(),
+            |_, _| [0.2; 3],
+            None,
+        )
+        .unwrap();
+        unsafe {
+            x3f_printf_callback = Some(capture);
+        }
+        for level in [
+            x3f_verbosity_t_ERR,
+            x3f_verbosity_t_INFO,
+            x3f_verbosity_t_DEBUG,
+        ] {
+            unsafe {
+                x3f_printf_level = level;
+            }
+            assert!(unsafe {
+                gradient_tone::Field::build(&ctx, Some(&model), &[2000; 3], 3, Control::none())
+            }
+            .is_ok());
+            let path = std::env::temp_dir().join(format!(
+                "x3f-recovery-log-{}-{level}.pgm",
+                std::process::id()
+            ));
+            recovery_mask::write(&path, &ctx, Some(&model), [0, 0, 1, 1], Control::none()).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"P5\n1 1\n255\n\0");
+            std::fs::remove_file(path).unwrap();
+            report_dng_recovery_error("test logging failure");
+            let mut messages = MESSAGES.lock().unwrap();
+            // Successful field construction and mask export produce no log messages.
+            // Recovery errors reach the embedding callback at every verbosity.
+            assert_eq!(messages.len(), 1);
+            assert_eq!(
+                messages.last().unwrap(),
+                &(
+                    x3f_verbosity_t_ERR,
+                    "DNG recovery failed: test logging failure\n".to_owned()
+                )
+            );
+            messages.clear();
+        }
+        unsafe {
+            x3f_printf_callback = None;
+            x3f_printf_level = x3f_verbosity_t_INFO;
+        }
+    }
+
+    #[test]
+    fn recovery_uses_the_existing_merrill_family_not_a_dp2_gate() {
+        for model in [
+            "SIGMA DP1 Merrill",
+            "SIGMA DP2 Merrill",
+            "SIGMA DP3 Merrill",
+            "SIGMA SD1 Merrill",
+        ] {
+            assert!(super::is_merrill_name(model.as_bytes()));
+        }
+        for model in [
+            "SIGMA DP2",
+            "SIGMA SD14",
+            "SIGMA sd Quattro",
+            "SIGMA sd Quattro H",
+            "",
+        ] {
+            assert!(!super::is_merrill_name(model.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn recovery_calibration_and_mask_are_explicit_per_conversion() {
+        use super::ProcessingOptions;
+        use std::path::Path;
+        let outer = ProcessingOptions {
+            dng_highlight_recovery: true,
+            dng_recovery_luminance: Some([-2.0, 3.0, 0.1]),
+            dng_recovery_mask: Some(Path::new("outer.pgm")),
+            ..ProcessingOptions::default()
+        };
+        let inner = ProcessingOptions {
+            dng_recovery_luminance: Some([-1.0, 2.0, 0.2]),
+            dng_recovery_mask: Some(Path::new("inner.pgm")),
+            ..outer
+        };
+        std::thread::spawn(move || {
+            assert_eq!(inner.dng_recovery_luminance, Some([-1.0, 2.0, 0.2]));
+            assert_eq!(inner.dng_recovery_mask, Some(Path::new("inner.pgm")));
+        })
+        .join()
+        .unwrap();
+        assert_eq!(outer.dng_recovery_luminance, Some([-2.0, 3.0, 0.1]));
+        assert_eq!(outer.dng_recovery_mask, Some(Path::new("outer.pgm")));
+        let disabled = ProcessingOptions::default();
+        assert!(disabled.dng_recovery_luminance.is_none());
+        assert!(disabled.dng_recovery_mask.is_none());
+    }
+
+    fn evaluate_recovery_fixture(
+        pixel: [u16; 3],
+        mask: Option<[u8; 3]>,
+        model_name: &str,
+        recovery: bool,
+    ) -> [f64; 3] {
+        use super::*;
+        use crate::highlight_recovery::SensorReliability;
+        let mut matrix = [2.0, -2.0, 1.0, -1.0, 3.0, -1.0, 3.0, -3.0, 1.0];
+        let prior = [1.0; 3];
+        let hp = highlight_params_t {
+            blending_low: 0.75,
+            blending_high: 1.5,
+            restore_thresh: 1.75,
+            sat_factor: 1.0,
+            chan_thresh: 0.5,
+        };
+        let mut ctx = DngCtx {
+            sgain: ptr::null_mut(),
+            sgain_num: 0,
+            conv_matrix: matrix.as_mut_ptr(),
+            prior: prior.as_ptr(),
+            hp: &hp,
+            clut: ptr::null(),
+            use_clut: false,
+            repair: ptr::null(),
+            use_repair: false,
+            sat_map: ptr::null(),
+            gate_thr: 0.20,
+            gate_width: 0.30,
+            black: [0.0; 3],
+            white: [10000; 3],
+            rows: 1,
+            cols: 1,
+            channels: 3,
+            recovery,
+            camera_y: (recovery && is_merrill_name(model_name.as_bytes()))
+                .then_some([0.0, 1.0, 0.0]),
+            gradient: None,
+            color_field: None,
+        };
+        let model = mask.map(|mask| {
+            let mut reliability = SensorReliability::new(1, 1, [0.001; 3]).unwrap();
+            reliability.data[0] = mask;
+            LocalRecovery::build(reliability, |_, _| [0.2; 3], None).unwrap()
+        });
+        let local = model.as_ref().filter(|_| recovery);
+        let gradient = ctx.camera_y.map(|_| unsafe {
+            gradient_tone::Field::build(&ctx, local, &pixel, 3, Control::none()).unwrap()
+        });
+        ctx.gradient = gradient.as_ref();
+        let first = unsafe { dng_evaluate_pixel(&ctx, local, 0, 0, &pixel, ptr::null_mut()) };
+        let second = unsafe { dng_evaluate_pixel(&ctx, local, 0, 0, &pixel, ptr::null_mut()) };
+        assert_eq!(first, second, "headroom and encoding passes must agree");
+        first
+    }
+
+    #[test]
+    fn merrill_healthy_negative_rgb_bypasses_legacy_stabilization() {
+        for model in [
+            "SIGMA DP1 Merrill",
+            "SIGMA DP2 Merrill",
+            "SIGMA DP3 Merrill",
+            "SIGMA SD1 Merrill",
+        ] {
+            for pixel in [[1000, 2800, 3300], [3000, 8400, 9900]] {
+                let measured = pixel.map(|v| v as f64 / 10000.0);
+                for recovery in [false, true] {
+                    assert_eq!(
+                        evaluate_recovery_fixture(pixel, Some([255; 3]), model, recovery),
+                        measured
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn older_native_sensors_retain_upstream_color_stabilization() {
+        let pixel = [3000, 8400, 9900];
+        let measured = pixel.map(|v| v as f64 / 10000.0);
+        for model in [
+            "SIGMA DP2",
+            "SIGMA SD9",
+            "SIGMA SD10",
+            "SIGMA SD14",
+            "SIGMA SD15",
+        ] {
+            assert_eq!(
+                evaluate_recovery_fixture(pixel, Some([255; 3]), model, false),
+                measured
+            );
+            let result = evaluate_recovery_fixture(pixel, Some([255; 3]), model, true);
+            // Same healthy mask as the Merrill witness, but the author's older
+            // path retains its safeguard for this pathological matrix response.
+            assert_ne!(result, measured);
+            // Exact expected result for this synthetic older-sensor fixture.
+            assert_eq!(
+                result,
+                [0.4730096544303833, 0.4836258312131101, 0.486574769208312]
+            );
+        }
+    }
+
+    #[test]
+    fn quattro_without_native_layer_provenance_uses_existing_path() {
+        // Expanded Quattro B/M are not independent native layer measurements.
+        // This checks routing only, not real-camera reconstruction quality.
+        for model in ["SIGMA sd Quattro", "SIGMA sd Quattro H"] {
+            for recovery in [false, true] {
+                assert_eq!(
+                    evaluate_recovery_fixture([2000; 3], None, model, recovery),
+                    [0.2; 3]
+                );
+            }
+        }
+    }
+
     #[test]
     fn scene_linear_handoff_retains_negative_channels_and_headroom() {
         use super::*;
@@ -4191,6 +5127,9 @@ mod tests {
             cols: 1,
             channels: 3,
             recovery: false,
+            camera_y: None,
+            gradient: None,
+            color_field: None,
         };
         let source = [2100, 600, 0];
         let sensor = unsafe { dng_evaluate_pixel(&ctx, None, 0, 0, &source, ptr::null_mut()) };
@@ -4208,6 +5147,7 @@ mod tests {
         use crate::*;
 
         let render = |mut pattern: [u32; 4]| {
+            let mut marked = [false; 9];
             let mut pixels = [10u16; 3 * 3 * 3];
             pixels[12..15].fill(1000);
             unsafe {
@@ -4237,8 +5177,25 @@ mod tests {
                     channels: 3,
                     row_stride: 9,
                 };
+                super::interpolate_bad_pixels_controlled(
+                    &mut x3f,
+                    &mut image,
+                    3,
+                    crate::Control::none(),
+                    Some(&mut marked),
+                );
+                let recorded = pixels;
+                pixels.fill(10);
+                pixels[12..15].fill(1000);
                 super::interpolate_bad_pixels(&mut x3f, &mut image, 3);
+                assert_eq!(
+                    pixels, recorded,
+                    "recording provenance must not change repair"
+                );
             }
+            let mut expected_marked = [false; 9];
+            expected_marked[4] = pixels[12] == 10;
+            assert_eq!(marked, expected_marked);
             pixels
         };
 

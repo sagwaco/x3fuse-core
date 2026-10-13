@@ -66,6 +66,7 @@ struct Args {
     legacy_offset: Option<i32>,
     matrix_max: Option<u32>,
     dng_highlight_recovery: bool,
+    dng_recovery_mask: bool,
     dng_highlight_mapping: DngHighlightMapping,
     cineon: bool,
     /// Set when the user explicitly passed `-color <space>`. Used to
@@ -99,6 +100,7 @@ impl Default for Args {
             legacy_offset: None,
             matrix_max: None,
             dng_highlight_recovery: false,
+            dng_recovery_mask: false,
             dng_highlight_mapping: DngHighlightMapping::Linear,
             cineon: false,
             color_explicit: false,
@@ -160,6 +162,10 @@ fn usage(progname: &str) -> ! {
          \x20                  BaselineExposure restores default brightness;\n\
          \x20                  readers that ignore it show a darker image.\n\
          \x20                  Default: off (matches the pre-Rust C writer).\n\
+         \x20  -dng-recovery-mask\n\
+         \x20                  Write <input basename>.mask.pgm beside the DNG.\n\
+         \x20                  Requires -dng-highlight-recovery; default off.\n\
+         \x20                  Existing masks are never overwritten.\n\
          \x20  -dng-highlight-mapping <linear|shoulder>\n\
          \x20                  Choose recovered highlight mapping (default:\n\
          \x20                  linear). Requires -dng-highlight-recovery to\n\
@@ -362,6 +368,7 @@ fn parse_args(argv: &[String]) -> Args {
                 args.opcodes_dir = Some(PathBuf::from(v));
             }
             "-dng-highlight-recovery" => args.dng_highlight_recovery = true,
+            "-dng-recovery-mask" => args.dng_recovery_mask = true,
             "-dng-highlight-mapping" => {
                 i += 1;
                 let v = argv
@@ -417,6 +424,31 @@ fn normalize(args: &mut Args) {
 /// usage()-style exit. Kept as a pure function so the unit tests can
 /// exercise it without `process::exit`.
 fn validate_args(args: &Args) -> Result<(), String> {
+    if args.dng_recovery_mask {
+        if args.file_type != FileType::Dng || !args.dng_highlight_recovery || args.cineon {
+            return Err("-dng-recovery-mask requires DNG output and -dng-highlight-recovery, without -cineon".to_string());
+        }
+        let mut destinations = std::collections::HashSet::new();
+        for input in &args.files {
+            let (_, path) = make_paths(input, args.outdir.as_deref(), ".mask.pgm");
+            // Resolve existing parent aliases before workers start. Exclusive
+            // creation remains the final guard against collisions at write time.
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let key = parent
+                .canonicalize()
+                .map(|p| p.join(path.file_name().unwrap()))
+                .unwrap_or_else(|_| path.clone());
+            if !destinations.insert(key) {
+                return Err(format!(
+                    "multiple inputs would write the same recovery mask: {}",
+                    path.display()
+                ));
+            }
+        }
+    }
     if args.cineon && args.file_type != FileType::Tiff {
         return Err(
             "-cineon is only meaningful with -tiff (other formats apply their own gamma/profile)"
@@ -531,6 +563,9 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
         compress: args.compress,
         opcodes_dir: args.opcodes_dir.clone(),
         dng_highlight_recovery: args.dng_highlight_recovery,
+        dng_recovery_mask: args
+            .dng_recovery_mask
+            .then(|| make_paths(infile, args.outdir.as_deref(), ".mask.pgm").1),
         dng_highlight_mapping: args.dng_highlight_mapping,
         cineon: args.cineon,
     };
@@ -637,6 +672,68 @@ mod tests {
         assert!(!a.dng_highlight_recovery);
         assert_eq!(a.dng_highlight_mapping, DngHighlightMapping::Linear);
         assert_eq!(a.files, vec![PathBuf::from("in.X3F")]);
+    }
+
+    #[test]
+    fn mask_export_is_opt_in_and_requires_dng_recovery() {
+        assert!(!Args::default().dng_recovery_mask);
+        for switches in [
+            vec!["-dng-recovery-mask"],
+            vec!["-tiff", "-dng-highlight-recovery", "-dng-recovery-mask"],
+            vec!["-dng-highlight-recovery", "-dng-recovery-mask", "-cineon"],
+        ] {
+            let argv: Vec<String> = std::iter::once("x3f_extract")
+                .chain(switches)
+                .map(str::to_string)
+                .collect();
+            assert!(validate_args(&parse_args(&argv)).is_err());
+        }
+        let argv = [
+            "x3f_extract",
+            "-dng-recovery-mask",
+            "-dng-highlight-recovery",
+            "a.X3F",
+        ];
+        let args = parse_args(&argv.map(str::to_string));
+        assert!(args.dng_recovery_mask);
+        assert!(validate_args(&args).is_ok());
+    }
+
+    #[test]
+    fn mask_batch_rejects_duplicate_output_names() {
+        let argv = [
+            "x3f_extract",
+            "-dng-recovery-mask",
+            "-dng-highlight-recovery",
+            "-o",
+            ".",
+            "a/photo.X3F",
+            "b/photo.X3F",
+        ];
+        assert!(validate_args(&parse_args(&argv.map(str::to_string)))
+            .unwrap_err()
+            .contains("same recovery mask"));
+        let argv = [
+            "x3f_extract",
+            "-dng-recovery-mask",
+            "-dng-highlight-recovery",
+            "photo.X3F",
+            "./photo.X3F",
+        ];
+        assert!(validate_args(&parse_args(&argv.map(str::to_string))).is_err());
+    }
+
+    #[test]
+    fn mask_names_follow_final_output_directory_not_dng_temporary_name() {
+        let input = Path::new("card/photo.X3F");
+        assert_eq!(
+            make_paths(input, None, ".mask.pgm").1,
+            Path::new("card/photo.X3F.mask.pgm")
+        );
+        assert_eq!(
+            make_paths(input, Some(Path::new("out")), ".mask.pgm").1,
+            Path::new("out/photo.X3F.mask.pgm")
+        );
     }
 
     #[test]

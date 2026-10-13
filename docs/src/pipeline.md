@@ -98,8 +98,15 @@ The `convert_data` function is the hot loop. In order:
    → D50 Bradford for ProPhoto).
 
 The DNG path replaces stages 7–9 with highlight handling in sensor BMT
-space. Recovery is opt-in through `-dng-highlight-recovery`. On Merrill
-and older sensors, reliable nearby layer ratios propose reconstruction of
+space. Recovery is opt-in through `-dng-highlight-recovery`.
+
+On Merrill, recovery estimates brightness for each affected pixel, refines
+brightness detail using neighboring measurements within each sensor layer,
+and adds color from nearby reliable pixels. Fully reliable pixels remain
+unchanged by reconstruction. The camera model selects this method. See
+[DNG highlight recovery](./highlight-recovery.md) for the stages and limits.
+
+On older sensors, reliable nearby layer ratios propose reconstruction of
 one or two clipped layers. Local proposals must also agree with the
 established reconstruction's rendered chroma after both BMT vectors pass
 through the color matrix. Donor confidence alone cannot justify a large
@@ -112,14 +119,18 @@ pixels cannot supply missing texture themselves.
 Nominal channel headroom alone does not guarantee trustworthy Foveon color:
 the overlapping BMT responses are not independent display RGB channels.
 Even a near-clipped sample below its saturation threshold can produce
-severe opposing channel contributions in the color matrix. A matrix-aware
-highlight safeguard therefore checks the coherent BMT vector after local
+severe opposing channel contributions in the color matrix. On older sensors,
+a matrix-aware highlight safeguard checks the coherent BMT vector after local
 reconstruction, including near-clipped samples. Pathological vectors are
 projected onto a neutral ray, with amplitude estimated from smoothly
 weighted surviving layers rather than the clipped maximum. This preserves
 available brightness variation while suppressing green/magenta highlight
 artifacts. It can change nominally unclipped layers inside those
 pathological highlights; normal valid unclipped areas retain their samples.
+
+The `-dng-recovery-mask` option exports a separate mask of unreliable source
+measurements when recovery is enabled. It does not change the DNG output.
+See [recovery masks](./recovery-mask.md) for geometry and failure handling.
 
 Recovered values and spatial gain stay in floating point until the final
 shared 16-bit encoding. The new `-dng-highlight-mapping linear|shoulder`

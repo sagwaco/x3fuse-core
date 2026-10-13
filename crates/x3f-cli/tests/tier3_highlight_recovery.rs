@@ -24,6 +24,30 @@ fn dp2m0981_retains_linear_highlight_detail() {
 }
 
 #[test]
+fn merrill_chroma_override_disables_color_reconstruction() {
+    let input = skip_if_missing!("DP2M0981.X3F");
+    let normal = read_raw(&extract(&input, &["-dng-highlight-recovery"]));
+    let disabled = read_raw(&extract_with_env(
+        &input,
+        &["-dng-highlight-recovery"],
+        &[("X3F_NO_CHROMA_LUT", "1")],
+    ));
+    assert_eq!(
+        (normal.width, normal.height),
+        (disabled.width, disabled.height)
+    );
+    assert!(
+        normal.pixels != disabled.pixels,
+        "chroma override was ignored"
+    );
+    assert!(disabled.baseline_exposure.is_finite());
+    // The diagnostic override must not enable recovery by itself.
+    let off = extract(&input, &[]);
+    let off_disabled = extract_with_env(&input, &[], &[("X3F_NO_CHROMA_LUT", "1")]);
+    assert_eq!(fs::read(off).unwrap(), fs::read(off_disabled).unwrap());
+}
+
+#[test]
 fn mapping_selection_does_not_enable_recovery() {
     for name in ["sigma_sd1_merrill_15.x3f", "_SDI8040.X3F", "_SDI8284.X3F"] {
         let Some(input) = common::find_input(name) else {
@@ -139,6 +163,10 @@ fn check_recovered_mapping(input: &Path) {
 /// Give every run an independent scratch directory and remove inherited
 /// research tunables from the child, without mutating this test's environment.
 fn extract(input: &Path, switches: &[&str]) -> PathBuf {
+    extract_with_env(input, switches, &[])
+}
+
+fn extract_with_env(input: &Path, switches: &[&str], env: &[(&str, &str)]) -> PathBuf {
     static RUN: AtomicUsize = AtomicUsize::new(0);
     let scratch = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "highlight-recovery-{}-{}",
@@ -155,6 +183,7 @@ fn extract(input: &Path, switches: &[&str]) -> PathBuf {
         }
     }
     let result = cmd
+        .envs(env.iter().copied())
         .args(["-dng", "-no-denoise"])
         .args(switches)
         .arg(&staged)

@@ -243,6 +243,17 @@ When highlight-recovery research lands, expect the tight bounds to
 loosen for affected images. Document the loosening in the commit
 message; don't quietly bump the threshold to the new max.
 
+Merrill DNG recovery uses separate brightness and color reconstruction.
+See [DNG highlight recovery](./highlight-recovery.md) for the stages and limits.
+Check that reconstruction leaves fully reliable pixels unchanged, unsupported
+pixels keep their tone anchors, and adding color preserves the chosen brightness.
+Check solver failures as errors, not a switch to another reconstruction method.
+These checks precede shared output scaling and 16-bit encoding.
+
+For [recovery masks](./recovery-mask.md), check native dimensions, pixel values,
+source association, and export failures. Requesting a mask must not change DNG
+output. A mask marks unreliable source measurements, not changed output pixels.
+
 The highlight mapping tests in
 [`tier3_highlight_recovery.rs`](../../crates/x3f-cli/tests/tier3_highlight_recovery.rs)
 decode the **raw SubIFD**, not the IFD0 preview. They check recovered
@@ -277,7 +288,89 @@ manual baseline table from guesses or from recovery-enabled runs: measure
 the exact documented recovery-off commands, and record intentional changes
 separately from stale historical file hashes.
 
-Include matrix-pathology cases in highlight validation. Foveon layers can
+The PR #23 follow-up guards color directions against nearly cancelled camera
+luminance, blends invalid tone anchors continuously at the severe-recovery
+threshold, restores `X3F_NO_CHROMA_LUT`, and refines color at native signal edges.
+Synthetic tests cover white/yellow stripes from one to eight pixels wide,
+horizontal and diagonal boundaries, partial grid cells, unchanged reliable
+pixels, and brightness preservation. The exp-10 follow-up adds smoothed layer/ratio guides and hysteresis to the
+native signal check, with local boundary refinement for fine structures.
+`_P2M0170.X3F`, `CLIPPED_IMAGE_MERRILL.X3F`, and `DP2M0981.X3F` were used for
+visual comparisons with denoising disabled. The user selected exp-10 after
+comparing edges alone, confidence fallback, and their combination. Those renders
+establish a preference on these images, not ground-truth recovery accuracy.
+
+Measured recovery-enabled baseline with `-dng -no-denoise -dng-highlight-recovery`
+(default linear mapping, no `X3F_*` research overrides):
+
+| Input | PR #23 (`c476a26`) MD5 | Initial follow-up (`1f95c4e`) MD5 | Exp-10 MD5 |
+| --- | --- | --- | --- |
+| `DP2M0981.X3F` | `47f35ba23b24ad78515557b8ddd491f7` | `e2184832f462cb4a196c54799b844b27` | `2fe08ce1849dfea71fba855c6f25a7ba` |
+
+The Rust exp-10 edge maps match the independent Python/SciPy prototype exactly
+on all 16,084,992 pixels of each of the three supplied RAWs. With `-compress`
+added to the command above, the resulting DNGs also match the original prototype
+outputs byte for byte (before an editor adds metadata):
+
+| Input | Exp-10 compressed DNG MD5 |
+| --- | --- |
+| `_P2M0170.X3F` | `8cf22d4868aa3e8dc7829155db17d9e9` |
+| `CLIPPED_IMAGE_MERRILL.X3F` | `ca381d3cfdc21d5e1d0a9a2d3d4c60cf` |
+| `DP2M0981.X3F` | `f2cfa4bc3053fa6f426b9b5a6b10e478` |
+
+The output-neutral memory/DRY cleanup retained all three reference edge maps
+and DNG files byte for byte before the intentional algorithm fixes. The final
+variant retains native strong edges, localizes overlapping guides on fine
+structures, and shares the color fit's cubic signal-trust taper. These are
+intentional algorithm changes; the exp-10 hashes above remain historical
+references rather than expected final output.
+
+The existing `merrill_stripes_keep_white_and_colored_highlights_separate` test
+is unchanged and now passes all five cases, including one-pixel, transposed and
+diagonal stripes. Added checks cover noisy evidence above the threshold floor,
+partial clipping at donor transitions, narrow/border geometry, and guide
+hysteresis. These tests do not establish ground-truth accuracy on the real RAWs.
+
+Broader donor expansion and global barrier-thinning experiments were rejected:
+they recovered extra yellow in the sample but also increased yellow in white
+areas. The hybrid field's donor-loss limitation remains documented in
+[highlight recovery](./highlight-recovery.md); the implementation does not
+silently replace it with an unvalidated full-resolution donor search.
+
+Final review-fix baselines (default linear mapping, no research overrides):
+
+| Input | `-no-denoise -compress` DNG MD5 | Default denoise, `-compress` DNG MD5 |
+| --- | --- | --- |
+| `_P2M0170.X3F` | `703d6c52d17af705cd229e3e85e2436c` | `3fc47bfc08889a6f1ad3589e142b4496` |
+| `CLIPPED_IMAGE_MERRILL.X3F` | `5f722a21929791e14343ca51ed336550` | `0dc184fefdf7ae52b9eea16a918a5f40` |
+| `DP2M0981.X3F` | `6e513d0463fac0817ebddc3b9eaf5acb` | `dc87f2bf2b21b637f8e1f58c1129c0dd` |
+
+The final no-denoise **uncompressed** `DP2M0981.X3F` DNG MD5 is
+`a55ee8fc95345a5f34cb7518699ada8a`.
+
+All commands include `-dng -dng-highlight-recovery`. Denoise hashes record the
+local CPU run, not a cross-platform byte-parity contract. Default denoising
+exposed recursive-residual drift in the color solver. Restarting from its true
+residual fixes that failure without relaxing the tolerance or iteration cap;
+the three no-denoise DNGs stay byte-identical before/after that solver fix.
+
+On these 16 Mpx files, no-denoise peak RSS fell from 1.54–1.66 GB for the reviewed
+port to 0.90–1.02 GB. Individual conversion times were 5.3–10.0 seconds versus
+5.5–10.5 seconds previously; these are local observations, not performance
+budgets. The no-denoise striped crop's fixed proxy masks retain about 86.5% of the original
+yellow signal and 6.8% of the original positive yellow signal in white-like
+pixels, versus 86.3% and 6.9% for exp-10. These proxies measure that crop only;
+they are not material labels or ground-truth color accuracy.
+
+The current run has the three Merrill fixtures above; other named camera corpus
+fixtures are skipped when absent. Recovery-off `DP2M0981.X3F` DNG/TIFF bytes still
+match the pre-change binaries. The existing recovery-off table is not repinned.
+Earlier PR follow-up checks with the local
+`DP2M0981.X3F` and `DP0Q0010.X3F` fixtures, recovery-off DNG and TIFF bytes match
+main (`00d326f`), as does recovery-enabled Quattro DNG. The three manual reference
+files above were unavailable; their hashes were not inferred from these fixtures.
+
+Include matrix-pathology cases when validating older sensors. Foveon layers can
 retain nominal headroom while their combined color projection is already
 unreliable, so a hard-clipping mask alone is insufficient. Exercise
 near-clipped BMT vectors with severe color-matrix cancellation as well as
