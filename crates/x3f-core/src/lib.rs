@@ -35,7 +35,7 @@ use std::ptr::NonNull;
 
 use thiserror::Error;
 use x3f_sys as sys;
-pub use x3f_sys::DenoiseBackend;
+pub use x3f_sys::{ColorMode, DenoiseBackend};
 // Shadow the external libc crate with x3f-sys's compat shim. On every
 // target except wasm32-unknown-unknown this is `pub use libc::*;`; on
 // wasm32 it provides Rust-native equivalents for the few libc symbols
@@ -120,6 +120,14 @@ impl DngHighlightMapping {
 pub struct ProcessOptions {
     /// Target color space / processing mode for the output.
     pub color_encoding: ColorEncoding,
+    /// Camera color mode for this conversion. None preserves the existing output.
+    /// TIFF and get_image apply the mode to RGB pixels. DNG embeds selectable
+    /// profiles and uses this mode as the default without changing raw samples.
+    /// DNG looks approximate native rendering at the export white balance.
+    /// Later white-balance edits can differ from SPP.
+    /// PPM, histogram and embedded JPEG exports do not accept this option.
+    /// AsShot uses the recorded camera mode at normal strength.
+    pub color_mode: Option<ColorMode>,
     /// Crop to the active sensor area (default: true).
     pub crop: bool,
     /// Run bad-pixel interpolation (default: true).
@@ -210,6 +218,7 @@ impl Default for ProcessOptions {
     fn default() -> Self {
         Self {
             color_encoding: ColorEncoding::default(),
+            color_mode: None,
             crop: true,
             fix_bad: true,
             apply_sgain: None,
@@ -512,6 +521,15 @@ impl Reader {
         self.load_directory_entry(de)
     }
 
+    /// Load camera metadata and return the valid named color modes for this file.
+    /// This does not decode raw pixels or include AsShot as a separate mode.
+    pub fn available_color_modes(&mut self) -> Result<Vec<ColorMode>, Error> {
+        self.load_camf()?;
+        self.load_property_list()?;
+        // SAFETY: this reader owns the loaded metadata for the whole call.
+        unsafe { sys::available_color_modes(self.x3f.as_ptr()) }.map_err(Into::into)
+    }
+
     /// Load and decode the RAW image data.
     pub fn load_raw(&mut self) -> Result<(), Error> {
         // SAFETY: self.x3f is valid.
@@ -619,6 +637,11 @@ impl Reader {
         opts: &ProcessOptions,
         binary: bool,
     ) -> Result<(), Error> {
+        if opts.color_mode.is_some() {
+            return Err(Error::InvalidData(
+                "camera color modes require color TIFF or DNG output".into(),
+            ));
+        }
         let out = out.as_ref();
         let image = self.get_image(opts)?;
         output::ppm::write(&image, out, binary).map_err(|source| Error::Io {
@@ -635,6 +658,11 @@ impl Reader {
         opts: &ProcessOptions,
         log_exposure: bool,
     ) -> Result<(), Error> {
+        if opts.color_mode.is_some() {
+            return Err(Error::InvalidData(
+                "camera color modes require color TIFF or DNG output".into(),
+            ));
+        }
         if opts.spp_denoise && opts.cineon {
             return Err(Error::InvalidData(
                 "SPP denoise requires color output without Cineon".into(),

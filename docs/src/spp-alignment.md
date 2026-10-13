@@ -10,8 +10,20 @@ tests. The library SHA-256 is
 Ordinary Merrill sRGB, Adobe RGB and ProPhoto RGB rendering uses the recovered
 calibration and output stages. The explicit `-spp-pipeline` option also uses the
 ordered float front end and the native bilateral/residual denoise sequence.
-The default renderer, DNG, scene-linear, Cineon and Quattro paths retain their
-existing processing. DNG's embedded preview retains its existing calibration.
+Without `-color-mode`, the default renderer, DNG, scene-linear, Cineon and
+Quattro paths retain their existing processing. DNG's embedded preview retains
+its existing calibration.
+
+The separate Color Modes development path adds named Merrill and dp Quattro
+looks for TIFF and embedded DNG profiles. Its new native tone evidence corrects
+the earlier domain gamma assumptions: Merrill uses 1/2.2, Quattro 1/2.2222,
+and final inverse-sRGB normalization uses 2.4 separately. Sigma HP correction
+is OFF for this baseline. The native tone oracle passes, but full SPP image
+parity remains unverified. Lightroom ignored the initial RGBTables looks.
+The replacement classic controls pass for cast, exposure, look tables and long
+tone curves. The final Merrill and dp Quattro files also pass the combined
+Lightroom 9.5.1 Local check. SPP image and WB/ISO parity remain open. See the
+[Color Modes implementation status](../COLOR-MODES-PLAN.md).
 
 Scene-derived chroma-LUT recovery remains selectable through `-chroma-lut` /
 `-no-chroma-lut`, or `ProcessOptions::rgb_chroma_lut`. The per-conversion choice

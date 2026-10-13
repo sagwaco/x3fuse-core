@@ -1229,7 +1229,7 @@ unsafe fn is_merrill_model(x3f: *mut x3f_t) -> bool {
     )
 }
 
-unsafe fn merrill_count_scale(x3f: *mut x3f_t) -> Option<f64> {
+pub(crate) unsafe fn merrill_count_scale(x3f: *mut x3f_t) -> Option<f64> {
     // X3F 4+ stores a process version; model alone cannot select its gain.
     if !matches!(unsafe { (*x3f).header.version }, 0x0002_0003 | 0x0003_0000) {
         return None;
@@ -3170,6 +3170,249 @@ unsafe fn merrill_wb_gain(x3f: *mut x3f_t, wb: *mut libc::c_char) -> Option<[f64
     }))
 }
 
+pub(crate) unsafe fn color_mode_base_calibration(
+    x3f: *mut x3f_t,
+    mut wb: *mut libc::c_char,
+    sensor: crate::ColorModeSensor,
+) -> crate::Result<([f64; 9], [f64; 3], f64)> {
+    let invalid =
+        || crate::Error::InvalidData("missing or invalid native color mode WB/ISO calibration");
+    if wb.is_null() {
+        wb = unsafe { x3f_get_wb(x3f) };
+    }
+    let mut cc = [0.0; 9];
+    let mut found = unsafe {
+        x3f_get_camf_matrix_for_wb(
+            x3f,
+            c"WhiteBalanceColorCorrections".as_ptr().cast_mut(),
+            wb,
+            3,
+            3,
+            cc.as_mut_ptr(),
+        )
+    };
+    if found == 0 && !wb.is_null() && unsafe { CStr::from_ptr(wb) } == c"Sunlight" {
+        wb = c"Daylight".as_ptr().cast_mut();
+        found = unsafe {
+            x3f_get_camf_matrix_for_wb(
+                x3f,
+                c"WhiteBalanceColorCorrections".as_ptr().cast_mut(),
+                wb,
+                3,
+                3,
+                cc.as_mut_ptr(),
+            )
+        };
+    }
+    if found == 0 || !crate::color_modes::valid_matrix(&cc) {
+        return Err(invalid());
+    }
+    let (gain, iso) = match sensor {
+        crate::ColorModeSensor::Merrill => (
+            unsafe { merrill_wb_gain(x3f, wb) }.ok_or_else(invalid)?,
+            unsafe { merrill_iso_gain(x3f) }.ok_or_else(invalid)?,
+        ),
+        crate::ColorModeSensor::Quattro => {
+            let mut gain = [0.0; 3];
+            if unsafe {
+                x3f_get_camf_matrix_for_wb(
+                    x3f,
+                    c"WhiteBalanceGains".as_ptr().cast_mut(),
+                    wb,
+                    3,
+                    0,
+                    gain.as_mut_ptr(),
+                )
+            } == 0
+                || gain.iter().any(|v| !v.is_finite() || *v <= 0.0)
+            {
+                return Err(invalid());
+            }
+            // GatherParams normalizes the unadjusted WB gains by their minimum.
+            let minimum = gain.into_iter().fold(f64::INFINITY, f64::min);
+            let mut temperature = [1.0; 3];
+            unsafe {
+                x3f_get_camf_float_vector(
+                    x3f,
+                    c"TempGainFact".as_ptr().cast_mut(),
+                    temperature.as_mut_ptr(),
+                );
+            }
+            let temperature = merrill_temperature_gain(temperature);
+            let mut camera = 0;
+            unsafe {
+                x3f_get_camf_unsigned(x3f, c"CAMERAID".as_ptr().cast_mut(), &mut camera);
+            }
+            let mut adjustment = [1.0; 3];
+            if camera == X3F_CAMERAID_SDQ {
+                unsafe {
+                    x3f_get_camf_float_vector(
+                        x3f,
+                        c"SensorAdjustmentGainFact_HI".as_ptr().cast_mut(),
+                        adjustment.as_mut_ptr(),
+                    );
+                }
+            } else {
+                let mut version = [0_u32; 3];
+                if unsafe {
+                    x3f_get_camf_matrix(
+                        x3f,
+                        c"CamsysVersion".as_ptr().cast_mut(),
+                        3,
+                        0,
+                        0,
+                        matrix_type_t_M_UINT,
+                        version.as_mut_ptr().cast(),
+                    )
+                } == 0
+                {
+                    return Err(crate::Error::InvalidData(
+                        "missing Quattro CamsysVersion calibration",
+                    ));
+                }
+                let version = u64::from(version[0]) * 1_000_000
+                    + u64::from(version[1]) * 1_000
+                    + u64::from(version[2]);
+                if version <= 1999 {
+                    unsafe {
+                        x3f_get_camf_float_vector(
+                            x3f,
+                            c"SensorAdjustmentGainFact".as_ptr().cast_mut(),
+                            adjustment.as_mut_ptr(),
+                        );
+                    }
+                }
+            }
+            let gain =
+                std::array::from_fn(|c| (temperature[c] * adjustment[c]) * (gain[c] / minimum));
+            let (mut capture, mut range) = (0.0, 0);
+            unsafe {
+                x3f_get_camf_float(x3f, c"CaptureISO".as_ptr().cast_mut(), &mut capture);
+                x3f_get_camf_unsigned(x3f, c"ISOrange".as_ptr().cast_mut(), &mut range);
+            }
+            let iso = merrill_render_iso_gain(capture, 100.0, 0, range).ok_or_else(invalid)?;
+            (gain, iso)
+        }
+    };
+    if gain.iter().any(|v| !v.is_finite() || *v <= 0.0) || !iso.is_finite() || iso <= 0.0 {
+        return Err(invalid());
+    }
+    Ok((cc, gain, iso))
+}
+
+/// Capture calibration before image processing consumes or changes RAW samples.
+/// # Safety
+/// `x3f` must own loaded CAMF and unprocessed RAW, with optional PROP.
+/// `wb` must be null or point to a NUL-terminated name. JPEG is loaded as needed.
+pub unsafe fn color_mode_calibration(
+    x3f: *mut x3f_t,
+    wb: *mut libc::c_char,
+    control: Control<'_>,
+) -> crate::Result<crate::ColorModeCalibration> {
+    control.check()?;
+    let sensor = unsafe { crate::color_modes::sensor(x3f) }?;
+    let (sensor_to_srgb, wb_gain, iso_gain) =
+        unsafe { color_mode_base_calibration(x3f, wb, sensor) }?;
+    let mut raw = x3f_area16_t::default();
+    let mut top = x3f_area16_t::default();
+    if unsafe { x3f_image_area(x3f, &mut raw) } == 0 || raw.data.is_null() {
+        return Err(crate::Error::InvalidData(
+            "color mode calibration requires unprocessed RAW samples",
+        ));
+    }
+    let mut black = [0.0; 3];
+    let mut deviation = [0.0; 3];
+    let quattro = sensor == crate::ColorModeSensor::Quattro;
+    if unsafe {
+        get_black_level(
+            x3f,
+            &mut raw,
+            1,
+            if quattro { 2 } else { 3 },
+            black.as_mut_ptr(),
+            deviation.as_mut_ptr(),
+        )
+    } == 0
+        || (quattro
+            && (unsafe { x3f_image_area_qtop(x3f, &mut top) } == 0
+                || unsafe {
+                    get_black_level(
+                        x3f,
+                        &mut top,
+                        0,
+                        1,
+                        black.as_mut_ptr().add(2),
+                        deviation.as_mut_ptr().add(2),
+                    )
+                } == 0))
+    {
+        return Err(crate::Error::InvalidData(
+            "missing color mode black calibration",
+        ));
+    }
+    let mut maximum = [0; 3];
+    if unsafe { x3f_get_max_raw(x3f, maximum.as_mut_ptr()) } == 0 {
+        return Err(crate::Error::InvalidData("missing color mode sensor range"));
+    }
+    let (count_scale, native_black) = if sensor == crate::ColorModeSensor::Merrill {
+        let mut shield = x3f_area16_t::default();
+        if unsafe {
+            x3f_crop_area_camf(
+                x3f,
+                c"DarkShieldTop".as_ptr().cast_mut(),
+                &mut raw,
+                1,
+                &mut shield,
+            )
+        } == 0
+        {
+            return Err(crate::Error::InvalidData(
+                "missing Merrill trimmed-black calibration",
+            ));
+        }
+        (unsafe { merrill_count_scale(x3f) }.unwrap(), unsafe {
+            merrill_trimmed_black(&shield, control)
+        }?)
+    } else {
+        (1.0, black)
+    };
+    let normalized_to_counts =
+        std::array::from_fn(|c| count_scale * (f64::from(maximum[c]) - black[c]));
+    let count_offset = std::array::from_fn(|c| count_scale * (black[c] - native_black[c]));
+    if normalized_to_counts
+        .iter()
+        .any(|v| !v.is_finite() || *v <= 0.0)
+        || count_offset.iter().any(|v| !v.is_finite())
+    {
+        return Err(crate::Error::InvalidData(
+            "invalid color mode sensor count range",
+        ));
+    }
+    let exif = unsafe { merrill_exif(x3f, control) }?;
+    let source = exif.color_space.ok_or(crate::Error::InvalidData(
+        "missing color mode EXIF source color space",
+    ))?;
+    let output_to_srgb = color_mode_output_matrix(sensor, x3f_color_encoding_e_SRGB, source)
+        .ok_or(crate::Error::InvalidData(
+            "unsupported color mode EXIF source color space",
+        ))?;
+    let color_dq = if sensor == crate::ColorModeSensor::Merrill {
+        Some(unsafe { merrill_color_dq(x3f) }?)
+    } else {
+        None
+    };
+    control.check()?;
+    Ok(crate::ColorModeCalibration {
+        sensor_to_srgb,
+        wb_gain,
+        normalized_to_counts,
+        count_offset,
+        iso_gain,
+        output_to_srgb,
+        color_dq,
+    })
+}
+
 fn merrill_render_matrix(
     encoding: x3f_color_encoding_t,
     mut cc: [f64; 9],
@@ -3226,12 +3469,16 @@ unsafe fn get_render_conv_controlled(
     lut: *mut f64,
     conv_matrix: *mut f64,
     cineon: bool,
+    resolved: Option<&crate::ColorModeParameters>,
 ) -> libc::c_int {
     let mut selected_wb = wb;
     let mut native_matrix = None;
     if !cineon && unsafe { is_merrill_model(x3f) } {
         let mode = unsafe { (*x3f).header.color_mode.map(|byte| byte as u8) };
-        if let Some(mode) = merrill_render_color_mode(&mode) {
+        if let Some(mode) = resolved
+            .map(|p| p.mode.key())
+            .or_else(|| merrill_render_color_mode(&mode))
+        {
             let mut cc = [0.0; 9];
             let mut found = unsafe {
                 x3f_get_camf_matrix_for_wb(
@@ -3281,7 +3528,9 @@ unsafe fn get_render_conv_controlled(
                 native_matrix = merrill_render_matrix(
                     encoding,
                     cc,
-                    has_compensation.then_some(compensation),
+                    resolved.map_or(has_compensation.then_some(compensation), |p| {
+                        p.creative_matrix
+                    }),
                     gain,
                     iso,
                 );
@@ -3464,6 +3713,67 @@ struct MerrillRender {
     luts: crate::merrill::RenderLuts,
 }
 
+struct QuattroColorModeRender {
+    matrix: [f64; 9],
+    recovery_matrix: [f64; 9],
+    luts: crate::merrill::RenderLuts,
+}
+
+impl QuattroColorModeRender {
+    fn new(
+        calibration: &crate::ColorModeCalibration,
+        params: &crate::ColorModeParameters,
+        luts: crate::merrill::RenderLuts,
+    ) -> crate::Result<Self> {
+        let (matrix, _) = calibration.render_matrix(params);
+        let mut physical = *params;
+        physical.creative_matrix = None;
+        let (physical_matrix, _) = calibration.render_matrix(&physical);
+        // Quattro recovery uses physical calibration before the selected look.
+        let recovery_matrix = physical_matrix.map(|v| v / params.pixel_saturation);
+        if matrix
+            .iter()
+            .chain(&recovery_matrix)
+            .any(|v| !v.is_finite())
+        {
+            return Err(crate::Error::InvalidData(
+                "invalid Quattro count calibration",
+            ));
+        }
+        Ok(Self {
+            matrix,
+            recovery_matrix,
+            luts,
+        })
+    }
+
+    fn render(&self, input: [f64; 3]) -> [u16; 3] {
+        let indices = mat3x1_mul_native(&self.matrix, input)
+            .map(|v| crate::color_mode_tone_index(crate::ColorModeSensor::Quattro, v));
+        // shortcut: use the native ordinary restore bounds with neutral residual
+        // gain until the native spatial filters replace the existing NLM path.
+        self.luts.render_indices(indices)
+    }
+}
+
+unsafe fn make_quattro_color_mode_render(
+    x3f: *mut x3f_t,
+    wb: *mut libc::c_char,
+    encoding: x3f_color_encoding_t,
+    params: &crate::ColorModeParameters,
+    control: Control<'_>,
+) -> crate::Result<QuattroColorModeRender> {
+    let calibration = unsafe { color_mode_calibration(x3f, wb, control) }?;
+    let exif = unsafe { merrill_exif(x3f, control) }?;
+    let luts =
+        unsafe { make_color_mode_render_luts(x3f, encoding, &exif, false, Some(params), control) }?;
+    QuattroColorModeRender::new(&calibration, params, luts)
+}
+
+fn recovery_conv_matrix(legacy: [f64; 9], quattro: Option<&QuattroColorModeRender>) -> [f64; 9] {
+    quattro.map_or(legacy, |render| render.recovery_matrix)
+}
+
 impl MerrillRender {
     fn render(&self, input: [f64; 3]) -> [u16; 3] {
         let output = std::array::from_fn(|c| {
@@ -3477,7 +3787,7 @@ impl MerrillRender {
     }
 }
 
-unsafe fn merrill_color_dq(x3f: *mut x3f_t) -> crate::Result<crate::merrill::ColorDq> {
+pub(crate) unsafe fn merrill_color_dq(x3f: *mut x3f_t) -> crate::Result<crate::merrill::ColorDq> {
     use crate::merrill::{color_dq_noise_scale, ColorDq};
     let mut skip = 0;
     unsafe {
@@ -3550,6 +3860,7 @@ unsafe fn make_merrill_render(
     encoding: x3f_color_encoding_t,
     apply_sgain: bool,
     control: Control<'_>,
+    resolved: Option<&crate::ColorModeParameters>,
 ) -> crate::Result<MerrillRender> {
     control.check()?;
     let mut raw: x3f_area16_t = unsafe { std::mem::zeroed() };
@@ -3599,6 +3910,7 @@ unsafe fn make_merrill_render(
             unused_gamma.as_mut_ptr(),
             matrix.as_mut_ptr(),
             false,
+            resolved,
         )
     } == 0
     {
@@ -3618,7 +3930,8 @@ unsafe fn make_merrill_render(
             "invalid Merrill count calibration",
         ));
     }
-    let luts = unsafe { make_merrill_render_luts(x3f, encoding, &exif, false, control) }?;
+    let luts =
+        unsafe { make_color_mode_render_luts(x3f, encoding, &exif, false, resolved, control) }?;
     Ok(MerrillRender {
         black,
         spatial,
@@ -3626,6 +3939,42 @@ unsafe fn make_merrill_render(
         color_dq,
         luts,
     })
+}
+
+unsafe fn make_color_mode_render_luts(
+    x3f: *mut x3f_t,
+    encoding: x3f_color_encoding_t,
+    exif: &crate::jpeg_exif::JpegExif,
+    spp: bool,
+    resolved: Option<&crate::ColorModeParameters>,
+    control: Control<'_>,
+) -> crate::Result<crate::merrill::RenderLuts> {
+    let Some(params) = resolved else {
+        return unsafe { make_merrill_render_luts(x3f, encoding, exif, spp, control) };
+    };
+    let source = exif.color_space.ok_or(crate::Error::InvalidData(
+        "missing color mode EXIF source color space",
+    ))?;
+    let target = color_mode_output_matrix(params.sensor, encoding, source).ok_or(
+        crate::Error::InvalidData("unsupported color mode output encoding"),
+    )?;
+    let native_target = match encoding {
+        x3f_color_encoding_e_SRGB => 2,
+        x3f_color_encoding_e_ARGB => 3,
+        x3f_color_encoding_e_PPRGB => 11,
+        _ => {
+            return Err(crate::Error::InvalidData(
+                "color modes require a rendered color encoding",
+            ))
+        }
+    };
+    crate::merrill::RenderLuts::from_color_mode(
+        params,
+        env_atof("X3F_EV").unwrap_or(0.0),
+        target,
+        native_target,
+        control,
+    )
 }
 
 unsafe fn make_merrill_render_luts(
@@ -3780,7 +4129,7 @@ fn merrill_prop_aperture(value: &str) -> Option<(u32, u32)> {
     }
 }
 
-unsafe fn merrill_exif(
+pub(crate) unsafe fn merrill_exif(
     x3f: *mut x3f_t,
     control: Control<'_>,
 ) -> crate::Result<crate::jpeg_exif::JpegExif> {
@@ -3836,6 +4185,23 @@ fn merrill_output_matrix(
     }))
 }
 
+fn color_mode_output_matrix(
+    sensor: crate::ColorModeSensor,
+    encoding: x3f_color_encoding_t,
+    exif_color_space: u16,
+) -> Option<[f64; 9]> {
+    if sensor == crate::ColorModeSensor::Merrill {
+        return merrill_output_matrix(encoding, exif_color_space);
+    }
+    let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+    // Quattro Stage4 skips matching spaces and otherwise uses its fixed target matrix.
+    // It does not apply the Merrill Adobe source inverse.
+    if encoding == x3f_color_encoding_e_ARGB && exif_color_space != 1 {
+        return Some(identity);
+    }
+    merrill_render_matrix(encoding, identity, None, [1.0; 3], 1.0)
+}
+
 fn merrill_setup_or_legacy(
     setup: crate::Result<MerrillRender>,
 ) -> crate::Result<Option<MerrillRender>> {
@@ -3888,6 +4254,9 @@ struct ConvCtx<'a> {
     cols: i32,
     channels: usize,
     merrill: Option<&'a MerrillRender>,
+    quattro_mode: Option<&'a QuattroColorModeRender>,
+    #[cfg(test)]
+    recovered_inputs: Option<&'a std::sync::Mutex<Vec<[u64; 3]>>>,
 }
 
 // SAFETY: see ConvCtx doc-comment above. The pointers are either
@@ -4061,9 +4430,17 @@ unsafe fn convert_row(
             sg[1] * sat_ratio[1],
             sg[2] * sat_ratio[2],
         ];
+        #[cfg(test)]
+        if let Some(inputs) = ctx.recovered_inputs {
+            inputs.lock().unwrap().push(input.map(f64::to_bits));
+        }
         if let Some(native) = ctx.merrill {
             let encoded = native.render(input);
             row_data[off..off + 3].copy_from_slice(&encoded);
+            continue;
+        }
+        if let Some(native) = ctx.quattro_mode {
+            row_data[off..off + 3].copy_from_slice(&native.render(input));
             continue;
         }
         let output = mat3x1_mul_native(m, input);
@@ -4096,6 +4473,8 @@ pub unsafe extern "C" fn convert_data(
             CINEON.with(|c| c.get()),
             None,
             None,
+            None,
+            None,
         )
         .is_ok() as libc::c_int
     }
@@ -4112,6 +4491,8 @@ unsafe fn convert_data_controlled(
     cineon: bool,
     rgb_chroma_lut: Option<bool>,
     merrill: Option<MerrillRender>,
+    resolved: Option<&crate::ColorModeParameters>,
+    quattro_mode: Option<QuattroColorModeRender>,
 ) -> crate::Result<()> {
     let max_out: u16 = 65535; // TODO: should be possible to adjust
 
@@ -4136,6 +4517,7 @@ unsafe fn convert_data_controlled(
                 lut.as_mut_ptr(),
                 conv_matrix.as_mut_ptr(),
                 cineon,
+                resolved,
             )
         }
     } else {
@@ -4157,6 +4539,7 @@ unsafe fn convert_data_controlled(
             "could not prepare RGB calibration",
         ));
     }
+    conv_matrix = recovery_conv_matrix(conv_matrix, quattro_mode.as_ref());
 
     // Spatial gain (M6d) — corr table on the stack, MAXCORR=6 slots.
     let mut sgain: [x3f_spatial_gain_corr_t; MAX_CORR] = unsafe { std::mem::zeroed() };
@@ -4273,6 +4656,9 @@ unsafe fn convert_data_controlled(
         cols: img.columns as i32,
         channels,
         merrill: merrill.as_ref(),
+        quattro_mode: quattro_mode.as_ref(),
+        #[cfg(test)]
+        recovered_inputs: None,
     };
 
     let total_u16 = (img.rows as usize) * row_stride;
@@ -5423,6 +5809,7 @@ pub unsafe extern "C" fn x3f_get_image(
     wb: *mut libc::c_char,
 ) -> libc::c_int {
     let options = ProcessingOptions {
+        color_mode: None,
         spp_denoise: false,
         dng_highlight_recovery: DNG_HIGHLIGHT_RECOVERY.with(|c| c.get()),
         dng_shoulder: DNG_HIGHLIGHT_MAPPING.with(|c| c.get()) == DngMapping::Shoulder,
@@ -5456,6 +5843,8 @@ pub unsafe extern "C" fn x3f_get_image(
 /// Options passed directly to one image processing operation.
 #[derive(Clone, Copy, Default)]
 pub struct ProcessingOptions {
+    /// Select a camera look for this color conversion. None keeps the legacy path.
+    pub color_mode: Option<crate::ColorMode>,
     /// Select the Merrill SPP float pipeline for this color conversion.
     pub spp_denoise: bool,
     pub dng_highlight_recovery: bool,
@@ -5637,6 +6026,23 @@ unsafe fn get_image_impl(
         wb = unsafe { x3f_get_wb(x3f) };
     }
 
+    let resolved = if let Some(mode) = options.color_mode {
+        if cineon
+            || !matches!(
+                encoding,
+                x3f_color_encoding_e_SRGB | x3f_color_encoding_e_ARGB | x3f_color_encoding_e_PPRGB
+            )
+        {
+            return Err(crate::Error::InvalidData(
+                "color modes require a rendered color encoding without Cineon",
+            ));
+        }
+        control.check()?;
+        Some(unsafe { crate::resolve_color_mode(x3f, mode) }?)
+    } else {
+        None
+    };
+
     if options.spp_denoise {
         return unsafe {
             spp::render(
@@ -5649,6 +6055,7 @@ unsafe fn get_image_impl(
                 apply_sgain != 0,
                 wb,
                 control,
+                resolved.as_ref(),
             )
         };
     }
@@ -5712,13 +6119,34 @@ unsafe fn get_image_impl(
             x3f_color_encoding_e_SRGB | x3f_color_encoding_e_ARGB | x3f_color_encoding_e_PPRGB
         )
         && unsafe { is_merrill_model(x3f) }
-        && merrill_render_color_mode(&unsafe { (*x3f).header.color_mode.map(|b| b as u8) })
-            .is_some();
+        && (resolved.is_some()
+            || merrill_render_color_mode(&unsafe { (*x3f).header.color_mode.map(|b| b as u8) })
+                .is_some());
     // Validate before render-specific black/gain preprocessing mutates samples.
     let merrill = if merrill_rgb {
-        merrill_setup_or_legacy(unsafe {
-            make_merrill_render(x3f, wb, encoding, apply_sgain != 0, control)
-        })?
+        let setup = unsafe {
+            make_merrill_render(
+                x3f,
+                wb,
+                encoding,
+                apply_sgain != 0,
+                control,
+                resolved.as_ref(),
+            )
+        };
+        if resolved.is_some() {
+            Some(setup?)
+        } else {
+            merrill_setup_or_legacy(setup)?
+        }
+    } else {
+        None
+    };
+    let quattro_mode = if let Some(params) = resolved
+        .as_ref()
+        .filter(|p| p.sensor == crate::ColorModeSensor::Quattro)
+    {
+        Some(unsafe { make_quattro_color_mode_render(x3f, wb, encoding, params, control) }?)
     } else {
         None
     };
@@ -5834,6 +6262,8 @@ unsafe fn get_image_impl(
                 cineon,
                 options.rgb_chroma_lut,
                 merrill,
+                resolved.as_ref(),
+                quattro_mode,
             )
         }?;
     }
@@ -6481,6 +6911,150 @@ mod tests {
     }
 
     #[test]
+    fn quattro_render_bounds_native_counts_before_tone_lookup() {
+        use crate::merrill::{RenderLuts, ToneParams};
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let params = crate::ColorModeParameters {
+            mode: crate::ColorMode::Standard,
+            sensor: crate::ColorModeSensor::Quattro,
+            as_shot_fallback: false,
+            creative_matrix: None,
+            contrast: 0.0,
+            tone: ToneParams {
+                start: -1.19,
+                end: 2.85,
+                steepness: 3.0,
+                steepness2: 1.55,
+                breakpoint: 0.078,
+                scale: 1.0,
+            },
+            inverse_gamma: 1.0 / 2.2222222222222223,
+            pixel_saturation: 16383.0,
+        };
+        let luts =
+            RenderLuts::from_color_mode(&params, 0.0, identity, 2, crate::Control::none()).unwrap();
+        assert!(
+            RenderLuts::from_color_mode(&params, 0.0, identity, 0, crate::Control::none()).is_err()
+        );
+        let expected = luts.render([0.0, 65535.0, 501.0]);
+        assert_ne!(luts.render([-100.0, 70000.0, 500.75]), expected);
+        let render = super::QuattroColorModeRender {
+            matrix: identity,
+            recovery_matrix: identity,
+            luts,
+        };
+        assert_eq!(render.render([-100.0, 70000.0, 500.75]), expected);
+        assert_eq!(expected[0], 0);
+        assert!(expected[1] > 65500);
+    }
+
+    #[test]
+    fn quattro_highlight_recovery_keeps_sensor_input_independent_of_mode() {
+        use super::*;
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let calibration = crate::ColorModeCalibration {
+            sensor_to_srgb: identity,
+            wb_gain: [1.0; 3],
+            normalized_to_counts: [16383.0; 3],
+            count_offset: [0.0; 3],
+            iso_gain: 1.0,
+            output_to_srgb: identity,
+            color_dq: None,
+        };
+        let standard = crate::ColorModeParameters {
+            mode: crate::ColorMode::Standard,
+            sensor: crate::ColorModeSensor::Quattro,
+            as_shot_fallback: false,
+            creative_matrix: Some(identity),
+            contrast: 0.0,
+            tone: crate::merrill::ToneParams {
+                start: -1.19,
+                end: 2.85,
+                steepness: 3.0,
+                steepness2: 1.55,
+                breakpoint: 0.078,
+                scale: 1.0,
+            },
+            inverse_gamma: 1.0 / 2.2222222222222223,
+            pixel_saturation: 16383.0,
+        };
+        let mut vivid = standard;
+        vivid.mode = crate::ColorMode::Vivid;
+        vivid.creative_matrix = Some([0.45, 0.0, 0.0, 0.0, 1.3, 0.0, 0.0, 0.0, 0.65]);
+        let make = |params: &crate::ColorModeParameters| {
+            let luts = crate::ColorModeRenderLuts::from_color_mode(
+                params,
+                0.0,
+                identity,
+                2,
+                Control::none(),
+            )
+            .unwrap();
+            QuattroColorModeRender::new(&calibration, params, luts).unwrap()
+        };
+        let renders = [make(&standard), make(&vivid)];
+        assert_eq!(
+            renders[0].matrix.map(|v| v / standard.pixel_saturation),
+            renders[0].recovery_matrix
+        );
+        assert_eq!(renders[0].recovery_matrix, renders[1].recovery_matrix);
+        assert_ne!(renders[0].matrix, renders[1].matrix);
+        let legacy = identity.map(|v| v * 2.0);
+        assert_eq!(recovery_conv_matrix(legacy, None), legacy);
+        let hp = highlight_params_t {
+            blending_low: 0.75,
+            blending_high: 1.5,
+            restore_thresh: 1.75,
+            sat_factor: 1.0,
+            chan_thresh: 0.5,
+        };
+        let clut: chroma_lut_t = unsafe { std::mem::zeroed() };
+        let repair: repair_pix_t = unsafe { std::mem::zeroed() };
+        let lut = [0.0; LUTSIZE as usize];
+        let input = [20000_u16, 40000, 65535];
+        let mut recovered = Vec::new();
+        let mut outputs = Vec::new();
+        for render in &renders {
+            let recovery_matrix = recovery_conv_matrix(legacy, Some(render));
+            assert_eq!(recovery_matrix, renders[0].recovery_matrix);
+            let mut prior = [0.0; 3];
+            unsafe { compute_chroma_prior(recovery_matrix.as_ptr(), prior.as_mut_ptr()) };
+            let inputs = std::sync::Mutex::new(Vec::new());
+            let ctx = ConvCtx {
+                sgain: ptr::null_mut(),
+                sgain_num: 0,
+                conv_matrix: recovery_matrix.as_ptr().cast_mut(),
+                lut: lut.as_ptr().cast_mut(),
+                prior: prior.as_ptr(),
+                hp: &hp,
+                clut: &clut,
+                use_clut: false,
+                repair: &repair,
+                use_repair: false,
+                sat_map: ptr::null(),
+                ev_scale: 1.0,
+                gate_thr: 0.20,
+                gate_width: 0.30,
+                black: [0.0; 3],
+                white: [65535; 3],
+                rows: 1,
+                cols: 1,
+                channels: 3,
+                merrill: None,
+                quattro_mode: Some(render),
+                recovered_inputs: Some(&inputs),
+            };
+            let mut row = input;
+            unsafe { convert_row(&ctx, 0, &mut row, ptr::null_mut()) }.unwrap();
+            recovered.push(inputs.into_inner().unwrap());
+            outputs.push(row);
+        }
+        assert_eq!(recovered[0], recovered[1]);
+        assert_eq!(recovered[0], vec![[1.0_f64.to_bits(); 3]]);
+        assert_ne!(outputs[0], outputs[1]);
+    }
+
+    #[test]
     fn merrill_unsupported_setup_falls_back_but_execution_errors_propagate() {
         assert!(
             super::merrill_setup_or_legacy(Err(crate::Error::InvalidData(
@@ -6560,6 +7134,7 @@ mod tests {
                 x3f_color_encoding_e_SRGB,
                 true,
                 Control::none(),
+                None,
             )
         };
         assert!(matches!(
@@ -6717,8 +7292,8 @@ mod tests {
             let mut capture = 800.0_f64;
             let mut sensor = 0.0_f64;
             let mut iso_range = 1_u32;
-            let mut entries: [camf_entry_t; 9] = std::mem::zeroed();
-            let mut dims: [[camf_dim_entry_t; 2]; 6] = std::mem::zeroed();
+            let mut entries: [camf_entry_t; 14] = std::mem::zeroed();
+            let mut dims: [[camf_dim_entry_t; 2]; 10] = std::mem::zeroed();
             let mut keys = [
                 c"Sunlight".as_ptr() as *mut _,
                 c"Sunlight".as_ptr() as *mut _,
@@ -6788,13 +7363,53 @@ mod tests {
                 entries[i + 3].matrix_decoded_type = typ;
                 entries[i + 3].matrix_decoded = data;
             }
+            let mut contrasts = [
+                c"Vivid".as_ptr().cast_mut(),
+                c"Standard".as_ptr().cast_mut(),
+            ];
+            let mut contrast_values = [
+                c"CMCC_Vivid".as_ptr() as *mut u8,
+                c"Missing".as_ptr() as *mut u8,
+            ];
+            entries[9].id = u32::from_le_bytes(*b"CMbP");
+            entries[9].name_address = c"ColorModeContrastCompensations".as_ptr().cast_mut();
+            entries[9].property_num = 2;
+            entries[9].property_name = contrasts.as_mut_ptr();
+            entries[9].property_value = contrast_values.as_mut_ptr();
+            let mut tone_rows = [
+                [1.0, -1.1, 2.5, 3.0, 0.45, 0.07, 1.4],
+                [1.0, -0.8, 2.9, 2.7, 0.45, 0.10, 2.0],
+            ];
+            let mut contrast = 0.25_f64;
+            let mut color_dq = [8.0_f64; 3];
+            let mut camsys = [2_u32, 0, 0];
+            for (i, (name, data, width, height)) in [
+                (c"TCColorModeSettings", tone_rows.as_mut_ptr().cast(), 2, 7),
+                (c"CMCC_Vivid", (&mut contrast as *mut f64).cast(), 1, 0),
+                (c"ColorDQCamRGB", color_dq.as_mut_ptr().cast(), 3, 0),
+                (c"CamsysVersion", camsys.as_mut_ptr().cast(), 3, 0),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                dims[i + 6][0].size = width;
+                dims[i + 6][1].size = height;
+                entries[i + 10].id = u32::from_le_bytes(*b"CMbM");
+                entries[i + 10].name_address = name.as_ptr().cast_mut();
+                entries[i + 10].matrix_dim = if height == 0 { 1 } else { 2 };
+                entries[i + 10].matrix_dim_entry = dims[i + 6].as_mut_ptr();
+                entries[i + 10].matrix_elements = width * height.max(1);
+                entries[i + 10].matrix_decoded_type = matrix_type_t_M_FLOAT;
+                entries[i + 10].matrix_decoded = data;
+            }
+            entries[13].matrix_decoded_type = matrix_type_t_M_UINT;
             let mut model: x3f_property_t = std::mem::zeroed();
             model.name_utf8 = c"CAMMODEL".as_ptr() as *mut _;
             model.value_utf8 = c"SIGMA DP2 Merrill".as_ptr() as *mut _;
-            let mut sections: [x3f_directory_entry_t; 2] = std::mem::zeroed();
+            let mut sections: [x3f_directory_entry_t; 3] = std::mem::zeroed();
             sections[0].header.identifier = u32::from_le_bytes(*b"SECc");
             sections[0].header.data_subsection.camf.entry_table = camf_entry_table_t {
-                size: 9,
+                size: entries.len() as u32,
                 element: entries.as_mut_ptr(),
             };
             sections[1].header.identifier = u32::from_le_bytes(*b"SECp");
@@ -6840,6 +7455,143 @@ mod tests {
             for (dst, src) in x3f.header.color_mode.iter_mut().zip(b"Vivid\0") {
                 *dst = *src as libc::c_char;
             }
+            for (dst, src) in x3f.header.white_balance.iter_mut().zip(b"Sunlight\0") {
+                *dst = *src as libc::c_char;
+            }
+            let recorded_header = x3f.header.color_mode;
+            let selected = crate::resolve_color_mode(&mut x3f, crate::ColorMode::Vivid).unwrap();
+            assert_eq!(selected.creative_matrix, Some(mode));
+            assert_eq!(selected.contrast, 0.25);
+            assert_eq!(selected.tone.start, f64::from(tone_rows[0][1] as f32));
+            assert_eq!(
+                crate::resolve_color_mode(&mut x3f, crate::ColorMode::AsShot)
+                    .unwrap()
+                    .mode,
+                crate::ColorMode::Vivid
+            );
+            x3f.header.color_mode.fill(0);
+            for (dst, src) in x3f.header.color_mode.iter_mut().zip(b"Monochrome") {
+                *dst = *src as libc::c_char;
+            }
+            assert!(crate::resolve_color_mode(&mut x3f, crate::ColorMode::AsShot).is_err());
+            assert_eq!(
+                crate::resolve_color_mode(&mut x3f, crate::ColorMode::Vivid)
+                    .unwrap()
+                    .mode,
+                crate::ColorMode::Vivid
+            );
+            x3f.header.color_mode = recorded_header;
+            contrasts.swap(0, 1);
+            contrast_values.swap(0, 1);
+            let reordered = crate::resolve_color_mode(&mut x3f, crate::ColorMode::Vivid).unwrap();
+            assert_eq!(reordered.creative_matrix, selected.creative_matrix);
+            assert_eq!(reordered.contrast, selected.contrast);
+            assert_eq!(reordered.tone.start, f64::from(tone_rows[1][1] as f32));
+            assert_eq!(x3f.header.color_mode, recorded_header);
+            let standard = crate::resolve_color_mode(&mut x3f, crate::ColorMode::Standard).unwrap();
+            assert_eq!(standard.creative_matrix, None);
+            assert_eq!(standard.contrast, 0.0);
+            let fcblue = crate::resolve_color_mode(&mut x3f, crate::ColorMode::FCBlue).unwrap();
+            assert_eq!(
+                fcblue.creative_matrix.unwrap().map(f64::to_bits),
+                [
+                    0x3ff8d42c3c9eecc0,
+                    0x3fd46edaa92e6213,
+                    0xbfebdfce3150dae4,
+                    0x3fd69d2bf5515055,
+                    0x3ff6160956c0d6f5,
+                    0xbfe77aa8a82a5615,
+                    0x3fc08ad688377186,
+                    0x3fb73b13d244dbd2,
+                    0x3fe8f5e84f09528f,
+                ]
+            );
+            assert_eq!(fcblue.contrast, 0.3);
+            (*model).value_utf8 = c"SIGMA SD1 Merrill".as_ptr().cast_mut();
+            assert_eq!(
+                crate::resolve_color_mode(&mut x3f, crate::ColorMode::FCBlue)
+                    .unwrap()
+                    .creative_matrix
+                    .unwrap()
+                    .map(f64::to_bits),
+                [
+                    0x3ff9b97785729b28,
+                    0x3fd2a44417870542,
+                    0xbfecc5197a24894c,
+                    0x3fd8915bdd76683c,
+                    0x3ff5d78811b1d92b,
+                    0xbfe7f7b9e060fe48,
+                    0x3fc2fbe33acd5b68,
+                    0x3fb4ca0c282c6ef4,
+                    0x3fe8a7c7c5260f5e,
+                ]
+            );
+            (*model).value_utf8 = c"SIGMA DP2 Merrill".as_ptr().cast_mut();
+            dims[7][0].size = 2;
+            assert_eq!(
+                crate::resolve_color_mode(&mut x3f, crate::ColorMode::Vivid)
+                    .unwrap()
+                    .contrast,
+                0.0
+            );
+            dims[7][0].size = 1;
+            assert_eq!(dims[7][0].size, 1);
+            contrast = f64::NAN;
+            assert!(contrast.is_nan());
+            assert!(crate::resolve_color_mode(&mut x3f, crate::ColorMode::Vivid).is_err());
+            contrast = 0.25;
+            assert_eq!(contrast, selected.contrast);
+            mode[8] = 0.0;
+            mode[2] = 0.0;
+            assert!(crate::resolve_color_mode(&mut x3f, crate::ColorMode::Vivid).is_err());
+            assert!(!crate::available_color_modes(&mut x3f)
+                .unwrap()
+                .contains(&crate::ColorMode::Vivid));
+            mode[8] = 1.0;
+            mode[2] = 2.0;
+            assert_eq!(
+                crate::resolve_color_mode(&mut x3f, crate::ColorMode::Vivid)
+                    .unwrap()
+                    .creative_matrix,
+                Some(mode)
+            );
+            color_dq[0] = f64::NAN;
+            assert!(color_dq[0].is_nan());
+            assert!(crate::resolve_color_mode(&mut x3f, crate::ColorMode::Vivid).is_err());
+            color_dq[0] = 8.0;
+            assert_eq!(color_dq[0], 8.0);
+            // Quattro uses the compiled Teal matrix only with a non-empty list.
+            sections[2].header.identifier = u32::from_le_bytes(*b"SECi");
+            sections[2].header.data_subsection.image_data.type_format = 0x0001_0023;
+            assert_eq!(
+                sections[2].header.data_subsection.image_data.type_format,
+                0x0001_0023
+            );
+            x3f.directory_section.num_directory_entries = 3;
+            x3f.header.version = 0x0004_0000;
+            let teal =
+                crate::resolve_color_mode(&mut x3f, crate::ColorMode::TealAndOrange).unwrap();
+            let expected_teal = [
+                1.06673, 0.05757, -0.12415, 0.25086, 0.38293, 0.36634, -0.01669, -0.04191, 1.05873,
+            ];
+            assert_eq!(teal.creative_matrix, Some(expected_teal));
+            *entries[2].property_name = c"TealAndOrange".as_ptr().cast_mut();
+            assert_eq!(
+                crate::resolve_color_mode(&mut x3f, crate::ColorMode::TealAndOrange)
+                    .unwrap()
+                    .creative_matrix,
+                Some(expected_teal)
+            );
+            assert_ne!(mode, expected_teal);
+            entries[2].property_num = 0;
+            assert!(crate::resolve_color_mode(&mut x3f, crate::ColorMode::TealAndOrange).is_err());
+            entries[2].name_address = c"AbsentCompensations".as_ptr().cast_mut();
+            assert!(crate::resolve_color_mode(&mut x3f, crate::ColorMode::TealAndOrange).is_err());
+            entries[2].name_address = c"ColorModeCompensations".as_ptr().cast_mut();
+            entries[2].property_num = 1;
+            *entries[2].property_name = c"Vivid".as_ptr().cast_mut();
+            x3f.directory_section.num_directory_entries = 2;
+            x3f.header.version = 0x0003_0000;
             let mut lut = [0.0; 16];
             let mut matrix = [0.0; 9];
             assert_eq!(
@@ -6851,7 +7603,8 @@ mod tests {
                     65535,
                     lut.as_mut_ptr(),
                     matrix.as_mut_ptr(),
-                    false
+                    false,
+                    None,
                 ),
                 1
             );
@@ -6884,7 +7637,8 @@ mod tests {
                     65535,
                     lut.as_mut_ptr(),
                     matrix.as_mut_ptr(),
-                    false
+                    false,
+                    None,
                 ),
                 1
             );
@@ -6902,7 +7656,8 @@ mod tests {
                     65535,
                     lut.as_mut_ptr(),
                     matrix.as_mut_ptr(),
-                    false
+                    false,
+                    None,
                 ),
                 0
             );

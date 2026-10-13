@@ -1,5 +1,5 @@
 //! Shared JPEG APP1/EXIF reader for rendering calibration and DNG metadata.
-//! Reads IFD0 and the EXIF sub-IFD; ignores MakerNotes, GPS and IFD1.
+//! Reads IFD0, the EXIF sub-IFD and Sigma PictureMode; ignores GPS and IFD1.
 
 #[derive(Default, Debug, Clone)]
 pub struct JpegExif {
@@ -20,6 +20,8 @@ pub struct JpegExif {
     pub focal_length: Option<(u32, u32)>,
     pub focal_length_in_35mm: Option<u16>,
     pub body_serial: Option<String>,
+    /// Recorded Sigma camera mode from MakerNote tag 0x003d.
+    pub picture_mode: Option<String>,
 }
 
 /// Find the APP1/Exif TIFF block in `jpeg` and parse the fields above.
@@ -71,6 +73,9 @@ pub fn parse_jpeg_exif(jpeg: &[u8]) -> Option<JpegExif> {
             0x9204 => out.exposure_bias = read_srational(tiff, ty, count, val_or_off, endian),
             0x9209 => out.flash = read_u16(ty, val_or_off, endian),
             0x920A => out.focal_length = read_rational(tiff, ty, count, val_or_off, endian),
+            0x927C => {
+                out.picture_mode = read_sigma_picture_mode(tiff, ty, count, val_or_off, endian)
+            }
             0xA405 => out.focal_length_in_35mm = read_u16(ty, val_or_off, endian),
             0xA431 => out.body_serial = read_ascii(tiff, ty, count, val_or_off, endian),
             _ => {}
@@ -204,6 +209,53 @@ fn read_u16(ty: u16, val_or_off: [u8; 4], endian: Endian) -> Option<u16> {
     }
 }
 
+fn read_sigma_picture_mode(
+    tiff: &[u8],
+    ty: u16,
+    count: u32,
+    val_or_off: [u8; 4],
+    endian: Endian,
+) -> Option<String> {
+    if ty != 7 {
+        return None;
+    }
+    let start = endian.read_u32(&val_or_off)? as usize;
+    let maker = tiff.get(start..)?.get(..usize::try_from(count).ok()?)?;
+    if maker.get(..8)? != b"SIGMA\0\0\0" {
+        return None;
+    }
+    let entries = usize::from(endian.read_u16(maker.get(10..)?)?);
+    let directory_end = 12usize
+        .checked_add(entries.checked_mul(12)?)?
+        .checked_add(4)?;
+    maker.get(..directory_end)?;
+    let mut mode = None;
+    walk_ifd(maker, 10, endian, |tag, ty, count, value| {
+        if tag != 0x003d || ty != 2 || count == 0 {
+            return;
+        }
+        if count > 4 {
+            // Sigma value offsets use the parent TIFF base, not the MakerNote base.
+            let Some(relative) = endian
+                .read_u32(&value)
+                .and_then(|offset| (offset as usize).checked_sub(start))
+            else {
+                return;
+            };
+            if relative < directory_end
+                || maker
+                    .get(relative..)
+                    .and_then(|v| v.get(..count as usize))
+                    .is_none()
+            {
+                return;
+            }
+        }
+        mode = read_ascii(tiff, ty, count, value, endian);
+    });
+    mode
+}
+
 fn read_rational(
     tiff: &[u8],
     ty: u16,
@@ -325,5 +377,102 @@ mod tests {
             jpeg[offset..offset + 4].fill(255);
             assert_eq!(parse_jpeg_exif(&jpeg).unwrap().f_number, None);
         }
+    }
+
+    fn picture_mode_jpeg(big: bool, mode: &[u8]) -> Vec<u8> {
+        let u16bytes = |v: u16| {
+            if big {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
+        let u32bytes = |v: u32| {
+            if big {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
+        let mut tiff = if big { b"MM".to_vec() } else { b"II".to_vec() };
+        tiff.extend(u16bytes(42));
+        tiff.extend(u32bytes(8));
+        tiff.extend(u16bytes(1));
+        tiff.extend(u16bytes(0x8769));
+        tiff.extend(u16bytes(4));
+        tiff.extend(u32bytes(1));
+        tiff.extend(u32bytes(26));
+        tiff.extend(u32bytes(0));
+        tiff.extend(u16bytes(1));
+        tiff.extend(u16bytes(0x927c));
+        tiff.extend(u16bytes(7));
+        tiff.extend(u32bytes(28 + mode.len() as u32));
+        tiff.extend(u32bytes(44));
+        tiff.extend(u32bytes(0));
+        tiff.extend(b"SIGMA\0\0\0\0\x03");
+        tiff.extend(u16bytes(1));
+        tiff.extend(u16bytes(0x003d));
+        tiff.extend(u16bytes(2));
+        tiff.extend(u32bytes(mode.len() as u32));
+        tiff.extend(u32bytes(72));
+        tiff.extend(u32bytes(0));
+        tiff.extend(mode);
+        let mut jpeg = b"\xff\xd8\xff\xe1".to_vec();
+        jpeg.extend(((tiff.len() + 8) as u16).to_be_bytes());
+        jpeg.extend(b"Exif\0\0");
+        jpeg.extend(tiff);
+        jpeg
+    }
+
+    #[test]
+    fn sigma_picture_mode_uses_parent_offsets_and_endian() {
+        for big in [false, true] {
+            for (mode, expected) in [
+                (&b"TealAndOrange\0\0\0"[..], "TealAndOrange"),
+                (&b"SunsetRed\0\0\0"[..], "SunsetRed"),
+                (&b"Monochrome\0\0"[..], "Monochrome"),
+                (&b"Standard\0\0\0\0"[..], "Standard"),
+            ] {
+                let jpeg = picture_mode_jpeg(big, mode);
+                assert_eq!(
+                    parse_jpeg_exif(&jpeg).unwrap().picture_mode.as_deref(),
+                    Some(expected)
+                );
+                for length in 0..jpeg.len() {
+                    assert!(parse_jpeg_exif(&jpeg[..length]).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sigma_picture_mode_rejects_invalid_note_and_value_bounds() {
+        // JPEG adds 12 bytes before the parent TIFF header.
+        for (offset, value) in [
+            (12 + 30, 2_u32.to_le_bytes().to_vec()),
+            (12 + 32, 12_u32.to_le_bytes().to_vec()),
+            (12 + 36, u32::MAX.to_le_bytes().to_vec()),
+            (12 + 44, b"OTHER".to_vec()),
+            (12 + 54, u16::MAX.to_le_bytes().to_vec()),
+            (12 + 58, 7_u16.to_le_bytes().to_vec()),
+            (12 + 60, u32::MAX.to_le_bytes().to_vec()),
+            (12 + 64, 8_u32.to_le_bytes().to_vec()),
+            (12 + 64, 80_u32.to_le_bytes().to_vec()),
+            (12 + 64, u32::MAX.to_le_bytes().to_vec()),
+        ] {
+            let mut jpeg = picture_mode_jpeg(false, b"TealAndOrange\0\0\0");
+            jpeg[offset..offset + value.len()].copy_from_slice(&value);
+            assert_eq!(
+                parse_jpeg_exif(&jpeg).unwrap().picture_mode,
+                None,
+                "{offset}"
+            );
+        }
+        assert_eq!(
+            parse_jpeg_exif(&calibration_jpeg(false))
+                .unwrap()
+                .picture_mode,
+            None
+        );
     }
 }

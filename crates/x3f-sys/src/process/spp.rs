@@ -467,6 +467,20 @@ unsafe fn color_matrix(
     compose_color_matrix(cc, iso_gain, compensation)
 }
 
+unsafe fn selected_color_matrix(
+    x3f: *mut x3f_t,
+    wb: *mut libc::c_char,
+    iso_gain: f32,
+    mode: Option<&crate::ColorModeParameters>,
+) -> crate::Result<[[f64; 3]; 3]> {
+    let Some(mode) = mode else {
+        return unsafe { color_matrix(x3f, wb, iso_gain) };
+    };
+    let (cc, _, _) =
+        unsafe { color_mode_base_calibration(x3f, wb, crate::ColorModeSensor::Merrill) }?;
+    compose_color_matrix(cc, iso_gain, mode.creative_matrix.unwrap_or([0.0; 9]))
+}
+
 fn active_in_keep(active: [i32; 4], keep: [i32; 4], size: [usize; 2]) -> crate::Result<[usize; 4]> {
     let invalid = || crate::Error::InvalidData("invalid SPP image rectangles");
     if (0..2).any(|i| i64::from(keep[i + 2]) - i64::from(keep[i]) != size[i] as i64) {
@@ -709,13 +723,14 @@ pub(super) unsafe fn render(
     apply_sgain: bool,
     wb: *mut libc::c_char,
     control: Control<'_>,
+    mode: Option<&crate::ColorModeParameters>,
 ) -> crate::Result<()> {
     control.check()?;
     let gain = unsafe { merrill_request_gain(x3f, wb, control) }
         .ok_or(crate::Error::InvalidData("unsupported SPP request gains"))?;
     let exif = unsafe { merrill_exif(x3f, control) }?;
     let noise = unsafe { noise_params(x3f, gain, &exif) }?;
-    let matrix = unsafe { color_matrix(x3f, wb, noise.iso_gain) }?;
+    let matrix = unsafe { selected_color_matrix(x3f, wb, noise.iso_gain, mode) }?;
     let sensor = unsafe { typed_scalar(x3f, c"SensorISO", 3, 0.) } as f32;
     let sensor_scale = if sensor == 0. { 1. } else { sensor / 100. };
     let mut strengths = [0.; 3];
@@ -746,7 +761,7 @@ pub(super) unsafe fn render(
         sensor_scale,
         gain.map(|v| v as f32),
     )?;
-    let luts = unsafe { make_merrill_render_luts(x3f, encoding, &exif, true, control) }?;
+    let luts = unsafe { make_color_mode_render_luts(x3f, encoding, &exif, true, mode, control) }?;
     let mut area = x3f_area16_t::default();
     if unsafe { x3f_image_area(x3f, &mut area) } == 0 {
         return Err(crate::Error::InvalidData("missing SPP image"));

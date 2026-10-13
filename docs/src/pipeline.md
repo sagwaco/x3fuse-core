@@ -109,6 +109,23 @@ omitted LUT flag or `-no-chroma-lut`. DNG, scene-linear,
 camera-space (`-color none`) output. The RGB LUT remains available as an
 alternative while Sigma's native pipeline is reconstructed.
 
+An explicit `ProcessOptions::color_mode` uses the shared validated resolver
+for TIFF and DNG. Merrill tone rows use the contrast-list ordinal. dp Quattro
+uses its native enum bounds, built-in tone shapes and quarter-resolution
+curve reconstruction. TIFF applies the mode before its output ICC encoding.
+The option defaults to `None`; the stages above keep their existing behavior
+when it is absent. sd Quattro and sd Quattro H modes remain unsupported.
+
+The experimental DNG mode path clears the creative selection before raw
+processing, then builds profile metadata and a selected-mode preview from
+that same image. Raw samples, levels and recovery scale stay independent of
+the selected mode. The replacement classic profiles use creative CM/FM values
+and a shared AsShotWhiteXY. Its separate cast, exposure, look-table and long-curve
+controls pass in Lightroom. The combined Merrill and dp Quattro files also
+pass profile switching, export, reopen and editable-control checks. The
+embedded preview uses the native renderer and can differ from the profile fit. The
+[Color Modes plan](../COLOR-MODES-PLAN.md) records evidence and remaining gates.
+
 The DNG path replaces stages 6–9 with highlight handling in sensor BMT
 space. Recovery is opt-in through `-dng-highlight-recovery`. On Merrill
 and older sensors, reliable nearby layer ratios propose reconstruction of
@@ -256,9 +273,10 @@ One of:
 - **DNG** — pure-Rust IFD writer in
   [`crates/x3f-core/src/output/dng/`](../../crates/x3f-core/src/output/dng/).
   Emits standard TIFF, EXIF, and DNG tags, including ForwardMatrix1
-  and DefaultBlackRender. Standard is the default camera profile; the
-  currently enabled extra profiles are five monochrome variants and
-  Unconverted. Additional Sigma picture modes remain disabled. The writer embeds
+  and DefaultBlackRender. Without `-color-mode`, Standard is the default
+  camera profile, with five monochrome variants and Unconverted as extras.
+  The legacy CMCM picture modes remain disabled. Explicit Color Modes use the
+  separate profile path described above. The writer embeds
   Sigma's flat-fielding `OpcodeList3` blobs (lens-correction GainMaps)
   when `-opcodes-dir opcodes` is passed. `-compress` encodes the raw
   plane as lossless JPEG (`Compression = 7`, the pure-Rust LJ92
@@ -271,7 +289,7 @@ One of:
   dcraw-lineage decoders stop after the first strip of a multi-strip
   lossless-JPEG plane — single-strip LJ92 is the layout everything
   decodes. Required UniqueCameraModel and LinearResponseLimit live in
-  IFD0; DefaultUserCrop is RATIONAL[4] in the raw IFD. Hue/saturation
+  IFD0; DefaultUserCrop is RATIONAL[4] in the raw IFD. Legacy hue/saturation
   maps use `[21, 2, 1]` dimensions, with saturation varying fastest and
   identical corrections at both saturation endpoints.
 - **16-bit TIFF** —
@@ -349,6 +367,6 @@ preserving the existing per-pixel arithmetic order. WASM remains serial CPU
 with no GPU imports. See [performance notes](performance.md#gpu-denoising) for
 numerical tolerances, benchmarks, and the BM3D decision.
 
-Everything else under [`src/`](../../src/) is the legacy archive —
-header files are still consumed by bindgen for typedefs, but the `.c`
-function bodies have all been deleted or migrated.
+Legacy C headers and the two log/version shims are in
+[`crates/x3f-sys/csrc/`](../../crates/x3f-sys/csrc/). Bindgen consumes the
+headers for ABI types. The other C function bodies have been ported to Rust.

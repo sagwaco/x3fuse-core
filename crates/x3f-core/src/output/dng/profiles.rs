@@ -1,51 +1,348 @@
-//! Camera-profile generation and the `ExtraCameraProfiles` (MMCR) blob.
+//! Legacy and native DNG camera-profile payloads.
 //!
-//! Mirrors the structure of `src/x3f_output_dng.c::write_camera_profile`
-//! and `write_camera_profiles`. The legacy code wrote the default profile's
-//! tags directly into the parent DNG IFD0, then for each additional
-//! profile spun up a tiny libtiff "TIFFFdOpen(..., "wb")" big-endian file
-//! to a `tmpfile`, stripped its 4-byte TIFF magic, prepended `"MMCR"`, and
-//! concatenated all such blobs into the parent file with one offset per
-//! profile in the `ExtraCameraProfiles` tag.
-//!
-//! We replicate that byte-for-byte: the default profile is written via the
-//! parent's `DirectoryWriter`, and the `MmcrBuilder` here produces a single
-//! big-endian IFD with `"MMCR"` magic in place of `"MM\x00\x2A"`.
+//! The primary profile uses IFD0. Extra profiles use an IFD after an
+//! eight-byte profile header, with offsets relative to that header.
+//! Legacy MMCR profiles keep their original bytes. Explicit Color Modes
+//! use IIRC with classic matrices, a tone curve and a LookTable.
 
 use std::ffi::CString;
 
-use crate::Reader;
+use crate::{Error, Image, Preview, Reader};
 
+use super::classic_profile as classic;
 use super::color::ColorCalibration;
 use super::metadata::{
     adobe_rgb_to_xyz, bradford_d65_to_d50, mat3_diag, mat3_inverse, mat3_mul, mat3_ones,
     mat3_to_f32,
 };
+#[cfg(test)]
+use super::rgb_table::xyz_d50_to_prophoto;
+use super::rgb_table::{multiply, NativeRendering};
 use super::tags as t;
 use super::tiff_writer::{DirectoryWriter, Value};
 
-/// Source of the camera-native → CIE XYZ matrix for a profile.
+pub(super) struct PreparedColorModes {
+    modes: Vec<x3f_sys::ColorModeParameters>,
+    selected: usize,
+    native: x3f_sys::ColorModeCalibration,
+}
+
+pub(super) struct ColorModeProfiles {
+    name: String,
+    color: [f32; 9],
+    forward: [f32; 9],
+    fit: classic::ClassicFit,
+    pub(super) white_xy: [f64; 2],
+    exposure_offset: f32,
+    pub(super) extra_blob: Vec<u8>,
+    pub(super) extra_offsets: Vec<u32>,
+    rendering: NativeRendering,
+}
+
+impl PreparedColorModes {
+    pub(super) fn resolve(
+        reader: &Reader,
+        wb: &str,
+        selection: x3f_sys::ColorMode,
+        warnings: &mut Vec<String>,
+        control: x3f_sys::Control<'_>,
+    ) -> Result<Self, Error> {
+        control.check()?;
+        // Resolve before raw processing consumes the decoded sensor buffer.
+        let selected = unsafe { x3f_sys::resolve_color_mode(reader.x3f.as_ptr(), selection) }?;
+        if selected.as_shot_fallback {
+            warnings.push("Unknown or empty as-shot Color Mode resolved to Standard".to_owned());
+        }
+        let available = unsafe { x3f_sys::available_color_modes(reader.x3f.as_ptr()) }?;
+        let index = available
+            .iter()
+            .position(|&mode| mode == selected.mode)
+            .ok_or(x3f_sys::Error::InvalidData(
+                "selected DNG Color Mode is unavailable for this file",
+            ))?;
+        let mut modes = Vec::with_capacity(available.len());
+        for mode in available {
+            control.check()?;
+            modes.push(if mode == selected.mode {
+                selected
+            } else {
+                unsafe { x3f_sys::resolve_color_mode(reader.x3f.as_ptr(), mode) }?
+            });
+        }
+        let wb = CString::new(wb)
+            .map_err(|_| x3f_sys::Error::InvalidData("white balance contains NUL"))?;
+        let native = unsafe {
+            x3f_sys::color_mode_calibration(reader.x3f.as_ptr(), wb.as_ptr().cast_mut(), control)
+        }?;
+        Ok(Self {
+            modes,
+            selected: index,
+            native,
+        })
+    }
+
+    pub(super) fn finish(
+        self,
+        reader: &Reader,
+        wb: &str,
+        calibration: &ColorCalibration,
+        highlight_scale: f64,
+        _warnings: &mut Vec<String>,
+        control: x3f_sys::Control<'_>,
+    ) -> Result<ColorModeProfiles, Error> {
+        let bmt = reader
+            .dng_bmt_to_xyz(Some(wb))
+            .ok_or(x3f_sys::Error::InvalidData(
+                "missing DNG physical color calibration",
+            ))?;
+        let color0 = classic::sdk_color(classic::serialized(
+            calibration.fold_color_matrix(&checked_inverse(&bmt)?),
+        ));
+        let neutral = calibration
+            .neutral
+            .map(|v| (v * 10_000.0).round().max(1.0) / 10_000.0);
+        let maximum = neutral.into_iter().fold(0.0, f64::max);
+        let neutral = neutral.map(|v| (v / maximum).clamp(0.001, 1.0));
+        let white_xy = classic::white_xy(color0, neutral)?;
+        let standard = self
+            .modes
+            .iter()
+            .find(|p| p.mode == x3f_sys::ColorMode::Standard)
+            .ok_or(x3f_sys::Error::InvalidData("missing Standard calibration"))?;
+        let (counts, _) = self.native.render_matrix(standard);
+        let basis = mat3_mul(
+            &super::rgb_table::srgb_to_xyz_d50(),
+            &super::rgb_table::quantized_output(self.native.output_to_srgb),
+        );
+        let count_scale = multiply(&mat3_mul(&basis, &counts), neutral)[1];
+        if !count_scale.is_finite() || count_scale <= 0.0 {
+            return Err(x3f_sys::Error::InvalidData("invalid native neutral count scale").into());
+        }
+        let baseline =
+            super::camera_baseline_exposure(reader, calibration, highlight_scale).unwrap_or(0.0);
+        let (exposure_offset, exposure) = profile_exposure(baseline as f32, 0.0)?;
+        let mut extra_blob = Vec::new();
+        let mut extra_offsets = Vec::new();
+        let mut primary = None;
+        for (index, mode) in self.modes.iter().enumerate() {
+            control.check()?;
+            let matrices =
+                classic::Matrices::new(&self.native, mode, color0, neutral, white_xy, count_scale)?;
+            let rendering = NativeRendering::new(&self.native, mode, control)?;
+            let fit = classic::ClassicFit::new(
+                &matrices,
+                &rendering,
+                highlight_scale,
+                exposure,
+                control,
+            )?;
+            let name = format!("x3fuse {}", mode.mode.name());
+            let color = mat3_to_f32(&matrices.color);
+            let forward = mat3_to_f32(&matrices.forward);
+            if index == self.selected {
+                primary = Some((name, color, forward, fit, rendering));
+            } else {
+                append_profile(
+                    &mut extra_blob,
+                    &mut extra_offsets,
+                    &build_profile_blob(
+                        &name,
+                        color,
+                        forward,
+                        Some(&fit.curve.knots),
+                        None,
+                        Some(ProfileLook::Classic(&fit.map)),
+                        exposure_offset,
+                    ),
+                )?;
+            }
+        }
+        // WhiteXY needs a row correction to retain each legacy as-shot neutral.
+        let physical_white = multiply(
+            &color0,
+            classic::xy_xyz(white_xy.map(|v| (v * 1_000_000.0).round() / 1_000_000.0)),
+        );
+        let maximum = physical_white.into_iter().fold(0.0, f64::max);
+        let physical_white = physical_white.map(|v| v / maximum);
+        for profile in &PROFILES[1..] {
+            let (color, forward) = compute_matrices(reader, wb, calibration, profile).ok_or(
+                x3f_sys::Error::InvalidData("missing legacy synthetic profile calibration"),
+            )?;
+            let color = classic::legacy_color(color.map(f64::from), physical_white, white_xy)?;
+            append_profile(
+                &mut extra_blob,
+                &mut extra_offsets,
+                &build_mmcr_profile(profile.name, mat3_to_f32(&color), forward, None, None),
+            )?;
+        }
+        let (name, color, forward, fit, rendering) = primary.ok_or(x3f_sys::Error::InvalidData(
+            "missing selected DNG Color Mode profile",
+        ))?;
+        Ok(ColorModeProfiles {
+            name,
+            color,
+            forward,
+            fit,
+            white_xy,
+            exposure_offset,
+            extra_blob,
+            extra_offsets,
+            rendering,
+        })
+    }
+}
+
+pub(super) fn checked_inverse(matrix: &[f64; 9]) -> x3f_sys::Result<[f64; 9]> {
+    let inverse = mat3_inverse(matrix);
+    let norm = |m: &[f64; 9]| {
+        m.as_chunks::<3>()
+            .0
+            .iter()
+            .map(|r| r.iter().map(|v| v.abs()).sum::<f64>())
+            .fold(0.0, f64::max)
+    };
+    if matrix.iter().chain(&inverse).any(|v| !v.is_finite()) || norm(matrix) * norm(&inverse) > 1e8
+    {
+        return Err(x3f_sys::Error::InvalidData(
+            "singular or ill-conditioned DNG color calibration",
+        ));
+    }
+    Ok(inverse)
+}
+
+fn profile_exposure(baseline: f32, target: f64) -> Result<(f32, f64), Error> {
+    if !baseline.is_finite()
+        || baseline.abs() > i32::MAX as f32 / 10000.0
+        || !target.is_finite()
+        || target < 0.0
+        || target > i32::MAX as f64 / 10000.0
+    {
+        return Err(x3f_sys::Error::InvalidData("invalid DNG profile exposure").into());
+    }
+    let (n, d) = srational_pair(f64::from(baseline), 10_000);
+    let baseline = f64::from(n) / f64::from(d);
+    let offset = (target - baseline) as f32;
+    let (n, d) = srational_pair(f64::from(offset), 10_000);
+    let total = baseline + f64::from(n) / f64::from(d);
+    if !offset.is_finite() || offset.abs() > i32::MAX as f32 / 10000.0 || total < 0.0 {
+        return Err(x3f_sys::Error::InvalidData("DNG profile exposure cannot fit metadata").into());
+    }
+    Ok((offset, total))
+}
+
+fn append_profile(blob: &mut Vec<u8>, offsets: &mut Vec<u32>, profile: &[u8]) -> Result<(), Error> {
+    if !blob.len().is_multiple_of(2) {
+        blob.push(0);
+    }
+    let offset = u32::try_from(blob.len())
+        .map_err(|_| x3f_sys::Error::InvalidData("DNG profile offset exceeds 32 bits"))?;
+    let total = blob
+        .len()
+        .checked_add(profile.len())
+        .filter(|&n| n <= u32::MAX as usize)
+        .ok_or(x3f_sys::Error::InvalidData(
+            "DNG profile data exceeds 32 bits",
+        ))?;
+    blob.reserve(total - blob.len());
+    blob.extend_from_slice(profile);
+    offsets.push(offset);
+    Ok(())
+}
+
+impl ColorModeProfiles {
+    pub(super) fn write_default(&self, ifd: &mut DirectoryWriter) {
+        add_profile_tags(ifd, &self.name, self.color, self.forward);
+        ifd.add(
+            t::CALIBRATION_ILLUMINANT1,
+            Value::Short(vec![t::CALIB_ILLUMINANT_D65]),
+        );
+        ifd.add(
+            t::PROFILE_TONE_CURVE,
+            Value::Float(self.fit.curve.knots.clone()),
+        );
+        ifd.add(
+            t::PROFILE_LOOK_TABLE_DIMS,
+            Value::Long(classic::LOOK_DIMS.map(|v| v as u32).to_vec()),
+        );
+        ifd.add(
+            t::PROFILE_LOOK_TABLE_DATA,
+            Value::Float(self.fit.map.clone()),
+        );
+        ifd.add(t::PROFILE_LOOK_TABLE_ENCODING, Value::Long(vec![1]));
+        ifd.add(
+            t::BASELINE_EXPOSURE_OFFSET,
+            srational_from_floats(&[self.exposure_offset], 10_000),
+        );
+        ifd.add(
+            t::AS_SHOT_PROFILE_NAME,
+            Value::Ascii(CString::new(self.name.as_str()).expect("profile name without NUL")),
+        );
+        ifd.add(t::DNG_VERSION, Value::Byte(t::DNG_VERSION_1_4_0_0.to_vec()));
+        ifd.add(
+            t::DNG_BACKWARD_VERSION,
+            Value::Byte(t::DNG_VERSION_1_4_0_0.to_vec()),
+        );
+    }
+
+    pub(super) fn preview(
+        &self,
+        image: &Image,
+        crop: Option<super::strip::CropWindow>,
+        max_width: u32,
+        control: x3f_sys::Control<'_>,
+    ) -> Result<Preview, Error> {
+        let (top, left, rows, columns) = crop.unwrap_or((0, 0, image.rows, image.columns));
+        if rows == 0
+            || columns == 0
+            || max_width == 0
+            || (0..3).any(|c| {
+                !image.levels.black[c].is_finite()
+                    || image.levels.white[c] as f64 <= image.levels.black[c]
+            })
+        {
+            return Err(
+                x3f_sys::Error::InvalidData("invalid DNG preview dimensions or levels").into(),
+            );
+        }
+        let reduction = columns.div_ceil(max_width);
+        let width = columns.div_ceil(reduction);
+        let height = rows.div_ceil(reduction);
+        let mut data = Vec::with_capacity((width * height * 3) as usize);
+        for row in 0..height {
+            control.check()?;
+            for col in 0..width {
+                let mut input = [0.0; 3];
+                let mut count = 0u32;
+                for y in row * reduction..((row + 1) * reduction).min(rows) {
+                    for x in col * reduction..((col + 1) * reduction).min(columns) {
+                        for (c, sum) in input.iter_mut().enumerate() {
+                            *sum += (image.sample(top + y, left + x, c as u32) as f64
+                                - image.levels.black[c])
+                                / (image.levels.white[c] as f64 - image.levels.black[c]);
+                        }
+                        count += 1;
+                    }
+                }
+                let input = input.map(|v| v / f64::from(count) * image.dng_highlight_scale);
+                data.extend(self.rendering.sensor_to_srgb8(input));
+            }
+        }
+        Ok(Preview {
+            data,
+            rows: height,
+            columns: width,
+            channels: 3,
+            row_stride: width * 3,
+        })
+    }
+}
+
+/// Matrix source for a legacy profile.
 #[derive(Clone, Copy)]
 enum BmtSource {
-    /// Body's standard calibration matrix (`x3f_get_bmt_to_xyz(wb)` chain).
-    /// Picture-mode profiles fold their `CMCM_<mode>` 3×3 CCM into this
-    /// matrix to differentiate chroma per mode — Standard's CCM is
-    /// identity, while Vivid / FCBlue / etc. carry per-mode chroma
-    /// shifts. This matches the legacy `get_bmt_to_xyz_fcblue` path
-    /// in `src/x3f_output_dng.c:149` and is the *primary* chromatic
-    /// differentiator between picture profiles. (`ProfileToneCurve` is
-    /// the secondary tonal differentiator; `ProfileHueSatMapData1` is
-    /// the tertiary fine-tune.)
-    ///
-    /// An earlier iteration of this writer skipped the CCM
-    /// pre-multiplication on the theory that it caused Lightroom to
-    /// filter the profiles out of the Profile dropdown. That diagnosis
-    /// was wrong — the actual cause was the MMCR layout being
-    /// non-standard. With the layout fixed (see `build_mmcr_profile`),
-    /// CCM-pre-multiplied matrices validate fine.
+    /// Use the body's legacy calibration. Explicit modes use native calibration.
     Default,
-    /// "Don't convert" — assume the working space is Adobe RGB. Used by
-    /// the grayscale profiles and the `Unconverted` debug profile.
+    /// Use Adobe RGB for legacy grayscale and Unconverted profiles.
     AdobeRgb,
 }
 
@@ -103,9 +400,8 @@ const PROFILES: &[CameraProfile] = &[
         cmcc_camf: Some("CMCC_Standard"),
         multi_axis_camf: Some("MultiAxisTable_Standard"),
     },
-    // Disabled: these CMCM-derived picture profiles don't render as
-    // expected in Lightroom. Kept here (commented) rather than deleted so
-    // they can be re-enabled once the CMCM folding is sorted out.
+    // Retain the historical disabled entries. Explicit modes use the
+    // shared native calibration and resolver instead of these profiles.
     /*
     CameraProfile {
         name: "Vivid",
@@ -461,10 +757,7 @@ pub(super) fn build_extra_profiles_blob(
     Some((blob, offsets))
 }
 
-/// Build one `MMCR`-prefixed big-endian TIFF holding a single profile's
-/// tags. Done by hand (no `TiffWriter`) because the existing C path
-/// produces big-endian profiles regardless of host byte order, and the
-/// surface is only four tags.
+/// Keep the original big-endian MMCR layout for legacy profiles.
 fn build_mmcr_profile(
     name: &str,
     color: [f32; 9],
@@ -472,46 +765,54 @@ fn build_mmcr_profile(
     tone_curve: Option<&[f32]>,
     hue_sat_map: Option<&[f32]>,
 ) -> Vec<u8> {
+    build_profile_blob(name, color, forward, tone_curve, hue_sat_map, None, 0.0)
+}
+
+#[derive(Clone, Copy)]
+enum ProfileLook<'a> {
+    Classic(&'a [f32]),
+}
+
+impl<'a> ProfileLook<'a> {
+    fn classic(self) -> Option<&'a [f32]> {
+        match self {
+            Self::Classic(table) => Some(table),
+        }
+    }
+}
+
+/// Native profiles use IIRC. Legacy profiles keep the original MMCR layout.
+fn build_profile_blob(
+    name: &str,
+    color: [f32; 9],
+    forward: [f32; 9],
+    tone_curve: Option<&[f32]>,
+    hue_sat_map: Option<&[f32]>,
+    look: Option<ProfileLook<'_>>,
+    exposure_offset: f32,
+) -> Vec<u8> {
+    let look_table = look.and_then(ProfileLook::classic);
+    let little = look.is_some();
+    let short = |v: u16| {
+        if little {
+            v.to_le_bytes()
+        } else {
+            v.to_be_bytes()
+        }
+    };
+    let long = |v: u32| {
+        if little {
+            v.to_le_bytes()
+        } else {
+            v.to_be_bytes()
+        }
+    };
     let name_c = CString::new(name).expect("profile name without NUL");
     let name_bytes = name_c.as_bytes_with_nul();
 
-    // CPP reference layout (which Lightroom successfully parses):
-    //   offset 0  : "MMCR" magic
-    //   offset 4  : 4-byte BE IFD0 offset = 8
-    //   offset 8  : IFD body — count(2) + N×12 entries + next-IFD(4)
-    //   offset 8+: external values for tags whose size > 4
-    //
-    // Earlier versions of this writer placed externals BEFORE the IFD body
-    // (with a non-8 IFD0 offset). Lightroom's DNG SDK rejected those MMCR
-    // blobs entirely — the profiles never showed up in the Profile dropdown
-    // or even in the "Browse all profiles" view. Match the libtiff layout
-    // exactly: IFD body immediately after the 8-byte header, externals
-    // appended at the tail.
-    //
-    // Tag set (in tag-ID order):
-    //   259    Compression                (SHORT inline, value 1 = uncompressed)
-    //   50721  ColorMatrix1               (SRATIONAL[9], external)
-    //   50936  ProfileName                (ASCII, external if > 4 bytes)
-    //   50937  ProfileHueSatMapDims       (LONG[3], external) — optional
-    //   50938  ProfileHueSatMapData1      (FLOAT[H*S*V*3], external) — optional
-    //   50940  ProfileToneCurve           (FLOAT[N], external) — optional, only
-    //                                      when the profile's CMCC_<mode> ≠ 0
-    //   50964  ForwardMatrix1             (SRATIONAL[9], external)
-    //   51107  ProfileHueSatMapEncoding   (LONG inline, value 0 = linear) — optional
-    //   51110  DefaultBlackRender         (LONG inline, value 1)
-    //
-    // CalibrationIlluminant1 is intentionally omitted: CPP's MMCR blobs
-    // don't carry it (Adobe inherits the parent file's IFD0 illuminant)
-    // and including it had no observable effect, so we drop it to stay
-    // byte-for-byte compatible with the working reference.
-    //
-    // The hue/sat map is *not* present in CPP MMCR blobs — Sigma's
-    // reference build leaves the per-mode hue/sat correction to its own
-    // post-render pass and only ships ColorMatrix + ForwardMatrix +
-    // ToneCurve. We add it so DNG-aware processors (Lightroom, Capture
-    // One, RawTherapee) that don't run Sigma's pipeline can apply the
-    // same hue/sat correction the camera would have.
-
+    // Place the IFD at offset 8, then its external values. Adobe rejects
+    // the older layout that put external values before the profile IFD.
+    // Legacy profiles omit illuminant, LookTable and exposure-offset tags.
     // We have to know each entry's value-or-offset slot before we can
     // emit the IFD body. So lay out the externals first (in a side
     // buffer), then write the IFD body referencing them, then append the
@@ -523,6 +824,12 @@ fn build_mmcr_profile(
     }
     if tone_curve.is_some() {
         entry_count += 1;
+    }
+    if look.is_some() {
+        entry_count += 2; // Illuminant + exposure offset
+    }
+    if look_table.is_some() {
+        entry_count += 3; // Dims + data + encoding
     }
     let ifd_body_len: usize = 2 + (entry_count as usize) * 12 + 4;
     let externals_start: usize = header_bytes + ifd_body_len;
@@ -538,22 +845,22 @@ fn build_mmcr_profile(
     let color_off = (externals_start + ext.len()) as u32;
     for v in color {
         let (n, d) = srational_pair(v as f64, 10_000);
-        ext.extend_from_slice(&n.to_be_bytes());
-        ext.extend_from_slice(&d.to_be_bytes());
+        ext.extend_from_slice(&long(n as u32));
+        ext.extend_from_slice(&long(d as u32));
     }
     pad2(&mut ext);
     let forward_off = (externals_start + ext.len()) as u32;
     for v in forward {
         let (n, d) = srational_pair(v as f64, 10_000);
-        ext.extend_from_slice(&n.to_be_bytes());
-        ext.extend_from_slice(&d.to_be_bytes());
+        ext.extend_from_slice(&long(n as u32));
+        ext.extend_from_slice(&long(d as u32));
     }
     let tone_curve_meta = tone_curve.map(|curve| {
         // FLOAT is 4 bytes / 4-byte aligned; ext is currently 8-aligned
         // (matrix payloads are 8 byte multiples) so no extra pad needed.
         let off = (externals_start + ext.len()) as u32;
         for &v in curve {
-            ext.extend_from_slice(&v.to_be_bytes());
+            ext.extend_from_slice(&long(v.to_bits()));
         }
         (off, curve.len() as u32)
     });
@@ -563,13 +870,31 @@ fn build_mmcr_profile(
         // Data2 (50939). Both are 4-byte aligned.
         let dims_off = (externals_start + ext.len()) as u32;
         for &d in &super::hue_sat_map::HUE_SAT_MAP_DIMS {
-            ext.extend_from_slice(&d.to_be_bytes());
+            ext.extend_from_slice(&long(d));
         }
         let data_off = (externals_start + ext.len()) as u32;
         for &v in hsm {
-            ext.extend_from_slice(&v.to_be_bytes());
+            ext.extend_from_slice(&long(v.to_bits()));
         }
         (dims_off, data_off, hsm.len() as u32)
+    });
+    let look_table_meta = look_table.map(|table| {
+        let dims_off = (externals_start + ext.len()) as u32;
+        for dimension in classic::LOOK_DIMS {
+            ext.extend_from_slice(&long(dimension as u32));
+        }
+        let data_off = (externals_start + ext.len()) as u32;
+        for value in table {
+            ext.extend_from_slice(&long(value.to_bits()));
+        }
+        (dims_off, data_off, table.len() as u32)
+    });
+    let exposure_meta = look.map(|_| {
+        let exposure_off = (externals_start + ext.len()) as u32;
+        let (n, d) = srational_pair(f64::from(exposure_offset), 10_000);
+        ext.extend_from_slice(&long(n as u32));
+        ext.extend_from_slice(&long(d as u32));
+        exposure_off
     });
     let name_inline = name_bytes.len() <= 4;
     let name_off = if name_inline {
@@ -586,7 +911,7 @@ fn build_mmcr_profile(
         // SHORT inline: value goes in the first 2 bytes of the 4-byte slot
         // (BE), rest zero — TIFF inline-value convention.
         let mut b = [0u8; 4];
-        b[..2].copy_from_slice(&1u16.to_be_bytes());
+        b[..2].copy_from_slice(&short(1));
         b
     };
     let mut entries: Vec<(u16, u16, u32, [u8; 4])> = Vec::with_capacity(entry_count as usize);
@@ -600,8 +925,18 @@ fn build_mmcr_profile(
         t::COLOR_MATRIX1,
         super::tiff_writer::TIFF_TYPE_SRATIONAL,
         9,
-        color_off.to_be_bytes(),
+        long(color_off),
     ));
+    if look.is_some() {
+        let mut illuminant = [0u8; 4];
+        illuminant[..2].copy_from_slice(&short(t::CALIB_ILLUMINANT_D65));
+        entries.push((
+            t::CALIBRATION_ILLUMINANT1,
+            super::tiff_writer::TIFF_TYPE_SHORT,
+            1,
+            illuminant,
+        ));
+    }
     entries.push((
         t::PROFILE_NAME,
         super::tiff_writer::TIFF_TYPE_ASCII,
@@ -611,7 +946,7 @@ fn build_mmcr_profile(
             b[..name_bytes.len()].copy_from_slice(name_bytes);
             b
         } else {
-            name_off.to_be_bytes()
+            long(name_off)
         },
     ));
     if let Some((dims_off, data_off, data_count)) = hue_sat_map_meta {
@@ -619,13 +954,13 @@ fn build_mmcr_profile(
             t::PROFILE_HUE_SAT_MAP_DIMS,
             super::tiff_writer::TIFF_TYPE_LONG,
             3,
-            dims_off.to_be_bytes(),
+            long(dims_off),
         ));
         entries.push((
             t::PROFILE_HUE_SAT_MAP_DATA1,
             super::tiff_writer::TIFF_TYPE_FLOAT,
             data_count,
-            data_off.to_be_bytes(),
+            long(data_off),
         ));
     }
     if let Some((tone_off, tone_count)) = tone_curve_meta {
@@ -633,45 +968,75 @@ fn build_mmcr_profile(
             t::PROFILE_TONE_CURVE,
             super::tiff_writer::TIFF_TYPE_FLOAT,
             tone_count,
-            tone_off.to_be_bytes(),
+            long(tone_off),
         ));
     }
     entries.push((
         t::FORWARD_MATRIX1,
         super::tiff_writer::TIFF_TYPE_SRATIONAL,
         9,
-        forward_off.to_be_bytes(),
+        long(forward_off),
     ));
+    if let Some((dims_off, data_off, data_count)) = look_table_meta {
+        entries.push((
+            t::PROFILE_LOOK_TABLE_DIMS,
+            super::tiff_writer::TIFF_TYPE_LONG,
+            3,
+            long(dims_off),
+        ));
+        entries.push((
+            t::PROFILE_LOOK_TABLE_DATA,
+            super::tiff_writer::TIFF_TYPE_FLOAT,
+            data_count,
+            long(data_off),
+        ));
+    }
     if hue_sat_map_meta.is_some() {
         // LONG inline: 4-byte value goes directly in the slot.
         entries.push((
             t::PROFILE_HUE_SAT_MAP_ENCODING,
             super::tiff_writer::TIFF_TYPE_LONG,
             1,
-            super::hue_sat_map::HUE_SAT_MAP_ENCODING.to_be_bytes(),
+            long(super::hue_sat_map::HUE_SAT_MAP_ENCODING),
+        ));
+    }
+    if look_table_meta.is_some() {
+        entries.push((
+            t::PROFILE_LOOK_TABLE_ENCODING,
+            super::tiff_writer::TIFF_TYPE_LONG,
+            1,
+            long(1),
+        ));
+    }
+    if let Some(exposure_off) = exposure_meta {
+        entries.push((
+            t::BASELINE_EXPOSURE_OFFSET,
+            super::tiff_writer::TIFF_TYPE_SRATIONAL,
+            1,
+            long(exposure_off),
         ));
     }
     entries.push((
         t::DEFAULT_BLACK_RENDER,
         super::tiff_writer::TIFF_TYPE_LONG,
         1,
-        1u32.to_be_bytes(),
+        long(1),
     ));
     debug_assert_eq!(entries.len(), entry_count as usize);
 
     let mut buf: Vec<u8> = Vec::with_capacity(externals_start + ext.len());
-    buf.extend_from_slice(b"MMCR");
-    buf.extend_from_slice(&(header_bytes as u32).to_be_bytes()); // IFD0 offset = 8
+    buf.extend_from_slice(if little { b"IIRC" } else { b"MMCR" });
+    buf.extend_from_slice(&long(header_bytes as u32)); // IFD0 offset = 8
     debug_assert_eq!(buf.len(), header_bytes);
 
-    buf.extend_from_slice(&entry_count.to_be_bytes());
+    buf.extend_from_slice(&short(entry_count));
     for (tag, ty, count, value4) in entries {
-        buf.extend_from_slice(&tag.to_be_bytes());
-        buf.extend_from_slice(&ty.to_be_bytes());
-        buf.extend_from_slice(&count.to_be_bytes());
+        buf.extend_from_slice(&short(tag));
+        buf.extend_from_slice(&short(ty));
+        buf.extend_from_slice(&long(count));
         buf.extend_from_slice(&value4);
     }
-    buf.extend_from_slice(&0u32.to_be_bytes()); // next IFD = none
+    buf.extend_from_slice(&long(0)); // next IFD = none
     debug_assert_eq!(buf.len(), externals_start);
 
     buf.extend_from_slice(&ext);
@@ -695,6 +1060,10 @@ pub(crate) fn srational_from_floats(values: &[f32], denom: i32) -> Value {
             .collect(),
     )
 }
+
+#[cfg(test)]
+#[path = "profile_tests.rs"]
+mod profile_tests;
 
 #[cfg(test)]
 mod tests {

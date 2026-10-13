@@ -82,6 +82,7 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 | `-o <DIR>`                | write output to `<DIR>`                                                            |
 | `-v` / `-q`               | verbose / quiet (errors only)                                                      |
 | `-color <SPACE>`          | RGB color space: `none`, `sRGB`, `AdobeRGB`, `ProPhotoRGB` (does not affect DNG)   |
+| `-color-mode <MODE>` | experimental Merrill/dp Quattro camera look for color TIFF or DNG; see the compatibility limit below |
 | `-compress`               | lossless compression (DNG: lossless JPEG, TIFF: Deflate/ZIP)                       |
 | `-denoise <0-10>`         | NLM denoise intensity: `0` = off, `10` = full strength (**default**); intermediate values linearly scale the NLM sigma |
 | `-no-denoise`             | disable the NLM denoise pass (alias for `-denoise 0`)                               |
@@ -147,6 +148,33 @@ color output and denoise intensity 10. DNG, Cineon, monochrome, MED/LOW and a
 forced GPU backend return an error. Rust callers set `ProcessOptions::spp_denoise`.
 The default is false. See the [SPP alignment notes](docs/src/spp-alignment.md)
 for supported settings and native verification.
+
+## Camera Color Modes (development)
+
+Set `-color-mode Vivid`, another named mode, or `-color-mode as-shot` to use
+the new camera-mode path. TIFF applies the look to its pixels. Merrill has
+Standard, Vivid, Neutral, Portrait, Landscape and FCBlue. dp Quattro adds
+SunsetRed, ForestGreen, FCYellow, Cinema and TealAndOrange. sd Quattro and
+sd Quattro H need a further calibration port and return an error.
+
+Rust callers set `ProcessOptions::color_mode` and can query
+`Reader::available_color_modes()`. This new public field requires updates to
+exhaustive Rust struct literals; `..Default::default()` retains the existing
+output. The C ABI is unchanged. The option is separate from output color
+encoding and is accepted for TIFF and DNG exports only.
+
+The DNG implementation is not ready for release. It preserves raw samples and
+embeds named profiles. Lightroom 9.5.1 Local ignored the initial RGBTables
+looks. The replacement classic-profile controls pass for cast, exposure, look
+tables and long tone curves, with JPEG export checks for cast, exposure and hue.
+The full Merrill and dp Quattro mode files now pass the combined Lightroom
+check: defaults, visible switching, JPEG export, reopen and editable controls.
+Source review and workspace checks pass. Full SPP image parity is unverified.
+DNG looks approximate native rendering at the export white balance. Later
+WB edits keep the profile fixed and can differ from SPP. Highlights outside
+the DNG profile gamut can also differ.
+See the [implementation status and remaining gates](docs/COLOR-MODES-PLAN.md).
+Omitting `-color-mode` retains the existing TIFF and DNG behavior.
 
 ## DNG output
 

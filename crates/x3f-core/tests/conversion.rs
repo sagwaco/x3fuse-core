@@ -178,6 +178,19 @@ fn concurrent_conversions_match_serial_for_per_file_options() {
         };
         jobs.push((file, OutputFormat::Dng, normal.clone()));
         jobs.push((file, OutputFormat::Tiff, normal.clone()));
+        let mut reader = x3f_core::Reader::open(file).unwrap();
+        if let Ok(modes) = reader.available_color_modes() {
+            for mode in modes.into_iter().take(2) {
+                jobs.push((
+                    file,
+                    OutputFormat::Tiff,
+                    ProcessOptions {
+                        color_mode: Some(mode),
+                        ..normal.clone()
+                    },
+                ));
+            }
+        }
         jobs.push((
             file,
             OutputFormat::Dng,
@@ -202,7 +215,6 @@ fn concurrent_conversions_match_serial_for_per_file_options() {
             },
         ));
     }
-    // Append so the four baseline cases above keep their existing indices.
     // This fixture actually changes with the LUT; the first two Quattros do not.
     let clipped = files[0].with_file_name("CLIPPED_IMAGE_MERRILL.X3F");
     let lut_start = jobs.len();
@@ -214,6 +226,17 @@ fn concurrent_conversions_match_serial_for_per_file_options() {
                 ProcessOptions {
                     denoise_intensity: 0,
                     rgb_chroma_lut: Some(enabled),
+                    ..ProcessOptions::default()
+                },
+            ));
+        }
+        for mode in [x3f_core::ColorMode::Standard, x3f_core::ColorMode::Vivid] {
+            jobs.push((
+                &clipped,
+                OutputFormat::Tiff,
+                ProcessOptions {
+                    denoise_intensity: 0,
+                    color_mode: Some(mode),
                     ..ProcessOptions::default()
                 },
             ));

@@ -6,7 +6,7 @@
 //! TIFF header (II + magic + IFD0-offset)
 //! Preview strip bytes               (8-bit RGB, downsampled to 300 px wide)
 //! Raw strip bytes                    (16-bit RGB, full resolution; optional lossless JPEG)
-//! ExtraCameraProfiles blob           (concatenated MMCR mini-TIFFs)
+//! ExtraCameraProfiles blob           (MMCR or IIRC mini-TIFFs)
 //! IFD1 (raw) — external values + body
 //! IFD0 (preview) — external values + body
 //! ```
@@ -27,6 +27,7 @@
 //!   emits lossless JPEG ([`ljpeg`]), the compression the spec sanctions
 //!   for 16-bit integer raws and the one all RAW engines decode.
 
+mod classic_profile;
 pub(crate) mod color;
 pub(crate) mod exif;
 mod hue_sat_map;
@@ -34,6 +35,7 @@ mod ljpeg;
 pub(crate) mod metadata;
 mod opcodes;
 mod profiles;
+mod rgb_table;
 mod strip;
 pub(crate) mod tags;
 pub(crate) mod tiff_writer;
@@ -104,6 +106,14 @@ pub(crate) fn write_controlled(
     let wb = opts.wb.clone().unwrap_or_default();
     let calibration =
         ColorCalibration::new(reader, &wb).ok_or(Error::Library(crate::LibraryError::Argument))?;
+    let modes = opts
+        .color_mode
+        .map(|selection| {
+            profiles::PreparedColorModes::resolve(reader, &wb, selection, warnings, control)
+        })
+        .transpose()?;
+    // Creative selection belongs to profile metadata and preview, not sensor samples.
+    opts.color_mode = None;
 
     let mut image = reader.get_image_with_control(&opts, control)?;
     on_write();
@@ -142,6 +152,18 @@ pub(crate) fn write_controlled(
     let (out_rows, out_cols) = crop
         .map(|(_, _, r, c)| (r, c))
         .unwrap_or((image.rows, image.columns));
+    let color_profiles = modes
+        .map(|modes| {
+            modes.finish(
+                reader,
+                &wb,
+                &calibration,
+                image.dng_highlight_scale,
+                warnings,
+                control,
+            )
+        })
+        .transpose()?;
 
     let mut preview_opts = opts.clone();
     if opts.dng_highlight_recovery {
@@ -149,8 +171,11 @@ pub(crate) fn write_controlled(
         // raw samples. Preview rendering only restores the exposure scale.
         preview_opts.apply_sgain = Some(false);
     }
-    let preview =
-        reader.get_preview_with_control(&image, &preview_opts, PREVIEW_MAX_WIDTH, control)?;
+    let preview = if let Some(profiles) = &color_profiles {
+        profiles.preview(&image, crop, PREVIEW_MAX_WIDTH, control)?
+    } else {
+        reader.get_preview_with_control(&image, &preview_opts, PREVIEW_MAX_WIDTH, control)?
+    };
     let preview_bytes = strip::encode_preview_strip(&preview);
     // Lossless JPEG must go out as ONE full-height strip: the dcraw-
     // lineage decoders (LibRaw, and Apple's engine behaves the same)
@@ -206,18 +231,33 @@ pub(crate) fn write_controlled(
     }
 
     // -- ExtraCameraProfiles blob (default profile is written into IFD0
-    //    directly; everything else goes here as MMCR-prefixed mini-TIFFs).
+    //    directly; extras use MMCR or IIRC mini-TIFFs).
     //    We write the blob ahead of IFD1 so its offsets are known when
     //    we build IFD0.
-    let default_idx = profiles::default_profile_index(reader);
-    let (extra_blob, extra_rel_offsets) =
-        build_extra_profiles_blob(reader, &wb, &calibration, default_idx)
-            .ok_or(Error::Library(crate::LibraryError::Argument))?;
+    let legacy_extra;
+    let (extra_blob, extra_rel_offsets) = if let Some(profiles) = &color_profiles {
+        (&profiles.extra_blob, &profiles.extra_offsets)
+    } else {
+        legacy_extra = build_extra_profiles_blob(
+            reader,
+            &wb,
+            &calibration,
+            profiles::default_profile_index(reader),
+        )
+        .ok_or(Error::Library(crate::LibraryError::Argument))?;
+        (&legacy_extra.0, &legacy_extra.1)
+    };
     let extra_offsets_abs: Vec<u32> = if extra_blob.is_empty() {
         Vec::new()
     } else {
-        let base = tiff.write_data(&extra_blob).map_err(io_err(path))?;
-        extra_rel_offsets.iter().map(|o| base + o).collect()
+        let base = tiff.write_data(extra_blob).map_err(io_err(path))?;
+        extra_rel_offsets
+            .iter()
+            .map(|o| {
+                base.checked_add(*o)
+                    .ok_or(Error::Library(crate::LibraryError::Argument))
+            })
+            .collect::<Result<_, _>>()?
     };
 
     // -- OpcodeList3 lookup (optional, --opcodes-dir) -----------------
@@ -295,8 +335,11 @@ pub(crate) fn write_controlled(
         &calibration,
         highlight_scale,
         &mut ifd0,
+        color_profiles.as_ref().map(|p| p.white_xy),
     );
-    if write_default_profile(reader, &wb, &calibration, &mut ifd0).is_none() {
+    if let Some(profiles) = &color_profiles {
+        profiles.write_default(&mut ifd0);
+    } else if write_default_profile(reader, &wb, &calibration, &mut ifd0).is_none() {
         return Err(Error::Library(crate::LibraryError::Argument));
     }
     if !extra_offsets_abs.is_empty() {
@@ -550,6 +593,7 @@ fn add_dng_top_level_tags(
     calibration: &ColorCalibration,
     highlight_scale: f64,
     ifd: &mut DirectoryWriter,
+    white_xy: Option<[f64; 2]>,
 ) {
     // BaselineExposure = log2(capture_iso/sensor_iso)
     //                  + log2(DigitalISOGain) + log2(highlight_scale).
@@ -564,15 +608,7 @@ fn add_dng_top_level_tags(
     // scales the raster down uniformly to retain recovered headroom;
     // BaselineExposure restores the default viewing brightness. A reader
     // that ignores this optional tag retains the detail but renders darker.
-    let gain_be = calibration.digital_gain_ev;
-    let iso_be = match (
-        reader.dng_camf_float("SensorISO"),
-        reader.dng_camf_float("CaptureISO"),
-    ) {
-        (Some(sensor), Some(capture)) => Some((capture / sensor).log2()),
-        _ => None,
-    };
-    if let Some(be) = baseline_exposure(iso_be, gain_be, highlight_scale) {
+    if let Some(be) = camera_baseline_exposure(reader, calibration, highlight_scale) {
         ifd.add(
             tags::BASELINE_EXPOSURE,
             srational_from_floats(&[be as f32], 10_000),
@@ -580,16 +616,26 @@ fn add_dng_top_level_tags(
     }
 
     // Include the residual digital gain without clipping the raw samples.
-    ifd.add(
-        tags::AS_SHOT_NEUTRAL,
-        Value::Rational(
-            calibration
-                .neutral
-                .iter()
-                .map(|&v| ((v * 10_000.0).round().max(1.0) as u32, 10_000_u32))
-                .collect(),
-        ),
-    );
+    if let Some(xy) = white_xy {
+        ifd.add(
+            tags::AS_SHOT_WHITE_XY,
+            Value::Rational(
+                xy.map(|v| ((v * 1_000_000_000.0).round() as u32, 1_000_000_000))
+                    .to_vec(),
+            ),
+        );
+    } else {
+        ifd.add(
+            tags::AS_SHOT_NEUTRAL,
+            Value::Rational(
+                calibration
+                    .neutral
+                    .iter()
+                    .map(|&v| ((v * 10_000.0).round().max(1.0) as u32, 10_000_u32))
+                    .collect(),
+            ),
+        );
+    }
 
     // CameraCalibration defaults to identity. Its diagonal is folded into
     // every profile's ColorMatrix so readers that ignore it still agree.
@@ -605,6 +651,21 @@ fn add_dng_top_level_tags(
             );
         }
     }
+}
+
+fn camera_baseline_exposure(
+    reader: &Reader,
+    calibration: &ColorCalibration,
+    highlight_scale: f64,
+) -> Option<f64> {
+    let iso = match (
+        reader.dng_camf_float("SensorISO"),
+        reader.dng_camf_float("CaptureISO"),
+    ) {
+        (Some(sensor), Some(capture)) => Some((capture / sensor).log2()),
+        _ => None,
+    };
+    baseline_exposure(iso, calibration.digital_gain_ev, highlight_scale)
 }
 
 /// Replicates the JPEG-thumbnail-aspect-driven `DefaultUserCrop` logic

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use x3f_core::{set_max_printed_matrix_elements, set_offset_legacy, set_verbosity};
-use x3f_core::{ColorEncoding, DngHighlightMapping, ProcessOptions, Reader, Verbosity};
+use x3f_core::{ColorEncoding, ColorMode, DngHighlightMapping, ProcessOptions, Reader, Verbosity};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum FileType {
@@ -56,6 +56,7 @@ struct Args {
     apply_sgain: Option<bool>,
     file_type: FileType,
     color_encoding: ColorEncoding,
+    color_mode: Option<ColorMode>,
     log_hist: bool,
     wb: Option<String>,
     compress: bool,
@@ -90,6 +91,7 @@ impl Default for Args {
             apply_sgain: None,
             file_type: FileType::Dng,
             color_encoding: ColorEncoding::Srgb,
+            color_mode: None,
             log_hist: false,
             wb: None,
             compress: false,
@@ -131,6 +133,14 @@ fn usage(progname: &str) -> ! {
          \x20                  'none' means neither scaling, applying gamma\n\
          \x20                  nor converting color space.\n\
          \x20                  This switch does not affect DNG output\n\
+         \x20  -color-mode <MODE>  Select a camera color mode at normal strength\n\
+         \x20                  as-shot, Standard, Vivid, Neutral, Portrait,\n\
+         \x20                  Landscape, FCBlue; dp Quattro also supports SunsetRed,\n\
+         \x20                  ForestGreen, FCYellow, Cinema, TealAndOrange.\n\
+         \x20                  Color TIFF applies the look to pixels. DNG embeds\n\
+         \x20                  selectable profiles with this requested default.\n\
+         \x20                  DNG looks are approximations at export white balance.\n\
+         \x20                  Omitting the option preserves existing output.\n\
          \x20  -unprocessed    Dump RAW without any preprocessing\n\
          \x20  -qtop           Dump Quattro top layer without preprocessing\n\
          \x20  -no-crop        Do not crop to active area\n\
@@ -285,6 +295,14 @@ fn parse_args(argv: &[String]) -> Args {
                 };
                 args.color_explicit = true;
             }
+            "-color-mode" => {
+                i += 1;
+                let value = argv.get(i).unwrap_or_else(|| usage(progname));
+                args.color_mode = Some(value.parse().unwrap_or_else(|_| {
+                    eprintln!("Unknown camera color mode: {value}");
+                    usage(progname)
+                }));
+            }
             "-cineon" => args.cineon = true,
             "-o" => {
                 i += 1;
@@ -389,6 +407,20 @@ fn normalize(args: &mut Args) {
 /// usage()-style exit. Kept as a pure function so the unit tests can
 /// exercise it without `process::exit`.
 fn validate_args(args: &Args) -> Result<(), String> {
+    if args.color_mode.is_some() {
+        if !matches!(args.file_type, FileType::Tiff | FileType::Dng) {
+            return Err("-color-mode requires color TIFF or DNG output".into());
+        }
+        if args.cineon
+            || (args.file_type == FileType::Tiff
+                && !matches!(
+                    args.color_encoding,
+                    ColorEncoding::Srgb | ColorEncoding::AdobeRgb | ColorEncoding::ProPhotoRgb
+                ))
+        {
+            return Err("-color-mode requires color TIFF without Cineon, or DNG output".into());
+        }
+    }
     if args.spp_denoise {
         if args.rgb_chroma_lut == Some(true) {
             return Err(
@@ -519,6 +551,7 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
 
     let opts = ProcessOptions {
         color_encoding: args.color_encoding,
+        color_mode: args.color_mode,
         crop: args.crop,
         fix_bad: args.fix_bad,
         denoise_intensity: args.denoise_intensity,
@@ -730,6 +763,44 @@ mod tests {
         assert_eq!(a.color_encoding, ColorEncoding::Unprocessed);
         let a = parse(&["-color", "sRGB", "-qtop", "in.X3F"]);
         assert_eq!(a.color_encoding, ColorEncoding::Qtop);
+    }
+
+    #[test]
+    fn color_mode_is_separate_from_output_encoding_and_opt_in() {
+        assert_eq!(parse(&["in.X3F"]).color_mode, None);
+        let args = parse(&[
+            "-tiff",
+            "-color",
+            "AdobeRGB",
+            "-color-mode",
+            "Vivid",
+            "in.X3F",
+        ]);
+        assert_eq!(args.color_mode, Some(ColorMode::Vivid));
+        assert_eq!(args.color_encoding, ColorEncoding::AdobeRgb);
+        assert!(validate_args(&args).is_ok());
+        let args = parse(&["-dng", "-color", "none", "-color-mode", "as-shot", "in.X3F"]);
+        assert_eq!(args.color_mode, Some(ColorMode::AsShot));
+        assert!(validate_args(&args).is_ok());
+    }
+
+    #[test]
+    fn color_mode_rejects_outputs_outside_tiff_and_dng() {
+        for flags in [
+            vec!["-jpg"],
+            vec!["-raw"],
+            vec!["-meta"],
+            vec!["-ppm"],
+            vec!["-histogram"],
+            vec!["-tiff", "-cineon"],
+            vec!["-tiff", "-unprocessed"],
+            vec!["-tiff", "-qtop"],
+            vec!["-tiff", "-color", "none"],
+        ] {
+            let mut command = flags;
+            command.extend(["-color-mode", "Standard", "in.X3F"]);
+            assert!(validate_args(&parse(&command)).is_err(), "{command:?}");
+        }
     }
 
     #[test]

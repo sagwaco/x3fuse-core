@@ -337,13 +337,13 @@ impl BitWriter {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     /// Minimal lossless-JPEG decoder for round-trip tests. Parses the
     /// markers the encoder emits (single DHT, SOF3, single interleaved
     /// scan, predictor 1, no restarts) and reconstructs the raster.
-    fn decode(stream: &[u8]) -> (Vec<u16>, usize, usize, usize) {
+    pub(crate) fn decode(stream: &[u8]) -> (Vec<u16>, usize, usize, usize) {
         assert_eq!(&stream[..2], &[0xFF, 0xD8], "missing SOI");
         let mut pos = 2;
         let mut bits = [0u8; 16];

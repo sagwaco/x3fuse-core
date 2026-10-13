@@ -200,13 +200,20 @@ pub(crate) mod spp_denoise;
 // bad-pixel interpolation; M6e4 (in highlight.rs) the highlight
 // recovery family. preprocess_data / convert_data / convert entry
 // points remain C until later phases.
+mod color_modes;
 mod process;
+pub use color_modes::{
+    available_color_modes, color_mode_linear_tone_lut, color_mode_tone_index, color_mode_tone_lut,
+    resolve_color_mode, ColorMode, ColorModeCalibration, ColorModeColorDq, ColorModeParameters,
+    ColorModeRenderLuts, ColorModeSensor, ColorModeToneParameters,
+};
 pub use process::{
-    get_image_controlled, get_preview_controlled, get_scene_linear_controlled, x3f_get_bmt_to_xyz,
-    x3f_get_digital_iso_gain, x3f_get_dng_highlight_scale, x3f_get_dng_shoulder_ceiling,
-    x3f_get_dng_shoulder_knee, x3f_get_gain, x3f_get_image, x3f_get_preview,
-    x3f_get_preview_with_scale, x3f_get_raw_to_xyz, x3f_set_cineon, x3f_set_dng_highlight_mapping,
-    x3f_set_dng_highlight_recovery, ProcessingInfo, ProcessingOptions, SceneLinearData,
+    color_mode_calibration, get_image_controlled, get_preview_controlled,
+    get_scene_linear_controlled, x3f_get_bmt_to_xyz, x3f_get_digital_iso_gain,
+    x3f_get_dng_highlight_scale, x3f_get_dng_shoulder_ceiling, x3f_get_dng_shoulder_knee,
+    x3f_get_gain, x3f_get_image, x3f_get_preview, x3f_get_preview_with_scale, x3f_get_raw_to_xyz,
+    x3f_set_cineon, x3f_set_dng_highlight_mapping, x3f_set_dng_highlight_recovery, ProcessingInfo,
+    ProcessingOptions, SceneLinearData,
 };
 
 // M6e4: highlight-recovery family (highlight_params, chroma LUT, sat

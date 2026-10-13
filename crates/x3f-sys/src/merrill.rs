@@ -11,7 +11,8 @@ const LUT_SIZE: usize = 65536;
 const MAX_CURVE_EXTENT: f64 = 16384.0;
 
 /// GetTanhLUT @0x5d99c, with ProcessTiles' fixed B={0.8,0.8,0.8}.
-pub(crate) struct ColorDq {
+#[derive(Clone, Debug)]
+pub struct ColorDq {
     tables: [Vec<i16>; 3],
     mask: usize,
 }
@@ -63,7 +64,7 @@ impl ColorDq {
 
     /// ApplyMatrixAndColorDQ @0x73204..0x732c4, after its matrix multiply.
     /// The residual step that follows this operation bounds RGB to [0,32766].
-    pub(crate) fn apply(&self, q: [f64; 3]) -> [f32; 3] {
+    pub fn apply(&self, q: [f64; 3]) -> [f32; 3] {
         let residual = std::array::from_fn::<_, 3, _>(|c| {
             let i = ((q[c] + 1.5e-8) + 6755399441055744.0).to_bits() as i32;
             i.wrapping_sub(self.tables[c][i as usize & self.mask] as i32)
@@ -131,7 +132,7 @@ pub(crate) fn color_dq_noise_scale(
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ToneParams {
+pub struct ToneParams {
     pub start: f64,
     pub end: f64,
     pub steepness: f64,
@@ -189,6 +190,15 @@ pub(crate) fn generate_tone_lut(
     settings: ToneSettings,
     control: Control<'_>,
 ) -> Result<Vec<u16>> {
+    let (curve, scale) = generate_merrill_tone_curve(p, settings, control)?;
+    Ok(quantize_tone_curve(&curve, scale))
+}
+
+fn generate_merrill_tone_curve(
+    p: ToneParams,
+    settings: ToneSettings,
+    control: Control<'_>,
+) -> Result<(Vec<f32>, f64)> {
     control.check()?;
     if ![
         p.start,
@@ -344,6 +354,11 @@ pub(crate) fn generate_tone_lut(
     if !scale.is_finite() || !curve.iter().all(|v| v.is_finite()) {
         return Err(invalid_tone());
     }
+    Ok((curve, scale))
+}
+
+fn quantize_tone_curve(curve: &[f32], scale: f64) -> Vec<u16> {
+    let n = curve.len() - 1;
     let mut lut = vec![0; LUT_SIZE];
     for i in 0..n {
         lut[i] = (curve[i] as f64).mul_add(scale, 0.5).clamp(0.0, 65535.0) as u16;
@@ -351,7 +366,162 @@ pub(crate) fn generate_tone_lut(
     // The native builder normalizes with sample n, but repeats sample n-1.
     let tail = lut[n - 1];
     lut[n..].fill(tail);
-    Ok(lut)
+    lut
+}
+
+fn color_mode_curve(
+    params: &crate::ColorModeParameters,
+    exposure: f64,
+    control: Control<'_>,
+) -> Result<(Vec<f32>, f64)> {
+    match params.sensor {
+        crate::ColorModeSensor::Merrill => generate_merrill_tone_curve(
+            params.tone,
+            ToneSettings {
+                pixel_saturation: params.pixel_saturation,
+                exposure,
+                shadows: 0.0,
+                contrast: params.contrast,
+                highlights: 0.0,
+                alternate: false,
+            },
+            control,
+        ),
+        crate::ColorModeSensor::Quattro => generate_quattro_tone_curve(params, exposure, control),
+    }
+}
+
+pub(crate) fn generate_color_mode_tone_lut(
+    params: &crate::ColorModeParameters,
+    exposure: f64,
+    control: Control<'_>,
+) -> Result<Vec<u16>> {
+    let (curve, scale) = color_mode_curve(params, exposure, control)?;
+    Ok(quantize_tone_curve(&curve, scale))
+}
+
+pub(crate) fn generate_color_mode_linear_tone_lut(
+    params: &crate::ColorModeParameters,
+    exposure: f64,
+    control: Control<'_>,
+) -> Result<Vec<f64>> {
+    let (curve, scale) = color_mode_curve(params, exposure, control)?;
+    let n = curve.len() - 1;
+    Ok((0..LUT_SIZE)
+        .map(|i| (f64::from(curve[i.min(n - 1)]) * scale / 65535.0).clamp(0.0, 1.0))
+        .collect())
+}
+
+/// Normal alpha 1 makes the fixed curve's blend coefficient zero.
+fn generate_quattro_tone_curve(
+    params: &crate::ColorModeParameters,
+    exposure: f64,
+    control: Control<'_>,
+) -> Result<(Vec<f32>, f64)> {
+    control.check()?;
+    let p = params.tone;
+    let saturation = params.pixel_saturation * (-exposure).exp2();
+    if ![
+        p.start,
+        p.end,
+        p.steepness,
+        p.steepness2,
+        p.breakpoint,
+        p.scale,
+        params.contrast,
+        exposure,
+    ]
+    .iter()
+    .all(|v| v.is_finite())
+        || p.start >= p.end
+        || p.steepness <= 0.0
+        || p.steepness2 <= 0.0
+        || p.scale <= 0.0
+        || !(4.0..=MAX_CURVE_EXTENT).contains(&saturation)
+    {
+        return Err(Error::InvalidData(
+            "unsupported or degenerate Quattro tone parameters",
+        ));
+    }
+    let n = saturation as usize;
+    let contrast = (0.5 * params.contrast.clamp(-2.0, 2.0)).exp2();
+    let (k1, k2) = (p.steepness * contrast, p.steepness2 * contrast);
+    let domain = |x: f64| {
+        x.powf(1.0 / 2.2222222222222223)
+            .mul_add(p.end - p.start, p.start)
+    };
+    let sigmoid = |x: f64, k: f64| 1.0 / (1.0 + (-k * x).exp());
+    let mut curve = vec![0.0_f32; n + 1];
+    let mut x = 0.0;
+    let step = 1.0 / saturation;
+    let mut i = 0;
+    loop {
+        curve[i] = sigmoid(domain(x), k1) as f32;
+        x += step;
+        if x >= p.breakpoint || i >= n {
+            break;
+        }
+        i += 1;
+    }
+    let at_break = domain(x);
+    let correction = sigmoid(at_break, k1) - sigmoid(at_break, k2);
+    for sample in &mut curve[i + 1..] {
+        *sample = (sigmoid(domain(x), k2) + correction) as f32;
+        x += step;
+    }
+    // CombineToneCurve blends one sample per four counts, then smooths that grid.
+    let quarter_extent = saturation * 0.25;
+    let quarter_n = n / 4;
+    let mut controls: Vec<f32> = (0..=(saturation / 50.0 * 0.25) as usize)
+        .map(|i| curve[i * 200])
+        .collect();
+    controls.push(curve[quarter_n * 4]);
+    let mut work = controls.clone();
+    let reciprocal = 1.0_f32 / quarter_extent as f32;
+    let mut quarter = vec![0.0_f32; quarter_n + 1];
+    for (i, sample) in quarter.iter_mut().enumerate() {
+        control.check()?;
+        work.copy_from_slice(&controls);
+        let t = i as f32 * reciprocal;
+        let omt = 1.0 - t;
+        for level in 1..work.len() {
+            for j in (level..work.len()).rev() {
+                work[j] = omt.mul_add(work[j - 1], t * work[j]);
+            }
+        }
+        *sample = work[work.len() - 1];
+    }
+    curve[0] = quarter[0];
+    for (i, pair) in quarter.windows(2).enumerate() {
+        let base = curve[i * 4];
+        let delta = (pair[1] - pair[0]) * 0.25;
+        curve[i * 4 + 1] = base + delta;
+        curve[i * 4 + 2] = delta.mul_add(2.0, base);
+        curve[i * 4 + 3] = delta.mul_add(3.0, base);
+        curve[i * 4 + 4] = pair[1];
+    }
+    curve[quarter_n * 4 + 1..].fill(quarter[quarter_n]);
+    let lo = f64::from(curve[0]);
+    let range = f64::from(curve[n]) - lo;
+    let at_sat = (f64::from(curve[saturation as usize]) - lo) / range;
+    let normalization = saturation / at_sat;
+    if !normalization.is_finite() || range <= 0.0 || at_sat <= 0.0 {
+        return Err(Error::InvalidData("degenerate Quattro tone normalization"));
+    }
+    for sample in &mut curve {
+        let v = (f64::from(*sample) - lo) / range;
+        let linear = if v < 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        };
+        *sample = (normalization * linear) as f32;
+    }
+    let scale = p.scale * 65535.0 / f64::from(curve[n]);
+    if !scale.is_finite() || curve.iter().any(|v| !v.is_finite()) {
+        return Err(Error::InvalidData("invalid Quattro tone curve"));
+    }
+    Ok((curve, scale))
 }
 
 /// CreateGammaLUT_F20 @0x561f4; manager @0x9efe4 supplies mask65535,size65536.
@@ -374,13 +544,40 @@ fn generate_gamma_lut(native_target: u32) -> Vec<u16> {
         .collect()
 }
 
-pub(crate) struct RenderLuts {
+/// Native integer tone, output matrix and transfer lookup tables.
+pub struct RenderLuts {
     tone: Vec<u16>,
     gamma: Vec<u16>,
     fixed: [i32; 9],
 }
 
 impl RenderLuts {
+    /// Targets: 2 for sRGB, 3 for Adobe RGB, and 11 for ProPhoto RGB.
+    pub fn from_color_mode(
+        params: &crate::ColorModeParameters,
+        exposure: f64,
+        output_matrix: [f64; 9],
+        native_target: u32,
+        control: Control<'_>,
+    ) -> Result<Self> {
+        if !matches!(native_target, 2 | 3 | 11) {
+            return Err(Error::InvalidData("unsupported color mode output target"));
+        }
+        let mut fixed = [0; 9];
+        for (dest, value) in fixed.iter_mut().zip(output_matrix) {
+            let scaled = value.mul_add(4096.0, 0.5);
+            if !scaled.is_finite() || scaled < i32::MIN as f64 || scaled > i32::MAX as f64 {
+                return Err(Error::InvalidData("invalid color mode output matrix"));
+            }
+            *dest = scaled as i32;
+        }
+        Ok(Self {
+            tone: generate_color_mode_tone_lut(params, exposure, control)?,
+            gamma: generate_gamma_lut(native_target),
+            fixed,
+        })
+    }
+
     pub(crate) fn new(
         params: ToneParams,
         settings: ToneSettings,
@@ -406,18 +603,31 @@ impl RenderLuts {
     /// Unit-scale Stage3 conversion followed by ordinary RGB48 output, with
     /// channel gains1 and retinex gain256. Inputs are finite native count units.
     pub(crate) fn render(&self, working: [f32; 3]) -> [u16; 3] {
-        let tone = working.map(|v| {
+        let indices = working.map(|v| {
             // CropSizeRotateF20 @0x51570: asymmetric +0.5, truncate, low16.
-            let stored = (v as f64 + 0.5) as i64 as u16;
-            self.tone[stored as usize] as i32
+            ((v as f64 + 0.5) as i64 as u16) as usize
         });
+        self.render_indices(indices)
+    }
+
+    /// Apply tone, Q12 output matrix and output transfer.
+    /// Each index must be in 0..65536.
+    pub fn render_indices(&self, indices: [usize; 3]) -> [u16; 3] {
+        self.render_linear_indices(indices)
+            .map(|v| self.gamma[v as usize])
+    }
+
+    /// Apply tone and Q12 output matrix before output transfer.
+    /// Each index must be in 0..65536. Results use the 0..65535 linear range.
+    pub fn render_linear_indices(&self, indices: [usize; 3]) -> [u16; 3] {
+        let tone = indices.map(|i| self.tone[i] as i32);
         std::array::from_fn(|r| {
             // MUL/MADD W in output48row wrap at 32 bits before signed shift.
             let mut sum = 2048_i32;
             for (c, sample) in tone.iter().enumerate() {
                 sum = sum.wrapping_add(self.fixed[3 * r + c].wrapping_mul(*sample));
             }
-            self.gamma[(sum >> 12).clamp(0, 65535) as usize]
+            (sum >> 12).clamp(0, 65535) as u16
         })
     }
 }
@@ -425,6 +635,88 @@ impl RenderLuts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quattro_tone_matches_native_complete_arrays() {
+        let shapes = [
+            [-1.19, 2.85, 3.0, 0.078, 1.55],
+            [-1.20, 2.85, 3.55, 0.070, 1.60],
+            [-1.19, 2.85, 2.80, 0.080, 1.56],
+            [-1.05, 2.65, 3.10, 0.030, 1.97],
+            [-1.17, 2.85, 3.0, 0.1, 1.4],
+            [-1.20, 2.85, 3.50, 0.070, 1.90],
+        ];
+        // lib95 ARM64 SHA256 a0f64d51, GenerateF20ToneCurve with alpha 1.
+        let expected = [
+            0x4d960d5fc12a5ac0,
+            0x1728f75d86db08df,
+            0x22acafaa3b8b0039,
+            0x8cb526d93c724e87,
+            0x641b6affc2c35f4d,
+            0xfa327e6114870943,
+            0x68526ce16cdd9f56,
+            0xf3243f8894a4edf8,
+            0x8bafb9bbfb182d42,
+            0x772ff05d95a5b3e3,
+            0x02a33202963a09d6,
+            0x803fca0b1b0029bb,
+            0xd1cbc17ec8033faf,
+            0x66b5e74162288a41,
+            0x90542ec120ac0b83,
+            0x688d30788a13fdd5,
+            0xecf840129b7da72b,
+            0x9ccd0033b66cabb1,
+        ];
+        for (shape, [start, end, steepness, breakpoint, steepness2]) in
+            shapes.into_iter().enumerate()
+        {
+            for setting in 0..3 {
+                let params = crate::ColorModeParameters {
+                    mode: crate::ColorMode::Standard,
+                    sensor: crate::ColorModeSensor::Quattro,
+                    as_shot_fallback: false,
+                    creative_matrix: None,
+                    contrast: if setting == 2 { 0.3 } else { 0.0 },
+                    tone: ToneParams {
+                        start,
+                        end,
+                        steepness,
+                        steepness2,
+                        breakpoint,
+                        scale: 1.0,
+                    },
+                    inverse_gamma: 1.0 / 2.2222222222222223,
+                    pixel_saturation: 16383.0,
+                };
+                let exposure = if setting == 1 { 1.0 } else { 0.0 };
+                let lut = generate_color_mode_tone_lut(&params, exposure, Control::none()).unwrap();
+                assert_eq!(
+                    hash(&lut),
+                    expected[shape * 3 + setting],
+                    "shape={shape} setting={setting}"
+                );
+                let linear =
+                    generate_color_mode_linear_tone_lut(&params, exposure, Control::none())
+                        .unwrap();
+                assert!(lut
+                    .iter()
+                    .zip(linear)
+                    .all(
+                        |(&encoded, linear)| (f64::from(encoded) - linear * 65535.0).abs()
+                            <= 0.50000001
+                    ));
+                if shape == 0 && setting == 0 {
+                    // The retained native HP-on branch changes k2 by float32 -0.7.
+                    let mut hp_on = params;
+                    hp_on.tone.steepness2 += f64::from(-0.7_f32);
+                    assert_eq!(
+                        hash(&generate_color_mode_tone_lut(&hp_on, 0.0, Control::none()).unwrap()),
+                        0x022fdfe0496c2d4c
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn color_dq_matches_native_luts_and_pixel_rows() {
