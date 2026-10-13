@@ -26,7 +26,7 @@ Add the safe API crate to your application's `Cargo.toml`:
 
 ```toml
 [dependencies]
-x3f-core = "0.2.0"
+x3f-core = "0.2.1"
 ```
 
 [`convert_file`](crates/x3f-core/src/conversion.rs)
