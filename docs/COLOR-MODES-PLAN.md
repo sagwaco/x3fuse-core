@@ -16,8 +16,8 @@ option preserves existing output byte for byte.
 
 | Camera family | Ordinary modes |
 | --- | --- |
-| Supported full-resolution Merrill | Standard, Vivid, Neutral, Portrait, Landscape, FCBlue |
-| Supported dp Quattro | The Merrill names plus SunsetRed, ForestGreen, FCYellow, Cinema, TealAndOrange |
+| Supported full-resolution Merrill | Standard, Vivid, Neutral, Portrait, Landscape, FOV Classic Blue |
+| Supported dp Quattro | The Merrill names plus Sunset Red, Forest Green, FOV Classic Yellow, Cinema, Teal and Orange |
 
 Availability depends on valid camera calibration. sd Quattro and sd Quattro H
 remain unsupported because their native sensor calibration and resolution
@@ -54,8 +54,11 @@ return an unsupported-mode error. Explicit unknown CLI names are errors.
 ```sh
 x3f_extract -tiff -color sRGB -color-mode Vivid input.X3F
 x3f_extract -dng -color-mode as-shot input.X3F
-x3f_extract -dng -color-mode TealAndOrange input.X3F
+x3f_extract -dng -color-mode "Teal and Orange" input.X3F
 ```
+
+Quote CLI names that contain spaces. The earlier short names, such as
+`FCBlue`, `FCYellow` and `TealAndOrange`, remain accepted.
 
 `-color` remains the output encoding. Accept `-color-mode` only for color TIFF
 and DNG exports. Reject Cineon, unprocessed, Qtop, PPM, histogram and embedded
@@ -127,8 +130,9 @@ agreement across modes, WB and ISO remains a separate release gate.
 
 DNG raw samples, levels, crop and recovery scale remain independent of the
 selected mode. The selected mode becomes the primary profile and
-AsShotProfileName; other supported modes use ExtraCameraProfiles. Names use
-the `x3fuse ` prefix. No-option exports retain the existing bytes.
+AsShotProfileName; other supported modes use ExtraCameraProfiles. Names match
+the in-camera labels without a prefix. No-option exports retain the existing
+bytes.
 
 The replacement design uses shared AsShotWhiteXY and per-profile ColorMatrix
 and ForwardMatrix values. These explicit-mode profile matrices include the

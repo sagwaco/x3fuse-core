@@ -135,8 +135,10 @@ fn usage(progname: &str) -> ! {
          \x20                  This switch does not affect DNG output\n\
          \x20  -color-mode <MODE>  Select a camera color mode at normal strength\n\
          \x20                  as-shot, Standard, Vivid, Neutral, Portrait,\n\
-         \x20                  Landscape, FCBlue; dp Quattro also supports SunsetRed,\n\
-         \x20                  ForestGreen, FCYellow, Cinema, TealAndOrange.\n\
+         \x20                  Landscape, FOV Classic Blue; dp Quattro also supports\n\
+         \x20                  Sunset Red, Forest Green, FOV Classic Yellow, Cinema,\n\
+         \x20                  Teal and Orange. Quote names that contain spaces.\n\
+         \x20                  Short names such as FCBlue remain accepted.\n\
          \x20                  Color TIFF applies the look to pixels. DNG embeds\n\
          \x20                  selectable profiles with this requested default.\n\
          \x20                  DNG looks are approximations at export white balance.\n\
@@ -782,6 +784,11 @@ mod tests {
         let args = parse(&["-dng", "-color", "none", "-color-mode", "as-shot", "in.X3F"]);
         assert_eq!(args.color_mode, Some(ColorMode::AsShot));
         assert!(validate_args(&args).is_ok());
+        for name in ["FOV Classic Blue", "FCBlue"] {
+            let args = parse(&["-dng", "-color-mode", name, "in.X3F"]);
+            assert_eq!(args.color_mode, Some(ColorMode::FCBlue));
+            assert!(validate_args(&args).is_ok());
+        }
     }
 
     #[test]

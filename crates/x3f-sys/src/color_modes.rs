@@ -38,6 +38,7 @@ impl ColorMode {
         Self::TealAndOrange,
     ];
 
+    /// The in-camera label used for display and exported profiles.
     pub const fn name(self) -> &'static str {
         match self {
             Self::AsShot => "as-shot",
@@ -46,12 +47,12 @@ impl ColorMode {
             Self::Neutral => "Neutral",
             Self::Portrait => "Portrait",
             Self::Landscape => "Landscape",
-            Self::FCBlue => "FCBlue",
-            Self::SunsetRed => "SunsetRed",
-            Self::ForestGreen => "ForestGreen",
-            Self::FCYellow => "FCYellow",
+            Self::FCBlue => "FOV Classic Blue",
+            Self::SunsetRed => "Sunset Red",
+            Self::ForestGreen => "Forest Green",
+            Self::FCYellow => "FOV Classic Yellow",
             Self::Cinema => "Cinema",
-            Self::TealAndOrange => "TealAndOrange",
+            Self::TealAndOrange => "Teal and Orange",
         }
     }
 
@@ -92,7 +93,10 @@ impl FromStr for ColorMode {
     fn from_str(value: &str) -> Result<Self> {
         std::iter::once(Self::AsShot)
             .chain(Self::NAMED)
-            .find(|mode| value.eq_ignore_ascii_case(mode.name()))
+            .find(|mode| {
+                value.eq_ignore_ascii_case(mode.name())
+                    || value.as_bytes().eq_ignore_ascii_case(mode.key().to_bytes())
+            })
             .ok_or(Error::InvalidData(
                 "unknown color mode; use as-shot or a named camera color mode",
             ))
@@ -192,7 +196,7 @@ fn as_shot(bytes: &[u8]) -> Result<(ColorMode, bool)> {
     Ok(ColorMode::NAMED
         .iter()
         .copied()
-        .find(|mode| bytes == mode.name().as_bytes())
+        .find(|mode| bytes == mode.key().to_bytes())
         .map_or((ColorMode::Standard, true), |mode| (mode, false)))
 }
 
@@ -599,9 +603,33 @@ mod tests {
 
     #[test]
     fn names_and_as_shot_keep_selection_and_fallback_distinct() {
+        assert_eq!(
+            ColorMode::NAMED.map(ColorMode::name),
+            [
+                "Standard",
+                "Vivid",
+                "Neutral",
+                "Portrait",
+                "Landscape",
+                "FOV Classic Blue",
+                "Sunset Red",
+                "Forest Green",
+                "FOV Classic Yellow",
+                "Cinema",
+                "Teal and Orange",
+            ]
+        );
         for mode in ColorMode::NAMED {
             assert_eq!(mode.name().parse::<ColorMode>().unwrap(), mode);
-            assert_eq!(as_shot(mode.name().as_bytes()).unwrap(), (mode, false));
+            assert_eq!(mode.to_string(), mode.name());
+            assert_eq!(
+                mode.name().to_lowercase().parse::<ColorMode>().unwrap(),
+                mode
+            );
+            let key = mode.key().to_str().unwrap();
+            assert_eq!(key.parse::<ColorMode>().unwrap(), mode);
+            assert_eq!(key.to_lowercase().parse::<ColorMode>().unwrap(), mode);
+            assert_eq!(as_shot(key.as_bytes()).unwrap(), (mode, false));
         }
         assert_eq!("as-shot".parse::<ColorMode>().unwrap(), ColorMode::AsShot);
         assert_ne!(ColorMode::AsShot, ColorMode::Standard);

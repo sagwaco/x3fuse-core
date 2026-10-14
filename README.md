@@ -153,9 +153,13 @@ for supported settings and native verification.
 
 Set `-color-mode Vivid`, another named mode, or `-color-mode as-shot` to use
 the new camera-mode path. TIFF applies the look to its pixels. Merrill has
-Standard, Vivid, Neutral, Portrait, Landscape and FCBlue. dp Quattro adds
-SunsetRed, ForestGreen, FCYellow, Cinema and TealAndOrange. sd Quattro and
-sd Quattro H need a further calibration port and return an error.
+Standard, Vivid, Neutral, Portrait, Landscape and FOV Classic Blue. dp Quattro
+adds Sunset Red, Forest Green, FOV Classic Yellow, Cinema and Teal and Orange.
+sd Quattro and sd Quattro H need a further calibration port and return an error.
+
+DNG profile names match these camera labels without a prefix. Quote names
+with spaces in the CLI, for example `-color-mode "FOV Classic Blue"`.
+Existing short names such as `FCBlue` and `TealAndOrange` remain accepted.
 
 Rust callers set `ProcessOptions::color_mode` and can query
 `Reader::available_color_modes()`. This new public field requires updates to

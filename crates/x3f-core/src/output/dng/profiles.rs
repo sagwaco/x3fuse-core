@@ -136,7 +136,7 @@ impl PreparedColorModes {
                 exposure,
                 control,
             )?;
-            let name = format!("x3fuse {}", mode.mode.name());
+            let name = mode.mode.name().to_owned();
             let color = mat3_to_f32(&matrices.color);
             let forward = mat3_to_f32(&matrices.forward);
             if index == self.selected {
@@ -386,10 +386,8 @@ pub(crate) struct CameraProfile {
 /// profiles the legacy C writer also emitted, with their own forward
 /// matrices.
 ///
-/// Profile names match Sigma's CAMF short-form (`FCBlue`, `FCYellow`,
-/// `ForestGreen`, `SunsetRed`) rather than the verbose
-/// `FOV Classic Blue` etc., to align with the reference Sigma-aware
-/// DNG output that Lightroom recognises by name.
+/// Disabled entries retain their historical CAMF names. Explicit Color Modes
+/// use the in-camera labels from `ColorMode::name`.
 const PROFILES: &[CameraProfile] = &[
     CameraProfile {
         name: "Standard",

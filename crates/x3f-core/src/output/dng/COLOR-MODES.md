@@ -10,8 +10,9 @@ residuals. It is not SPP whole-image parity. Release gates remain in
 `ProcessOptions.color_mode = None` keeps the original writer and preview.
 With a requested mode, the writer resolves one list before processing consumes
 RAW. The selected mode is the primary profile and `AsShotProfileName`. Other
-modes use `ExtraCameraProfiles`. Names are `x3fuse Standard`, `x3fuse Vivid`,
-and the other resolver names. The six legacy synthetic names stay available.
+modes use `ExtraCameraProfiles`. Names match the in-camera labels, such as
+`Standard`, `Vivid` and `FOV Classic Blue`, without a prefix. The six legacy
+synthetic names stay available.
 
 The writer clears `color_mode` before raw processing. Mode selection changes
 profile metadata and preview pixels. Decoded samples, levels, crop, recovery
@@ -230,10 +231,11 @@ Sang performed bounded manual tests in Lightroom cloud 9.5.1 Local:
   readable-plate reference rather than the encoding-0 control.
 
 Sang's combined Lightroom cloud 9.5.1 Local check passed on both immutable
-1791915230810 ordinary mode files, 8040 and 8284. Both had the correct
-x3fuse Standard default, all six Merrill or eleven dp Quattro names, visible
-differences for the tested mode choices, selected looks retained in JPEG
-exports, selection retained after reopen, and editable WB/exposure.
+1791915230810 ordinary mode files, 8040 and 8284, before the label change.
+Both had the then-current `x3fuse Standard` default, all six Merrill or eleven
+dp Quattro names, visible differences for the tested mode choices, selected
+looks retained in JPEG exports, selection retained after reopen, and editable
+WB/exposure.
 Full SPP captures across modes/WB/ISO and the remaining application gates
 stay open. Lightroom Classic and standalone Camera Raw are not installed.
 

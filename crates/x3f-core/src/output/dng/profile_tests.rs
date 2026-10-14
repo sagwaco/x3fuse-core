@@ -458,10 +458,7 @@ fn write_lightroom_white_xy_cast_diagnostic() {
 
 fn assert_mode_profiles(data: &[u8], selected: x3f_sys::ColorMode, modes: &[x3f_sys::ColorMode]) {
     let primary = root(data);
-    assert_eq!(
-        primary[&t::PROFILE_NAME].text(),
-        format!("x3fuse {}", selected.name())
-    );
+    assert_eq!(primary[&t::PROFILE_NAME].text(), selected.name());
     assert_eq!(
         primary[&t::AS_SHOT_PROFILE_NAME].text(),
         primary[&t::PROFILE_NAME].text()
@@ -480,7 +477,7 @@ fn assert_mode_profiles(data: &[u8], selected: x3f_sys::ColorMode, modes: &[x3f_
         assert!(!profile.contains_key(&t::RGB_TABLES));
         assert!(!names.contains(&name), "duplicate profile {name}");
         names.push(name.clone());
-        if name.starts_with("x3fuse ") {
+        if modes.iter().any(|mode| mode.name() == name) {
             assert_eq!(profile[&t::CALIBRATION_ILLUMINANT1].shorts(), [21]);
             assert_eq!(profile[&t::PROFILE_LOOK_TABLE_DIMS].longs(), [72, 17, 65]);
             assert_eq!(profile[&t::PROFILE_LOOK_TABLE_ENCODING].longs(), [1]);
@@ -516,17 +513,14 @@ fn assert_mode_profiles(data: &[u8], selected: x3f_sys::ColorMode, modes: &[x3f_
             assert!(!profile.contains_key(&t::PROFILE_LOOK_TABLE_DATA));
         }
     }
-    let mut color_names: Vec<_> = names
-        .into_iter()
-        .filter(|n| n.starts_with("x3fuse "))
-        .collect();
     let mut expected: Vec<_> = modes
         .iter()
-        .map(|m| format!("x3fuse {}", m.name()))
+        .map(|mode| mode.name())
+        .chain(PROFILES[1..].iter().map(|profile| profile.name))
         .collect();
-    color_names.sort();
+    names.sort();
     expected.sort();
-    assert_eq!(color_names, expected);
+    assert_eq!(names, expected);
 }
 
 fn classic_model(
@@ -742,7 +736,7 @@ fn legacy_profiles_keep_the_as_shot_camera_white() {
         let mut error = 0.0_f64;
         for off in primary[&t::EXTRA_CAMERA_PROFILES].longs() {
             let profile = extra(&data, off as usize);
-            if profile[&t::PROFILE_NAME].text().starts_with("x3fuse ") {
+            if profile.contains_key(&t::PROFILE_LOOK_TABLE_DATA) {
                 assert_eq!(&data[off as usize..off as usize + 2], b"II");
                 continue;
             }
@@ -1205,10 +1199,7 @@ fn color_mode_recovery_scale_is_restored_once() {
                     continue;
                 }
                 let (matrix, fit, exposure) = classic_model(profile, &entries[0]);
-                let mode_name = profile[&t::PROFILE_NAME]
-                    .text()
-                    .strip_prefix("x3fuse ")
-                    .unwrap();
+                let mode_name = profile[&t::PROFILE_NAME].text();
                 let params = prepared
                     .modes
                     .iter()
@@ -1519,7 +1510,10 @@ fn write_color_mode_camera_fixtures() {
                 ));
             }
         }
-        eprintln!("{}: primary/as-shot x3fuse Standard; all supported profiles parsed; lossless raw decoded", output.display());
+        eprintln!(
+            "{}: primary/as-shot Standard; all supported profiles parsed; lossless raw decoded",
+            output.display()
+        );
     }
     std::fs::write(destination.join("sdk-pixel-probes.tsv"), probes).unwrap();
     std::fs::write(destination.join("profiles.tsv"), names).unwrap();
