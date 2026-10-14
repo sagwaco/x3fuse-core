@@ -62,6 +62,12 @@ impl ColorDq {
         })
     }
 
+    /// Return the three signed lookup tables in RGB channel order.
+    /// All tables have the same power-of-two length. The index mask is `len() - 1`.
+    pub fn tables(&self) -> [&[i16]; 3] {
+        self.tables.each_ref().map(Vec::as_slice)
+    }
+
     /// ApplyMatrixAndColorDQ @0x73204..0x732c4, after its matrix multiply.
     /// The residual step that follows this operation bounds RGB to [0,32766].
     pub fn apply(&self, q: [f64; 3]) -> [f32; 3] {
@@ -778,7 +784,9 @@ mod tests {
         for (strengths, size, lut_hashes, pixel_hash) in cases {
             let dq = ColorDq::new(strengths).unwrap();
             assert_eq!(dq.mask + 1, size);
-            for (table, expected) in dq.tables.iter().zip(lut_hashes) {
+            assert!(size.is_power_of_two());
+            for (table, expected) in dq.tables().into_iter().zip(lut_hashes) {
+                assert_eq!(table.len(), size);
                 assert_eq!(
                     hash(&table.iter().map(|v| *v as u16).collect::<Vec<_>>()),
                     expected
