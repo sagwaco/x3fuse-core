@@ -67,48 +67,60 @@ fn forced_gpu_errors_reach_every_public_processing_path() {
     }
     let output = std::env::temp_dir().join(format!("x3f-gpu-errors-{}", std::process::id()));
     std::fs::create_dir_all(&output).unwrap();
-    let options = ProcessOptions {
-        denoise_backend: DenoiseBackend::Gpu,
-        ..ProcessOptions::default()
-    };
-    let cancel = AtomicBool::new(false);
-    let assert_gpu_error = |error: Error| {
-        assert!(
-            matches!(error, Error::Gpu(ref message) if message.contains("no GPU denoiser")),
-            "{error:?}"
-        );
-    };
-    for (index, file) in files.iter().enumerate() {
-        match loaded_reader(file).get_image(&options) {
-            Ok(_) => panic!("forced GPU succeeded in a CPU-only build"),
-            Err(error) => assert_gpu_error(error),
-        }
-        match prepare_scene_linear(
-            file,
-            &SceneLinearOptions {
-                denoise_backend: DenoiseBackend::Gpu,
-                ..SceneLinearOptions::default()
-            },
-            &cancel,
-            |_| {},
-        ) {
-            Ok(_) => panic!("forced GPU succeeded in a CPU-only build"),
-            Err(error) => assert_gpu_error(error),
-        }
-        assert_gpu_error(
-            loaded_reader(file)
-                .dump_histogram(
-                    output.join(format!("histogram-{index}.csv")),
-                    &options,
-                    false,
-                )
-                .unwrap_err(),
-        );
-        for format in [OutputFormat::Dng, OutputFormat::Tiff] {
-            let path = output.join(format!("{index}-{format:?}"));
-            let error = convert_file(file, &path, format, &options, &cancel, |_| {}).unwrap_err();
-            assert_gpu_error(error);
-            assert!(!path.exists(), "failed conversion published an output");
+    for algorithm in [
+        x3f_core::DenoiseAlgorithm::Nlm,
+        x3f_core::DenoiseAlgorithm::Bm3d,
+    ] {
+        let denoise_options = x3f_core::DenoiseOptions {
+            algorithm,
+            ..Default::default()
+        };
+        let options = ProcessOptions {
+            denoise_options,
+            denoise_backend: DenoiseBackend::Gpu,
+            ..ProcessOptions::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let assert_gpu_error = |error: Error| {
+            assert!(
+                matches!(error, Error::Gpu(ref message) if message.contains("no GPU denoiser")),
+                "{error:?}"
+            );
+        };
+        for (index, file) in files.iter().enumerate() {
+            match loaded_reader(file).get_image(&options) {
+                Ok(_) => panic!("forced GPU succeeded in a CPU-only build"),
+                Err(error) => assert_gpu_error(error),
+            }
+            match prepare_scene_linear(
+                file,
+                &SceneLinearOptions {
+                    denoise_options,
+                    denoise_backend: DenoiseBackend::Gpu,
+                    ..SceneLinearOptions::default()
+                },
+                &cancel,
+                |_| {},
+            ) {
+                Ok(_) => panic!("forced GPU succeeded in a CPU-only build"),
+                Err(error) => assert_gpu_error(error),
+            }
+            assert_gpu_error(
+                loaded_reader(file)
+                    .dump_histogram(
+                        output.join(format!("histogram-{index}.csv")),
+                        &options,
+                        false,
+                    )
+                    .unwrap_err(),
+            );
+            for format in [OutputFormat::Dng, OutputFormat::Tiff] {
+                let path = output.join(format!("{index}-{format:?}"));
+                let error =
+                    convert_file(file, &path, format, &options, &cancel, |_| {}).unwrap_err();
+                assert_gpu_error(error);
+                assert!(!path.exists(), "failed conversion published an output");
+            }
         }
     }
     std::fs::remove_dir_all(output).unwrap();
@@ -397,6 +409,20 @@ fn spp_errors_and_cancellation_do_not_publish_output() {
         }
         let reader = loaded_reader(&file);
         for invalid in [
+            ProcessOptions {
+                denoise_options: x3f_core::DenoiseOptions {
+                    algorithm: x3f_core::DenoiseAlgorithm::Bm3d,
+                    ..Default::default()
+                },
+                ..options.clone()
+            },
+            ProcessOptions {
+                denoise_options: x3f_core::DenoiseOptions {
+                    luminance: true,
+                    ..Default::default()
+                },
+                ..options.clone()
+            },
             ProcessOptions {
                 rgb_chroma_lut: Some(true),
                 ..options.clone()

@@ -13,6 +13,7 @@ description = "Safe Rust API for reading and converting Sigma Foveon X3F raw ima
 [features]
 default = []
 gpu = ["x3f-sys/gpu"]
+serde = ["x3f-sys/serde"]
 
 [dependencies]
 x3f-sys.workspace = true

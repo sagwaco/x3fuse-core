@@ -35,7 +35,7 @@ use std::ptr::NonNull;
 
 use thiserror::Error;
 use x3f_sys as sys;
-pub use x3f_sys::{ColorMode, DenoiseBackend};
+pub use x3f_sys::{ColorMode, DenoiseAlgorithm, DenoiseBackend, DenoiseOptions, NlmOptions};
 // Shadow the external libc crate with x3f-sys's compat shim. On every
 // target except wasm32-unknown-unknown this is `pub use libc::*;`; on
 // wasm32 it provides Rust-native equivalents for the few libc symbols
@@ -140,12 +140,12 @@ pub struct ProcessOptions {
     pub wb: Option<String>,
     /// ZIP-compress DNG/TIFF output.
     pub compress: bool,
-    /// Strength of the NLM denoise pass run before color conversion, on a
+    /// Strength of sensor denoising before color conversion, on a
     /// 0..=10 scale: `0` disables denoise entirely (equivalent to the legacy
     /// `-no-denoise`), `10` is full strength (the legacy default), and
-    /// intermediate values linearly attenuate each sensor's NLM sigma
+    /// intermediate values linearly attenuate filter strength
     /// (`scale = intensity / 10`). Values above 10 are clamped. Backed by the
-    /// Non-Local Means with portable Rust and optional native GPU backends.
+    /// selected NLM/BM3D algorithm with portable Rust and optional GPU backends.
     pub denoise_intensity: u8,
     /// Select GPU acceleration or portable CPU execution (default: Auto).
     /// Enable the `gpu` Cargo feature for native acceleration. Auto falls back
@@ -153,6 +153,7 @@ pub struct ProcessOptions {
     pub denoise_backend: DenoiseBackend,
     /// Use the Merrill SPP float pipeline for full-resolution color TIFF, PPM or histogram output.
     /// This CPU path uses neutral SPP noise sliders. The default is false.
+    /// Requires default `denoise_options` because SPP uses its own denoiser.
     /// Requires full denoise intensity; other sensor and output modes return an error.
     /// Uses sharpness 0, fill light 0, saturation 0 and Highlight Control 1.
     /// `fix_bad=false` skips listed and detected repairs; `crop=false` returns
@@ -169,6 +170,8 @@ pub struct ProcessOptions {
     /// Cineon output. `X3F_NO_CHROMA_LUT` still controls the separate DNG
     /// recovery LUT, including camera-space (`None`) output.
     pub rgb_chroma_lut: Option<bool>,
+    /// Algorithm and advanced sensor-space denoising controls.
+    pub denoise_options: DenoiseOptions,
     /// Directory of pre-rendered DNG `OpcodeList3` blobs (Sigma's per-
     /// model / per-aperture flat-fielding gain maps). When set, the DNG
     /// writer looks up the blob matching the camera's model and aperture
@@ -228,6 +231,7 @@ impl Default for ProcessOptions {
             denoise_backend: DenoiseBackend::Auto,
             spp_denoise: false,
             rgb_chroma_lut: None,
+            denoise_options: DenoiseOptions::default(),
             opcodes_dir: None,
             dng_highlight_recovery: false,
             dng_highlight_mapping: DngHighlightMapping::default(),
@@ -696,7 +700,9 @@ impl Reader {
                     rgb_chroma_lut: opts.rgb_chroma_lut,
                     ..sys::ProcessingOptions::default()
                 },
-                sys::Control::none().with_denoise_backend(opts.denoise_backend),
+                sys::Control::none()
+                    .with_denoise_backend(opts.denoise_backend)
+                    .with_denoise_options(opts.denoise_options)?,
             )
         }?;
         #[cfg(target_arch = "wasm32")]

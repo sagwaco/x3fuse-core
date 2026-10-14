@@ -26,7 +26,7 @@ Add the safe API crate to your application's `Cargo.toml`:
 
 ```toml
 [dependencies]
-x3f-core = "0.2.0"
+x3f-core = "0.2.1"
 ```
 
 [`convert_file`](crates/x3f-core/src/conversion.rs)
@@ -40,13 +40,22 @@ the output they created.
 For native GPU denoising in this checkout, enable the library's optional `gpu` Cargo feature.
 `ProcessOptions::denoise_backend` and `SceneLinearOptions::denoise_backend`
 accept `DenoiseBackend::{Auto, Cpu, Gpu}`. `Auto` is the default; `Gpu` requires
-acceleration and returns `Error::Gpu` when unavailable. CPU execution preserves
-the existing output; GPU floating-point accumulation can differ slightly.
+acceleration and returns `Error::Gpu` when unavailable. Default NLM now copies
+luminance without filtering, so CPU output can differ slightly from earlier
+releases in nearly constant regions. Output with `-no-denoise` remains
+byte-identical. GPU floating-point accumulation can also differ slightly.
 See [denoising performance and validation](docs/src/performance.md#gpu-denoising).
 
-This checkout prepares the **0.2.0** release. It adds `denoise_backend` to
-`ProcessOptions` and `SceneLinearOptions`, `spp_denoise` to `ProcessOptions`,
-and GPU errors to the Rust error enums. Downstream exhaustive struct literals and error matches must be updated;
+Select `DenoiseOptions::algorithm` (`Nlm` or `Bm3d`) through either options
+struct’s `denoise_options` field. NLM remains the default. Advanced controls
+include independent luminance/chroma toggles, strength, and NLM patch/search
+sizes. Both algorithms support native GPU execution and CPU/WASM fallback.
+Enable the optional `serde` feature to persist these settings.
+
+Version **0.2.0** adds `denoise_backend` and
+`denoise_options` to `ProcessOptions` and `SceneLinearOptions`, and GPU errors to the Rust error
+enums. This branch also adds `spp_denoise` and `color_mode` to `ProcessOptions`.
+Downstream exhaustive struct literals and error matches must be updated;
 use `..Default::default()` when constructing options. These source changes
 must not be published as a 0.1.x patch. The C ABI remains unchanged.
 
@@ -84,8 +93,9 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 | `-color <SPACE>`          | RGB color space: `none`, `sRGB`, `AdobeRGB`, `ProPhotoRGB` (does not affect DNG)   |
 | `-color-mode <MODE>` | experimental Merrill/dp Quattro camera look for color TIFF or DNG; see the compatibility limit below |
 | `-compress`               | lossless compression (DNG: lossless JPEG, TIFF: Deflate/ZIP)                       |
-| `-denoise <0-10>`         | NLM denoise intensity: `0` = off, `10` = full strength (**default**); intermediate values linearly scale the NLM sigma |
-| `-no-denoise`             | disable the NLM denoise pass (alias for `-denoise 0`)                               |
+| `-denoise <0-10>`         | Denoise intensity: `0` = off, `10` = full strength (**default**); intermediate values scale filter strength |
+| `-no-denoise`             | disable denoising (alias for `-denoise 0`)                               |
+| `-denoiser <nlm\|bm3d>` | algorithm (default: NLM); see [advanced controls](docs/src/performance.md#algorithm-and-advanced-controls) |
 | `-denoise-backend <auto\|cpu\|gpu>` | execution backend; `auto` falls back to CPU, `gpu` fails if acceleration is unavailable |
 | `-spp-pipeline` | Merrill SPP recovery and denoise on CPU with neutral noise sliders; full-resolution color TIFF, PPM or histogram |
 | `-no-crop`                | do not crop to the active image area                                               |
@@ -146,6 +156,8 @@ and does not disable SPP's camera-based highlight recovery.
 highlight repair, tiled denoise and sharpening. It requires an HI Merrill file,
 color output and denoise intensity 10. DNG, Cineon, monochrome, MED/LOW and a
 forced GPU backend return an error. Rust callers set `ProcessOptions::spp_denoise`.
+SPP requires the default `DenoiseOptions`; BM3D and custom NLM controls return
+an error because SPP uses a separate filter pipeline.
 The default is false. See the [SPP alignment notes](docs/src/spp-alignment.md)
 for supported settings and native verification.
 

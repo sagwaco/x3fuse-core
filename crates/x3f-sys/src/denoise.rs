@@ -1,4 +1,4 @@
-//! Non-Local Means with a portable Rust CPU implementation and an optional
+//! NLM and two-stage BM3D with portable Rust CPU implementations and an optional
 //! native wgpu backend. Called directly by the pipeline (`run_denoising` in
 //! `process.rs` and the two Quattro passes in `quattro.rs`).
 //!
@@ -31,8 +31,110 @@ use crate::Control;
 
 use crate::quattro::Area16;
 
+mod bm3d;
 #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 mod gpu;
+
+/// Denoising algorithm, independent of execution backend.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "lowercase")
+)]
+pub enum DenoiseAlgorithm {
+    #[default]
+    Nlm,
+    Bm3d,
+}
+
+impl std::str::FromStr for DenoiseAlgorithm {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "nlm" => Ok(Self::Nlm),
+            "bm3d" => Ok(Self::Bm3d),
+            _ => Err("denoiser must be nlm or bm3d"),
+        }
+    }
+}
+
+/// Full, odd NLM window sizes in pixels. These tune the main pass; the
+/// legacy low-frequency chroma pass retains its 21-pixel search window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default, deny_unknown_fields, rename_all = "camelCase")
+)]
+pub struct NlmOptions {
+    pub luma_patch: u8,
+    pub chroma_patch: u8,
+    pub luma_search: u8,
+    pub chroma_search: u8,
+}
+
+impl NlmOptions {
+    pub const DEFAULT: Self = Self {
+        luma_patch: 3,
+        chroma_patch: 3,
+        luma_search: 11,
+        chroma_search: 11,
+    };
+}
+impl Default for NlmOptions {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Sensor-space denoising. Defaults retain NLM's chroma-oriented Foveon
+/// profile. `strength` multiplies the camera profile and intensity (0..10);
+/// NLM windows do not affect BM3D's fixed 8x8 block profile.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(default, deny_unknown_fields, rename_all = "camelCase")
+)]
+pub struct DenoiseOptions {
+    pub algorithm: DenoiseAlgorithm,
+    pub luminance: bool,
+    pub chroma: bool,
+    pub strength: f32,
+    pub nlm: NlmOptions,
+}
+impl DenoiseOptions {
+    pub const DEFAULT: Self = Self {
+        algorithm: DenoiseAlgorithm::Nlm,
+        luminance: false,
+        chroma: true,
+        strength: 1.0,
+        nlm: NlmOptions::DEFAULT,
+    };
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.strength.is_finite() || !(0.1..=3.0).contains(&self.strength) {
+            return Err("denoise strength must be finite and between 0.1 and 3.0");
+        }
+        for patch in [self.nlm.luma_patch, self.nlm.chroma_patch] {
+            if !(1..=9).contains(&patch) || patch % 2 == 0 {
+                return Err("NLM patch sizes must be odd, from 1 through 9");
+            }
+        }
+        for search in [self.nlm.luma_search, self.nlm.chroma_search] {
+            if !(1..=31).contains(&search) || search % 2 == 0 {
+                return Err("NLM search sizes must be odd, from 1 through 31");
+            }
+        }
+        Ok(())
+    }
+}
+impl Default for DenoiseOptions {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 /// Execution preference for one conversion. `Auto` falls back to portable CPU
 /// denoising; `Gpu` reports an error when acceleration cannot be used.
@@ -124,6 +226,7 @@ const O_UV: i32 = 32768;
 /// Owned, tightly-packed (no row padding) interleaved 3-channel `u16` image.
 /// `Area16` carries an arbitrary `row_stride`; we copy into this packed form
 /// for the resize/median/NLM kernels and copy back.
+#[derive(Clone)]
 struct Img3 {
     rows: usize,
     cols: usize,
@@ -944,26 +1047,114 @@ fn subtract_u16_inplace(out: &mut Img3, res: &Img3i16) {
 ///      (search 21) → signed residual → cubic upscale → subtract.
 fn denoise_nlm(img: &mut Img3, h: f64, control: Control<'_>) -> crate::Result<()> {
     control.check()?;
+    let options = control.denoise_options;
     // 1. main NLM.
-    let mut out = fast_nlm_denoise_controlled(img, [0.0, h, h], 3, 11, control)?;
+    let mut out = configured_nlm(img, [h; 3], control)?;
 
     // 2. V-channel median.
-    median_blur_channel_3x3(&mut out, 2);
+    if options.chroma {
+        median_blur_channel_3x3(&mut out, 2);
+    }
 
     // 3. low-frequency denoising.
     let sub_rows = ((out.rows as f64) * 0.25).round_ties_even() as usize;
     let sub_cols = ((out.cols as f64) * 0.25).round_ties_even() as usize;
-    if sub_rows >= 1 && sub_cols >= 1 {
+    if options.chroma && sub_rows >= 1 && sub_cols >= 1 {
         let sub = resize_area(&out, sub_rows, sub_cols);
-        let sub_dn = fast_nlm_denoise_controlled(&sub, [0.0, h / 8.0, h / 4.0], 3, 21, control)?;
+        let sub_dn = fast_nlm_denoise_controlled(
+            &sub,
+            [0.0, h / 8.0, h / 4.0],
+            options.nlm.chroma_patch as i32,
+            21,
+            control,
+        )?;
         let sub_res = subtract_to_i16(&sub, &sub_dn);
         let res = resize_cubic_i16(&sub_res, out.rows, out.cols);
         subtract_u16_inplace(&mut out, &res);
     }
 
+    preserve_disabled_channels(img, &mut out, options);
     control.check()?;
     *img = out;
     Ok(())
+}
+
+fn channel_strengths(mut h: [f64; 3], options: DenoiseOptions) -> [f64; 3] {
+    if !options.luminance {
+        h[0] = 0.0;
+    }
+    if !options.chroma {
+        h[1] = 0.0;
+        h[2] = 0.0;
+    }
+    h
+}
+
+fn denoise_bm3d(img: &Img3, scale: f32, control: Control<'_>) -> crate::Result<Img3> {
+    let options = control.denoise_options;
+    let noise = bm3d::estimate_noise(img, control)?;
+    let sigma = channel_strengths(
+        noise.map(|s| s * scale as f64 * options.strength as f64),
+        options,
+    );
+    log(
+        crate::x3f_verbosity_t_DEBUG,
+        &format!("BM3D estimated sigma Y/U/V: {sigma:?}"),
+    );
+    bm3d::denoise(img, sigma, control)
+}
+
+fn preserve_disabled_channels(src: &Img3, out: &mut Img3, options: DenoiseOptions) {
+    for (source, result) in src.data.chunks_exact(3).zip(out.data.chunks_exact_mut(3)) {
+        if !options.luminance {
+            result[0] = source[0];
+        }
+        if !options.chroma {
+            result[1..].copy_from_slice(&source[1..]);
+        }
+    }
+}
+
+fn configured_nlm(img: &Img3, h: [f64; 3], control: Control<'_>) -> crate::Result<Img3> {
+    let options = control.denoise_options;
+    let h = channel_strengths(h, options);
+    let nlm = options.nlm;
+    let mut out = if options.chroma {
+        let same = nlm.luma_patch == nlm.chroma_patch && nlm.luma_search == nlm.chroma_search;
+        let strengths = if same { h } else { [0.0, h[1], h[2]] };
+        let mut out = fast_nlm_denoise_controlled(
+            img,
+            strengths,
+            nlm.chroma_patch as i32,
+            nlm.chroma_search as i32,
+            control,
+        )?;
+        if options.luminance && !same {
+            let luma = fast_nlm_denoise_controlled(
+                img,
+                [h[0], 0.0, 0.0],
+                nlm.luma_patch as i32,
+                nlm.luma_search as i32,
+                control,
+            )?;
+            for (result, source) in out.data.chunks_exact_mut(3).zip(luma.data.chunks_exact(3)) {
+                result[0] = source[0];
+            }
+        }
+        out
+    } else if options.luminance {
+        fast_nlm_denoise_controlled(
+            img,
+            h,
+            nlm.luma_patch as i32,
+            nlm.luma_search as i32,
+            control,
+        )?
+    } else {
+        img.clone()
+    };
+    preserve_disabled_channels(img, &mut out, options);
+    Ok(out)
 }
 
 // ----------------------------------------------------------------------
@@ -1053,20 +1244,27 @@ pub(crate) unsafe fn denoise_area_controlled(
     control: Control<'_>,
 ) -> crate::Result<()> {
     control.check()?;
-    if image.is_null() {
+    if image.is_null()
+        || scale <= 0.0
+        || (!control.denoise_options.luminance && !control.denoise_options.chroma)
+    {
         return Ok(());
     }
     debug_assert_eq!(unsafe { (*image).channels }, 3);
     #[cfg(not(target_arch = "wasm32"))]
     let started = std::time::Instant::now();
     let dt = DType::from_u32(dtype);
-    let h = dt.base_h() * scale as f64;
+    let h = dt.base_h() * scale as f64 * control.denoise_options.strength as f64;
 
     let mut img = unsafe { area_to_img3(image) };
     // Work on owned storage: cancellation or a failed GPU attempt must never
     // leave the caller's sensor buffer in YUV or partially denoised.
     unsafe { bmt_to_yuv(&mut img.area(), dt) };
-    denoise_nlm(&mut img, h, control)?;
+    if control.denoise_options.algorithm == DenoiseAlgorithm::Bm3d {
+        img = denoise_bm3d(&img, scale, control)?;
+    } else {
+        denoise_nlm(&mut img, h, control)?;
+    }
     unsafe { yuv_to_bmt(&mut img.area(), dt) };
     control.check()?;
     unsafe { img3_to_area(&img, image) };
@@ -1098,23 +1296,31 @@ pub(crate) unsafe fn denoise_active_area(
     control: Control<'_>,
 ) -> crate::Result<()> {
     control.check()?;
-    if area.is_null() {
+    if area.is_null()
+        || scale <= 0.0
+        || (!control.denoise_options.luminance && !control.denoise_options.chroma)
+    {
         return Ok(());
     }
     debug_assert_eq!(unsafe { (*area).channels }, 3);
     #[cfg(not(target_arch = "wasm32"))]
     let started = std::time::Instant::now();
     let dt = DType::from_u32(dtype);
-    let sigma = dt.base_h() * scale as f64;
+    let sigma = dt.base_h() * scale as f64 * control.denoise_options.strength as f64;
 
-    if stage == 0 {
+    if control.denoise_options.algorithm == DenoiseAlgorithm::Bm3d {
+        let img = unsafe { area_to_img3(area) };
+        let out = denoise_bm3d(&img, scale, control)?;
+        control.check()?;
+        unsafe { img3_to_area(&out, area) };
+    } else if stage == 0 {
         let mut img = unsafe { area_to_img3(area) };
         denoise_nlm(&mut img, sigma, control)?;
         control.check()?;
         unsafe { img3_to_area(&img, area) };
     } else {
         let img = unsafe { area_to_img3(area) };
-        let out = fast_nlm_denoise_controlled(&img, [0.0, sigma, sigma * 2.0], 3, 11, control)?;
+        let out = configured_nlm(&img, [sigma, sigma, sigma * 2.0], control)?;
         control.check()?;
         unsafe { img3_to_area(&out, area) };
     }
@@ -1138,6 +1344,73 @@ pub(crate) unsafe fn denoise_active_area(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advanced_settings_validate_and_disabled_planes_are_exact() {
+        for strength in [f32::NAN, f32::INFINITY, 0.0, 3.1] {
+            assert!(DenoiseOptions {
+                strength,
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+        for size in [0, 2, 10, 255] {
+            let mut options = DenoiseOptions::default();
+            options.nlm.luma_patch = size;
+            assert!(options.validate().is_err());
+            options.nlm = NlmOptions::default();
+            options.nlm.chroma_search = size;
+            assert!(options.validate().is_err());
+        }
+        let mut source = Img3::new(17, 19);
+        for (i, pixel) in source.data.chunks_exact_mut(3).enumerate() {
+            pixel.copy_from_slice(&[
+                20000 + ((i * 71) % 200) as u16,
+                32000 + ((i * 37) % 200) as u16,
+                33000 + ((i * 23) % 200) as u16,
+            ]);
+        }
+        for (luminance, chroma) in [(false, true), (true, false), (true, true), (false, false)] {
+            let options = DenoiseOptions {
+                luminance,
+                chroma,
+                nlm: NlmOptions {
+                    luma_patch: 5,
+                    luma_search: 7,
+                    chroma_patch: 3,
+                    chroma_search: 9,
+                },
+                ..Default::default()
+            };
+            let control = Control::none()
+                .with_denoise_backend(DenoiseBackend::Cpu)
+                .with_denoise_options(options)
+                .unwrap();
+            let mut out = source.clone();
+            denoise_nlm(&mut out, 100.0, control).unwrap();
+            for channel in 0..3 {
+                let changed = source
+                    .data
+                    .chunks_exact(3)
+                    .zip(out.data.chunks_exact(3))
+                    .any(|(a, b)| a[channel] != b[channel]);
+                assert_eq!(changed, if channel == 0 { luminance } else { chroma });
+            }
+        }
+        let mut raw = source.clone();
+        let control = Control::none()
+            .with_denoise_options(DenoiseOptions {
+                luminance: false,
+                chroma: false,
+                ..Default::default()
+            })
+            .unwrap();
+        unsafe {
+            denoise_area_controlled(&mut raw.area(), DENOISE_STD, 1.0, control).unwrap();
+        }
+        assert_eq!(raw.data, source.data);
+    }
 
     #[test]
     fn cancellation_preserves_sensor_buffer_without_cancelling_another_call() {
@@ -1512,14 +1785,14 @@ mod tests {
         let image = Img3::new(7, 13);
         // Unsupported GPU window also exercises error fallback on GPU hosts.
         // CPU-only/WASM builds reject any forced GPU request before dispatch.
-        let cpu = fast_nlm_cpu(&image, [0.0, 100.0, 100.0], 5, 7, Control::none()).unwrap();
-        let auto = fast_nlm_denoise_controlled(&image, [0.0, 100.0, 100.0], 5, 7, Control::none())
+        let cpu = fast_nlm_cpu(&image, [0.0, 100.0, 100.0], 11, 7, Control::none()).unwrap();
+        let auto = fast_nlm_denoise_controlled(&image, [0.0, 100.0, 100.0], 11, 7, Control::none())
             .unwrap();
         assert_eq!(cpu.data, auto.data);
         let forced = fast_nlm_denoise_controlled(
             &image,
             [0.0, 100.0, 100.0],
-            5,
+            11,
             7,
             Control::none().with_denoise_backend(DenoiseBackend::Gpu),
         );

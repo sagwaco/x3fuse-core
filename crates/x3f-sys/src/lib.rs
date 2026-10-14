@@ -50,11 +50,9 @@ mod _wasm_c_shim_anchors {
     static A1: unsafe extern "C" fn(c_int, *const c_char, c_int) = super::wasm_c_shims::x3f_printf;
 }
 
-// Pure-Rust Non-Local Means denoise, called directly by the pipeline
-// (`process::run_denoising` and the Quattro passes in `quattro`) on every
-// target. No C/C++ and no FFI boundary — see the module header.
+// Rust NLM and BM3D denoising, called directly by the pipeline on every target.
 mod denoise;
-pub use denoise::DenoiseBackend;
+pub use denoise::{DenoiseAlgorithm, DenoiseBackend, DenoiseOptions, NlmOptions};
 
 // Native Rust replacement for `x3f_expand_quattro`. The legacy C symbol of
 // the same name in `src/x3f_process.c` resolves to this `#[no_mangle] extern

@@ -46,6 +46,8 @@ histograms accept sRGB, Adobe RGB or ProPhoto RGB. It uses CPU execution for
 `Auto` and `Cpu`. DNG, Cineon, monochrome/sepia, MED/LOW, other cameras, forced
 `Gpu`, and denoise intensity other than 10 return an error. Unsupported
 calibration also returns an error.
+`DenoiseOptions` must keep its default values. BM3D and custom NLM controls
+return an error because this path uses Sigma's separate filter pipeline.
 
 The noise sliders use the middle of five positions. Sharpness, fill light and
 saturation use zero; Highlight Control uses one. These are explicit export

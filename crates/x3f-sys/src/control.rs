@@ -46,6 +46,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Control<'a> {
     cancel: Option<&'a AtomicBool>,
     pub(crate) denoise_backend: crate::DenoiseBackend,
+    pub(crate) denoise_options: crate::DenoiseOptions,
 }
 
 impl<'a> Control<'a> {
@@ -53,12 +54,14 @@ impl<'a> Control<'a> {
         Self {
             cancel: Some(cancel),
             denoise_backend: crate::DenoiseBackend::Auto,
+            denoise_options: crate::DenoiseOptions::DEFAULT,
         }
     }
     pub const fn none() -> Self {
         Self {
             cancel: None,
             denoise_backend: crate::DenoiseBackend::Auto,
+            denoise_options: crate::DenoiseOptions::DEFAULT,
         }
     }
     /// Choose a denoising backend without changing another conversion's state.
@@ -72,5 +75,11 @@ impl<'a> Control<'a> {
         } else {
             Ok(())
         }
+    }
+
+    pub fn with_denoise_options(mut self, options: crate::DenoiseOptions) -> Result<Self> {
+        options.validate().map_err(Error::InvalidData)?;
+        self.denoise_options = options;
+        Ok(self)
     }
 }

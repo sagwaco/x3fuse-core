@@ -53,6 +53,7 @@ struct Args {
     denoise_backend: x3f_core::DenoiseBackend,
     spp_denoise: bool,
     rgb_chroma_lut: Option<bool>,
+    denoise_options: x3f_core::DenoiseOptions,
     apply_sgain: Option<bool>,
     file_type: FileType,
     color_encoding: ColorEncoding,
@@ -88,6 +89,7 @@ impl Default for Args {
             denoise_backend: x3f_core::DenoiseBackend::Auto,
             spp_denoise: false,
             rgb_chroma_lut: None,
+            denoise_options: x3f_core::DenoiseOptions::default(),
             apply_sgain: None,
             file_type: FileType::Dng,
             color_encoding: ColorEncoding::Srgb,
@@ -146,13 +148,20 @@ fn usage(progname: &str) -> ! {
          \x20  -unprocessed    Dump RAW without any preprocessing\n\
          \x20  -qtop           Dump Quattro top layer without preprocessing\n\
          \x20  -no-crop        Do not crop to active area\n\
-         \x20  -no-denoise     Disable NLM denoise (same as -denoise 0)\n\
-         \x20  -denoise-backend <auto|cpu|gpu>  Select execution backend\n\
          \x20  -spp-pipeline   Use Merrill SPP recovery and denoise on CPU\n\
          \x20                  Neutral noise sliders; TIFF, PPM or histogram\n\
-         \x20  -denoise <0-10> NLM denoise intensity. 0 = off,\n\
+         \x20                  Requires default denoise options and -denoise 10\n\
+         \x20  -no-denoise     Disable denoising (same as -denoise 0)\n\
+         \x20  -denoiser <nlm|bm3d>  Select algorithm (default: nlm)\n\
+         \x20  -denoise-luma / -no-denoise-luma  Luminance (default: off)\n\
+         \x20  -denoise-chroma / -no-denoise-chroma  Chroma (default: on)\n\
+         \x20  -denoise-strength <0.1-3>  Sensor strength multiplier (default: 1)\n\
+         \x20  -nlm-luma-patch / -nlm-chroma-patch <1-9>  Odd patch size\n\
+         \x20  -nlm-luma-search / -nlm-chroma-search <1-31>  Odd search size\n\
+         \x20  -denoise-backend <auto|cpu|gpu>  Select execution backend\n\
+         \x20  -denoise <0-10> Denoise intensity. 0 = off,\n\
          \x20                  10 = full strength (default). Intermediate\n\
-         \x20                  values linearly scale the NLM sigma.\n\
+         \x20                  values scale the selected filter strength.\n\
          \x20  -no-sgain       Do not apply spatial gain (color compensation)\n\
          \x20  -no-fix-bad     Do not fix bad pixels\n\
          \x20  -chroma-lut     Enable scene-derived RGB highlight recovery\n\
@@ -327,6 +336,44 @@ fn parse_args(argv: &[String]) -> Args {
             "-no-chroma-lut" => args.rgb_chroma_lut = Some(false),
             "-no-denoise" => args.denoise_intensity = 0,
             "-spp-pipeline" => args.spp_denoise = true,
+            "-denoiser" => {
+                i += 1;
+                args.denoise_options.algorithm = argv
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| usage(progname));
+            }
+            "-denoise-luma" => args.denoise_options.luminance = true,
+            "-no-denoise-luma" => args.denoise_options.luminance = false,
+            "-denoise-chroma" => args.denoise_options.chroma = true,
+            "-no-denoise-chroma" => args.denoise_options.chroma = false,
+            "-denoise-strength" => {
+                i += 1;
+                args.denoise_options.strength = argv
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| usage(progname));
+                args.denoise_options
+                    .validate()
+                    .unwrap_or_else(|_| usage(progname));
+            }
+            "-nlm-luma-patch" | "-nlm-chroma-patch" | "-nlm-luma-search" | "-nlm-chroma-search" => {
+                let flag = argv[i].as_str();
+                i += 1;
+                let value = argv
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| usage(progname));
+                match flag {
+                    "-nlm-luma-patch" => args.denoise_options.nlm.luma_patch = value,
+                    "-nlm-chroma-patch" => args.denoise_options.nlm.chroma_patch = value,
+                    "-nlm-luma-search" => args.denoise_options.nlm.luma_search = value,
+                    _ => args.denoise_options.nlm.chroma_search = value,
+                }
+                args.denoise_options
+                    .validate()
+                    .unwrap_or_else(|_| usage(progname));
+            }
             "-denoise-backend" => {
                 i += 1;
                 let v = argv.get(i).unwrap_or_else(|| usage(progname));
@@ -448,6 +495,9 @@ fn validate_args(args: &Args) -> Result<(), String> {
         if args.denoise_backend == x3f_core::DenoiseBackend::Gpu {
             return Err("-spp-pipeline supports -denoise-backend auto or cpu".into());
         }
+        if args.denoise_options != x3f_core::DenoiseOptions::default() {
+            return Err("-spp-pipeline requires default denoise options".into());
+        }
     }
     if args.cineon && args.file_type != FileType::Tiff {
         return Err(
@@ -560,6 +610,7 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
         denoise_backend: args.denoise_backend,
         spp_denoise: args.spp_denoise,
         rgb_chroma_lut: args.rgb_chroma_lut,
+        denoise_options: args.denoise_options,
         apply_sgain: args.apply_sgain,
         wb: args.wb.clone(),
         compress: args.compress,
@@ -607,7 +658,7 @@ fn main() -> ExitCode {
         set_max_printed_matrix_elements(n);
     }
     // -ocl is a no-op, preserved only so legacy scripts don't error. There is
-    // no OpenCL backend (the denoise pass is the pure-Rust NLM in x3f-sys).
+    // no OpenCL backend (native acceleration uses wgpu in x3f-sys).
     let _ = args.use_opencl;
 
     if let Some(dir) = args.outdir.as_deref() {
@@ -907,7 +958,7 @@ mod tests {
     #[test]
     fn spp_pipeline_is_explicit_and_rejects_unsupported_modes() {
         assert!(!parse(&["in.X3F"]).spp_denoise);
-        for format in ["-tiff", "-ppm", "-histogram"] {
+        for format in ["-tiff", "-ppm-ascii", "-ppm", "-histogram"] {
             let args = parse(&[format, "-color", "sRGB", "-spp-pipeline", "in.X3F"]);
             assert!(args.spp_denoise);
             assert!(validate_args(&args).is_ok(), "{format}");
@@ -937,6 +988,57 @@ mod tests {
     }
 
     #[test]
+    fn spp_pipeline_requires_default_denoise_options() {
+        for flags in [
+            vec!["-denoiser", "bm3d"],
+            vec!["-denoise-luma"],
+            vec!["-no-denoise-chroma"],
+            vec!["-denoise-strength", "1.5"],
+            vec!["-nlm-luma-patch", "7"],
+            vec!["-nlm-chroma-patch", "7"],
+            vec!["-nlm-luma-search", "21"],
+            vec!["-nlm-chroma-search", "21"],
+        ] {
+            for spp_first in [false, true] {
+                let mut command = vec!["-tiff"];
+                if spp_first {
+                    command.push("-spp-pipeline");
+                }
+                command.extend(&flags);
+                if !spp_first {
+                    command.push("-spp-pipeline");
+                }
+                command.push("in.X3F");
+                let error = validate_args(&parse(&command)).unwrap_err();
+                assert!(
+                    error.contains("default denoise options"),
+                    "{command:?}: {error}"
+                );
+            }
+        }
+        let args = parse(&[
+            "-tiff",
+            "-spp-pipeline",
+            "-denoiser",
+            "nlm",
+            "-no-denoise-luma",
+            "-denoise-chroma",
+            "-denoise-strength",
+            "1",
+            "-nlm-luma-patch",
+            "3",
+            "-nlm-chroma-patch",
+            "3",
+            "-nlm-luma-search",
+            "11",
+            "-nlm-chroma-search",
+            "11",
+            "in.X3F",
+        ]);
+        assert!(validate_args(&args).is_ok());
+    }
+
+    #[test]
     fn recovery_pipelines_are_separate() {
         for flags in [
             vec!["-chroma-lut", "-spp-pipeline"],
@@ -960,6 +1062,34 @@ mod tests {
             command.push("in.X3F");
             assert!(validate_args(&parse(&command)).is_ok(), "{command:?}");
         }
+    }
+
+    #[test]
+    fn algorithm_and_advanced_denoise_flags_are_independent() {
+        let options = parse(&[
+            "-denoiser",
+            "bm3d",
+            "-denoise-luma",
+            "-no-denoise-chroma",
+            "-denoise-strength",
+            "1.5",
+            "-nlm-luma-patch",
+            "7",
+            "-nlm-chroma-search",
+            "21",
+            "in.X3F",
+        ])
+        .denoise_options;
+        assert_eq!(options.algorithm, x3f_core::DenoiseAlgorithm::Bm3d);
+        assert!(options.luminance);
+        assert!(!options.chroma);
+        assert_eq!(options.strength, 1.5);
+        assert_eq!(options.nlm.luma_patch, 7);
+        assert_eq!(options.nlm.chroma_search, 21);
+        assert_eq!(
+            parse(&["in.X3F"]).denoise_options,
+            x3f_core::DenoiseOptions::default()
+        );
     }
 
     #[test]

@@ -6002,6 +6002,11 @@ unsafe fn get_image_impl(
 ) -> crate::Result<()> {
     let dng_recovery = options.dng_highlight_recovery;
     if options.spp_denoise {
+        if control.denoise_options != crate::DenoiseOptions::default() {
+            return Err(crate::Error::InvalidData(
+                "SPP denoising requires default denoise options",
+            ));
+        }
         if options.rgb_chroma_lut == Some(true) {
             return Err(crate::Error::InvalidData(
                 "SPP processing cannot combine with RGB chroma LUT recovery; select one pipeline",
@@ -6612,6 +6617,89 @@ static _A_X3F_GET_PREVIEW: unsafe extern "C" fn(
 #[cfg(test)]
 mod tests {
     use super::{intermediate_levels, shoulder_compress, INTERMEDIATE_UNIT};
+
+    #[test]
+    fn spp_rejects_custom_denoise_options_before_processing() {
+        use super::*;
+        let defaults = crate::DenoiseOptions::default();
+        for denoise_options in [
+            crate::DenoiseOptions {
+                algorithm: crate::DenoiseAlgorithm::Bm3d,
+                ..defaults
+            },
+            crate::DenoiseOptions {
+                luminance: true,
+                ..defaults
+            },
+            crate::DenoiseOptions {
+                chroma: false,
+                ..defaults
+            },
+            crate::DenoiseOptions {
+                strength: 2.0,
+                ..defaults
+            },
+            crate::DenoiseOptions {
+                nlm: crate::NlmOptions {
+                    luma_patch: 5,
+                    ..defaults.nlm
+                },
+                ..defaults
+            },
+            crate::DenoiseOptions {
+                nlm: crate::NlmOptions {
+                    chroma_patch: 5,
+                    ..defaults.nlm
+                },
+                ..defaults
+            },
+            crate::DenoiseOptions {
+                nlm: crate::NlmOptions {
+                    luma_search: 13,
+                    ..defaults.nlm
+                },
+                ..defaults
+            },
+            crate::DenoiseOptions {
+                nlm: crate::NlmOptions {
+                    chroma_search: 13,
+                    ..defaults.nlm
+                },
+                ..defaults
+            },
+        ] {
+            let mut x3f: x3f_t = unsafe { std::mem::zeroed() };
+            let mut image: x3f_area16_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                get_image_controlled(
+                    &mut x3f,
+                    &mut image,
+                    ptr::null_mut(),
+                    x3f_color_encoding_e_SRGB,
+                    1,
+                    1,
+                    10,
+                    1,
+                    ptr::null_mut(),
+                    ProcessingOptions {
+                        spp_denoise: true,
+                        ..ProcessingOptions::default()
+                    },
+                    Control::none()
+                        .with_denoise_options(denoise_options)
+                        .unwrap(),
+                )
+            };
+            assert!(matches!(
+                result,
+                Err(crate::Error::InvalidData(
+                    "SPP denoising requires default denoise options"
+                ))
+            ));
+            assert!(image.buf.is_null());
+            assert!(image.data.is_null());
+        }
+    }
 
     #[test]
     fn merrill_colordq_camf_boundaries_use_native_skip_key_and_table_shapes() {
