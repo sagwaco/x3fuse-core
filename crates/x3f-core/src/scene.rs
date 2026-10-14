@@ -68,6 +68,11 @@ pub struct SceneLinearImage {
     pub orientation: u16,
     /// Calibration for camera-space white-balance edits.
     pub white_balance: WhiteBalanceCalibration,
+    /// Native Color Mode calibration at the as-shot white balance.
+    /// Input is `inverse(white_balance.camera_to_rgb) * scene_rgb`, with
+    /// the selected spatial gain and sensor processing already applied.
+    /// None means an unsupported sensor or missing or invalid native calibration.
+    pub color_mode_calibration: Option<sys::ColorModeCalibration>,
 }
 
 /// Camera framing inferred from the embedded JPEG, matching DNG DefaultUserCrop.
@@ -180,6 +185,15 @@ pub fn prepare_scene_linear(
         .unwrap_or(1);
     on_stage(ConversionStage::Process);
     control.check()?;
+    let cwb = crate::wb_cstring(Some(&wb))?;
+    // SAFETY: RAW is still unprocessed, and the reader and WB name outlive the call.
+    let color_mode_calibration = match unsafe {
+        sys::color_mode_calibration(reader.x3f.as_ptr(), crate::cwb_ptr(&cwb), control)
+    } {
+        Ok(calibration) => Some(calibration),
+        Err(sys::Error::InvalidData(_)) => None,
+        Err(error) => return Err(error.into()),
+    };
     // SAFETY: preparation consumes only this fresh reader's decoded buffers.
     let linear = unsafe {
         sys::get_scene_linear_controlled(
@@ -203,6 +217,7 @@ pub fn prepare_scene_linear(
             xyz_to_camera,
             as_shot_neutral: color.neutral,
         },
+        color_mode_calibration,
     })
 }
 
@@ -221,6 +236,107 @@ fn validate_matrix(m: &[f64; 9]) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scene_calibration_matches_fresh_raw_without_changing_pixels() {
+        let corpus = std::env::var_os("X3F_TEST_FILES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../x3f_test_files"));
+        let mut checked = 0;
+        for name in ["_SDI8040.X3F", "_SDI8284.X3F"] {
+            let path = corpus.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            let load = || {
+                let mut reader = Reader::open(&path).unwrap();
+                reader.load_camf().unwrap();
+                reader.load_property_list().unwrap();
+                reader.load_thumbnail_jpeg().unwrap();
+                reader.load_raw().unwrap();
+                reader
+            };
+            let expected_calibration = {
+                let reader = load();
+                let cwb = crate::wb_cstring(Some(&reader.dng_default_wb())).unwrap();
+                // SAFETY: this reader owns unprocessed RAW and loaded metadata.
+                unsafe {
+                    sys::color_mode_calibration(
+                        reader.x3f.as_ptr(),
+                        crate::cwb_ptr(&cwb),
+                        Control::none(),
+                    )
+                }
+                .unwrap()
+            };
+            for apply_sgain in [false, true] {
+                let expected_scene = {
+                    let reader = load();
+                    // SAFETY: this fresh reader owns all buffers consumed by preparation.
+                    unsafe {
+                        sys::get_scene_linear_controlled(
+                            reader.x3f.as_ptr(),
+                            true,
+                            0,
+                            apply_sgain,
+                            false,
+                            Control::none(),
+                        )
+                    }
+                    .unwrap()
+                };
+                let scene = prepare_scene_linear(
+                    &path,
+                    &SceneLinearOptions {
+                        denoise_intensity: 0,
+                        apply_sgain: Some(apply_sgain),
+                        ..Default::default()
+                    },
+                    &AtomicBool::new(false),
+                    |_| {},
+                )
+                .unwrap();
+                assert!(
+                    scene.data == expected_scene.data,
+                    "{name}, sgain={apply_sgain}"
+                );
+                assert_eq!(
+                    (scene.width, scene.height),
+                    (expected_scene.width, expected_scene.height)
+                );
+                assert_eq!(
+                    scene.white_balance.camera_to_rgb,
+                    expected_scene.camera_to_rgb
+                );
+                let actual = scene.color_mode_calibration.unwrap();
+                assert_eq!(actual.sensor_to_srgb, expected_calibration.sensor_to_srgb);
+                assert_eq!(actual.wb_gain, expected_calibration.wb_gain);
+                assert_eq!(
+                    actual.normalized_to_counts,
+                    expected_calibration.normalized_to_counts
+                );
+                assert_eq!(actual.count_offset, expected_calibration.count_offset);
+                assert_eq!(actual.iso_gain, expected_calibration.iso_gain);
+                assert_eq!(actual.output_to_srgb, expected_calibration.output_to_srgb);
+                assert_eq!(
+                    actual.color_dq.is_some(),
+                    expected_calibration.color_dq.is_some()
+                );
+                if let (Some(actual), Some(expected)) =
+                    (&actual.color_dq, &expected_calibration.color_dq)
+                {
+                    assert_eq!(
+                        actual.apply([100.0, 500.0, 900.0]),
+                        expected.apply([100.0, 500.0, 900.0])
+                    );
+                }
+            }
+            checked += 1;
+        }
+        if checked == 0 {
+            eprintln!("skip: set X3F_TEST_FILES for scene Color Mode calibration coverage");
+        }
+    }
 
     #[test]
     fn as_shot_crop_is_normalized_in_display_orientation() {

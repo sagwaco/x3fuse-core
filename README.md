@@ -55,6 +55,7 @@ Enable the optional `serde` feature to persist these settings.
 Version **0.2.0** adds `denoise_backend` and
 `denoise_options` to `ProcessOptions` and `SceneLinearOptions`, and GPU errors to the Rust error
 enums. This branch also adds `spp_denoise` and `color_mode` to `ProcessOptions`.
+`SceneLinearImage` adds optional `color_mode_calibration` for rendering camera profiles.
 Downstream exhaustive struct literals and error matches must be updated;
 use `..Default::default()` when constructing options. These source changes
 must not be published as a 0.1.x patch. The C ABI remains unchanged.

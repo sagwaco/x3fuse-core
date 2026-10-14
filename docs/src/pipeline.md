@@ -247,6 +247,28 @@ Orientation and camera WB calibration accompany the pixels. The renderer must
 apply orientation once and preserve negative channels and values above one until
 its chosen output transform.
 
+`SceneLinearImage::color_mode_calibration` captures native Color Mode calibration
+from the same decoded RAW before sensor processing changes it. It uses the
+as-shot WB and returns `None` for unsupported sensors or invalid native
+calibration. Cancellation and other errors still stop preparation. Editors can
+reuse this value without decoding RAW a second time.
+
+For a prepared pixel, `inverse(white_balance.camera_to_rgb) * scene_rgb` gives
+the normalized BMT input to this calibration. Spatial gain, sensor denoise,
+repair and any requested highlight recovery are already in that input. Do not
+apply spatial gain again. Black, white and WB normalization match DNG samples,
+but spatial gain follows `SceneLinearOptions::apply_sgain` and can differ from
+DNG export. DNG output scaling and final integer encoding are absent; the
+earlier sensor intermediates still use integers.
+
+Multiply by the matrix from `render_matrix` and add its offset to obtain native
+counts. Then apply `color_dq` when present before the sensor's count bounds and
+tone lookup. The calibration is fixed at as-shot WB; it does not reproduce a
+native WB preset change. Scene
+preparation uses different filters and spatial-gain tables from native SPP.
+Merrill's black-offset and spatial-gain order also differ. This mapping does
+not undo sensor processing or establish whole-image SPP parity.
+
 `read_as_shot_crop` reads camera framing without decoding RAW pixels. It uses
 the embedded JPEG aspect and CAMF active area, matching DNG `DefaultUserCrop`,
 and returns normalized `[x, y, width, height]` in EXIF-oriented coordinates.
