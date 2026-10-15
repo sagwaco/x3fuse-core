@@ -107,6 +107,14 @@ The curve has 4097 uniform linear input points, `i/4096`. Its first point is
 so the test model reads their Y values directly and interpolates them.
 Arbitrary spline support is not needed for this fixed grid.
 
+Native FP32 sampling can produce small local decreases near white. The DNG
+fit clamps finite samples to [0,1] and raises each decrease to the previous
+output before fitting the LookTable. Valid curves keep their exact values;
+non-finite samples still fail. On dp0 Quattro `DP0Q0130.X3F`, Cinema had one
+decreasing knot at input 2990/4096. The repair raises it by 0.0000006556511.
+This approximation keeps all eleven profiles available. Native tone, TIFF
+pixels, DNG raw samples and the embedded preview are unchanged.
+
 The fit follows the SDK order:
 
 1. Clamp each sensor channel to the selected profile's camera white.

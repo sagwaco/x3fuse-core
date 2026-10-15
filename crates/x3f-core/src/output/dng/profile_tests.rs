@@ -1344,6 +1344,57 @@ fn color_mode_corpus_preserves_decoded_raw_and_calibration() {
 }
 
 #[test]
+#[ignore = "checks the optional dp0 Quattro sample with a native Cinema tone reversal"]
+fn quattro_native_tone_reversal_keeps_all_profiles() {
+    let corpus = std::env::var_os("X3F_TEST_FILES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../x3f_test_files"));
+    let input = corpus.join("DP0Q0130.X3F");
+    if !input.is_file() {
+        eprintln!("skip: missing {}", input.display());
+        return;
+    }
+    let modes = loaded_reader(&input).available_color_modes().unwrap();
+    assert_eq!(modes.len(), 11);
+    let destination =
+        std::env::temp_dir().join(format!("x3f-dng-tone-reversal-{}", std::process::id()));
+    std::fs::create_dir_all(&destination).unwrap();
+    let mut reference: Option<Vec<u8>> = None;
+    for (selection, name) in [
+        (Some(x3f_sys::ColorMode::AsShot), "Sunset Red"),
+        (Some(x3f_sys::ColorMode::Standard), "Standard"),
+        (None, "legacy"),
+    ] {
+        let path = destination.join(format!("{name}.dng"));
+        let report = crate::convert_file(
+            &input,
+            &path,
+            crate::OutputFormat::Dng,
+            &crate::ProcessOptions {
+                color_mode: selection,
+                denoise_intensity: 0,
+                ..Default::default()
+            },
+            &std::sync::atomic::AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        let data = std::fs::read(&path).unwrap();
+        if selection.is_some() {
+            assert_mode_profiles(&data, name, &modes);
+        }
+        if let Some(first) = &reference {
+            assert_raw_equal(first, &data);
+        } else {
+            reference = Some(data);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+    std::fs::remove_dir(destination).unwrap();
+}
+
+#[test]
 #[cfg(any(unix, target_arch = "wasm32"))]
 fn monochrome_as_shot_metadata_uses_header_or_picture_mode() {
     for (version, header, picture, expected) in [

@@ -156,22 +156,24 @@ pub(super) struct ToneCurve {
 impl ToneCurve {
     pub(super) fn fit(mut render: impl FnMut(f64) -> f64) -> Result<Self> {
         // Align knots with Adobe's 4096-interval tone table to retain plateaus.
-        let knots: Vec<_> = (0..=4096)
-            .flat_map(|i| {
-                let x = i as f32 / 4096.0;
-                let y = render(f64::from(x)) as f32;
-                [
-                    x,
-                    if i == 0 {
-                        0.0
-                    } else if i == 4096 {
-                        1.0
-                    } else {
-                        y
-                    },
-                ]
-            })
-            .collect();
+        let mut knots = Vec::with_capacity(8194);
+        let mut previous = 0.0;
+        for i in 0..=4096 {
+            let x = i as f32 / 4096.0;
+            let y = render(f64::from(x)) as f32;
+            let y = match i {
+                0 => 0.0,
+                4096 => 1.0,
+                _ => y,
+            };
+            if !y.is_finite() {
+                return Err(Error::InvalidData("non-finite classic tone sample"));
+            }
+            // Native FP32 tone samples can fall slightly near white.
+            let y = y.clamp(previous, 1.0);
+            knots.extend([x, y]);
+            previous = y;
+        }
         Self::from_knots(knots)
     }
 
@@ -447,6 +449,41 @@ mod tests {
         }
         assert!(ToneCurve::from_knots(vec![0.0, 0.0, 0.0, 1.0]).is_err());
         assert!(ToneCurve::from_knots(vec![0.0, 0.5, 1.0, 0.0]).is_err());
+    }
+
+    #[test]
+    fn fitted_tone_bounds_samples_and_flattens_reversals() {
+        let sample = |x: f64| match (x * 4096.0) as usize {
+            1 => -0.1,
+            2048 => 0.49,
+            4095 => 1.01,
+            _ => x,
+        };
+        let raw: Vec<_> = (0..=4096)
+            .flat_map(|i| {
+                let x = i as f32 / 4096.0;
+                [x, sample(f64::from(x)) as f32]
+            })
+            .collect();
+        assert!(ToneCurve::from_knots(raw).is_err());
+        let curve = ToneCurve::fit(sample).unwrap();
+        for i in 0..=4096 {
+            let expected = match i {
+                1 => 0.0,
+                2048 => 2047.0 / 4096.0,
+                4095 => 1.0,
+                _ => i as f32 / 4096.0,
+            };
+            assert_eq!(curve.table[i], expected);
+        }
+        assert!((curve.inverse(0.5) - 0.5).abs() < 1.0 / 4096.0);
+    }
+
+    #[test]
+    fn fitted_tone_rejects_non_finite_samples() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(ToneCurve::fit(|x| if x == 0.5 { invalid } else { x }).is_err());
+        }
     }
 
     #[test]
