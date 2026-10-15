@@ -14,6 +14,16 @@ modes use `ExtraCameraProfiles`. Names match the in-camera labels, such as
 `Standard`, `Vivid` and `FOV Classic Blue`, without a prefix. The six legacy
 synthetic names stay available.
 
+For DNG only, `AsShot` with a recorded `Monochrome` mode makes the existing
+synthetic `Monochrome` profile the primary profile and `AsShotProfileName`.
+Merrill reads the header mode; Quattro v4 reads EXIF `PictureMode`. All native
+color profiles, including Standard, remain selectable alongside the other
+synthetic profiles. Standard supplies the shared white point, color preview
+and baseline exposure. The primary Monochrome profile keeps its synthetic
+matrices and default tone behavior; it does not inherit Standard's native
+tone, LookTable or exposure offset. Camera filter selection is not applied.
+TIFF still rejects as-shot Monochrome. Sepia still returns an error.
+
 The writer clears `color_mode` before raw processing. Mode selection changes
 profile metadata and preview pixels. Decoded samples, levels, crop, recovery
 and the source X3F header stay invariant. The same processed sensor image

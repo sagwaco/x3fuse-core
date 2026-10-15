@@ -456,9 +456,9 @@ fn write_lightroom_white_xy_cast_diagnostic() {
     );
 }
 
-fn assert_mode_profiles(data: &[u8], selected: x3f_sys::ColorMode, modes: &[x3f_sys::ColorMode]) {
+fn assert_mode_profiles(data: &[u8], selected: &str, modes: &[x3f_sys::ColorMode]) {
     let primary = root(data);
-    assert_eq!(primary[&t::PROFILE_NAME].text(), selected.name());
+    assert_eq!(primary[&t::PROFILE_NAME].text(), selected);
     assert_eq!(
         primary[&t::AS_SHOT_PROFILE_NAME].text(),
         primary[&t::PROFILE_NAME].text()
@@ -1177,6 +1177,7 @@ fn color_mode_recovery_scale_is_restored_once() {
             let copy = PreparedColorModes {
                 modes: prepared.modes.clone(),
                 selected: prepared.selected,
+                monochrome: prepared.monochrome,
                 native: prepared.native.clone(),
             };
             let profiles = copy
@@ -1288,7 +1289,7 @@ fn color_mode_corpus_preserves_decoded_raw_and_calibration() {
                         "selection mutated X3F header"
                     );
                     let data = std::fs::read(&output).unwrap();
-                    assert_mode_profiles(&data, mode, &modes);
+                    assert_mode_profiles(&data, mode.name(), &modes);
                     if let Some(first) = &reference {
                         assert_raw_equal(first, &data);
                         if mode == x3f_sys::ColorMode::Vivid {
@@ -1343,6 +1344,280 @@ fn color_mode_corpus_preserves_decoded_raw_and_calibration() {
 }
 
 #[test]
+#[cfg(any(unix, target_arch = "wasm32"))]
+fn monochrome_as_shot_metadata_uses_header_or_picture_mode() {
+    for (version, header, picture, expected) in [
+        (0x0003_0000_u32, "Monochrome", "Standard", true),
+        (0x0003_0000, "Standard", "Monochrome", false),
+        (0x0003_0000, "Sepia", "Monochrome", false),
+        (0x0003_0000, "", "Monochrome", false),
+        (0x0004_0001, "Standard", "Monochrome", true),
+        (0x0004_0001, "Monochrome", "Standard", false),
+        (0x0004_0001, "Monochrome", "Sepia", false),
+        (0x0004_0001, "Monochrome", "", false),
+    ] {
+        // IFD0 -> EXIF -> Sigma MakerNote with a 16-byte PictureMode value.
+        let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+        for (tag, kind, count, offset) in [(0x8769_u16, 4_u16, 1_u32, 26_u32), (0x927c, 7, 44, 44)]
+        {
+            tiff.extend(1_u16.to_le_bytes());
+            tiff.extend(tag.to_le_bytes());
+            tiff.extend(kind.to_le_bytes());
+            tiff.extend(count.to_le_bytes());
+            tiff.extend(offset.to_le_bytes());
+            tiff.extend(0_u32.to_le_bytes());
+        }
+        tiff.extend(b"SIGMA\0\0\0\0\x03");
+        tiff.extend(1_u16.to_le_bytes());
+        tiff.extend(0x003d_u16.to_le_bytes());
+        tiff.extend(2_u16.to_le_bytes());
+        tiff.extend(16_u32.to_le_bytes());
+        tiff.extend(72_u32.to_le_bytes());
+        tiff.extend(0_u32.to_le_bytes());
+        tiff.extend(picture.bytes());
+        tiff.resize(88, 0);
+        let mut jpeg = b"\xff\xd8\xff\xe1".to_vec();
+        jpeg.extend(((tiff.len() + 8) as u16).to_be_bytes());
+        jpeg.extend(b"Exif\0\0");
+        jpeg.extend(tiff);
+
+        let mut bytes = vec![0; if version < 0x0004_0000 { 424 } else { 24 }];
+        bytes[..4].copy_from_slice(b"FOVb");
+        bytes[4..8].copy_from_slice(&version.to_le_bytes());
+        let image = bytes.len() as u32;
+        bytes.extend(b"SECi");
+        for value in [0x0002_0000_u32, 2, 18, 1, 1, 0] {
+            bytes.extend(value.to_le_bytes());
+        }
+        bytes.extend(&jpeg);
+        let directory = bytes.len() as u32;
+        bytes.extend(b"SECd");
+        for value in [0x0002_0000, 1, image, jpeg.len() as u32 + 28] {
+            bytes.extend(value.to_le_bytes());
+        }
+        bytes.extend(b"IMA2");
+        bytes.extend(directory.to_le_bytes());
+        let reader = Reader::from_bytes(&bytes).unwrap();
+        // SAFETY: the reader owns this header and no other references exist.
+        unsafe {
+            let field = &mut (*reader.x3f.as_ptr()).header.color_mode;
+            for (out, byte) in field.iter_mut().zip(header.bytes()) {
+                *out = byte as _;
+            }
+        }
+        assert_eq!(reader.dng_thumb_jpeg_bytes().unwrap(), jpeg);
+        assert_eq!(
+            as_shot_monochrome(&reader),
+            expected,
+            "{version:x}/{header}/{picture}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "writes and checks Monochrome DNGs from the optional Merrill and dp2 Quattro corpus"]
+fn write_monochrome_as_shot_corpus_and_check_profiles() {
+    fn reader_with_mode(path: &std::path::Path, mode: &str) -> Reader {
+        let mut reader = loaded_reader(path);
+        if reader.header_version() >= 0x0004_0000 {
+            reader.load_thumbnail_jpeg().unwrap();
+            // SAFETY: the loaded JPEG is owned only by this reader. The fixed-size
+            // edit changes the fixture's PictureMode without changing its offsets.
+            let jpeg = unsafe {
+                let de = x3f_sys::x3f_get_thumb_jpeg(reader.x3f.as_ptr());
+                let image = &mut (*de).header.data_subsection.image_data;
+                std::slice::from_raw_parts_mut(image.data.cast::<u8>(), image.data_size as usize)
+            };
+            fn field(tiff: &[u8], ifd: usize, tag: u16, order: Order) -> (usize, usize) {
+                let count = order.u16(&tiff[ifd..ifd + 2]) as usize;
+                let entry = tiff[ifd + 2..]
+                    .as_chunks::<12>()
+                    .0
+                    .iter()
+                    .take(count)
+                    .find(|entry| order.u16(&entry[..2]) == tag)
+                    .unwrap();
+                (
+                    order.u32(&entry[4..8]) as usize,
+                    order.u32(&entry[8..]) as usize,
+                )
+            }
+            let base = jpeg.windows(6).position(|v| v == b"Exif\0\0").unwrap() + 6;
+            let tiff = &jpeg[base..];
+            let order = match &tiff[..2] {
+                b"II" => Order::Little,
+                b"MM" => Order::Big,
+                _ => panic!("invalid fixture TIFF header"),
+            };
+            let ifd = order.u32(&tiff[4..8]) as usize;
+            let (_, exif) = field(tiff, ifd, 0x8769, order);
+            let (_, maker) = field(tiff, exif, 0x927c, order);
+            assert_eq!(&tiff[maker..maker + 8], b"SIGMA\0\0\0");
+            let (count, offset) = field(tiff, maker + 10, 0x003d, order);
+            assert!(count > mode.len());
+            let slot = &mut jpeg[base + offset..base + offset + count];
+            slot.fill(0);
+            slot[..mode.len()].copy_from_slice(mode.as_bytes());
+            assert_eq!(
+                x3f_sys::jpeg_exif::parse_jpeg_exif(jpeg)
+                    .unwrap()
+                    .picture_mode
+                    .as_deref(),
+                Some(mode)
+            );
+        } else {
+            assert_eq!(reader.dng_color_mode(), "Monochrome");
+            // SAFETY: the test owns the reader and preserves the source file.
+            unsafe {
+                let field = &mut (*reader.x3f.as_ptr()).header.color_mode;
+                field.fill(0);
+                for (out, byte) in field.iter_mut().zip(mode.bytes()) {
+                    *out = byte as _;
+                }
+            }
+        }
+        reader
+    }
+
+    let corpus = std::env::var_os("X3F_TEST_FILES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../x3f_test_files"));
+    let destination =
+        std::env::temp_dir().join(format!("x3f-dng-monochrome-{}", std::process::id()));
+    std::fs::create_dir_all(&destination).unwrap();
+    for (name, compress, count) in [
+        ("DP1M0815.X3F", false, 6),
+        ("DP2M0981.X3F", true, 6),
+        ("_SDI8284.X3F", false, 11),
+    ] {
+        let source = corpus.join(name);
+        if !source.is_file() {
+            eprintln!("skip: missing {}", source.display());
+            continue;
+        }
+        let mut data = Vec::new();
+        for selection in [x3f_sys::ColorMode::Standard, x3f_sys::ColorMode::AsShot] {
+            let mut reader = reader_with_mode(&source, "Monochrome");
+            assert!(as_shot_monochrome(&reader));
+            let header = reader.dng_color_mode();
+            let jpeg = reader.dng_thumb_jpeg_bytes();
+            let modes = reader.available_color_modes().unwrap();
+            assert_eq!(modes.len(), count);
+            let path = destination.join(format!("{name}-{}.dng", selection.name()));
+            let mut warnings = Vec::new();
+            super::super::write_controlled(
+                &reader,
+                &path,
+                &crate::ProcessOptions {
+                    color_mode: Some(selection),
+                    compress,
+                    denoise_intensity: 0,
+                    ..Default::default()
+                },
+                x3f_sys::Control::none(),
+                &mut || {},
+                &mut warnings,
+            )
+            .unwrap();
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(reader.dng_color_mode(), header);
+            assert_eq!(reader.dng_thumb_jpeg_bytes(), jpeg);
+            let bytes = std::fs::read(&path).unwrap();
+            assert_mode_profiles(
+                &bytes,
+                if selection == x3f_sys::ColorMode::AsShot {
+                    "Monochrome"
+                } else {
+                    "Standard"
+                },
+                &modes,
+            );
+            data.push(bytes);
+        }
+        assert_raw_equal(&data[0], &data[1]);
+        let directories: Vec<_> = data
+            .iter()
+            .map(|bytes| {
+                let primary = root(bytes);
+                let offsets = primary[&t::EXTRA_CAMERA_PROFILES].longs();
+                let start = primary[&t::STRIP_OFFSETS].longs()[0] as usize;
+                let size = primary[&t::STRIP_BYTE_COUNTS].longs()[0] as usize;
+                let preview = &bytes[start..start + size];
+                let mut profiles = vec![primary];
+                profiles.extend(offsets.into_iter().map(|off| extra(bytes, off as usize)));
+                (preview, profiles)
+            })
+            .collect();
+        assert_eq!(
+            directories[0].0, directories[1].0,
+            "Standard preview changed"
+        );
+        for original in &directories[0].1 {
+            let name = original[&t::PROFILE_NAME].text();
+            let promoted = directories[1]
+                .1
+                .iter()
+                .find(|profile| profile[&t::PROFILE_NAME].text() == name)
+                .unwrap();
+            for tag in [
+                t::COLOR_MATRIX1,
+                t::FORWARD_MATRIX1,
+                t::BASELINE_EXPOSURE_OFFSET,
+            ] {
+                assert_eq!(
+                    original.get(&tag).map(Entry::rationals),
+                    promoted.get(&tag).map(Entry::rationals),
+                    "{name}/{tag}"
+                );
+            }
+            for tag in [t::PROFILE_TONE_CURVE, t::PROFILE_LOOK_TABLE_DATA] {
+                assert_eq!(
+                    original.get(&tag).map(Entry::floats),
+                    promoted.get(&tag).map(Entry::floats),
+                    "{name}/{tag}"
+                );
+            }
+            for tag in [
+                t::DEFAULT_BLACK_RENDER,
+                t::PROFILE_LOOK_TABLE_DIMS,
+                t::PROFILE_LOOK_TABLE_ENCODING,
+            ] {
+                assert_eq!(
+                    original.get(&tag).map(Entry::longs),
+                    promoted.get(&tag).map(Entry::longs),
+                    "{name}/{tag}"
+                );
+            }
+        }
+        let options = crate::ProcessOptions {
+            color_mode: Some(x3f_sys::ColorMode::AsShot),
+            denoise_intensity: 0,
+            ..Default::default()
+        };
+        let tiff = destination.join(format!("{name}-unsupported.tif"));
+        let error = reader_with_mode(&source, "Monochrome")
+            .dump_tiff(&tiff, &options)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("as-shot monochrome and sepia"),
+            "{error}"
+        );
+        assert!(!tiff.exists());
+        let sepia = destination.join(format!("{name}-sepia.dng"));
+        let error = reader_with_mode(&source, "Sepia")
+            .dump_dng(&sepia, &options)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("as-shot monochrome and sepia"),
+            "{error}"
+        );
+        assert!(!sepia.exists());
+        eprintln!("{name}: Monochrome default, all {count} native modes, unchanged profiles/raw/preview; TIFF and Sepia still reject");
+    }
+    eprintln!("Monochrome DNG validation files: {}", destination.display());
+}
+
+#[test]
 #[ignore = "checks the real dp2 Quattro PictureMode against explicit named DNG selection"]
 fn quattro_as_shot_matches_recorded_profile_and_raw() {
     let Some(corpus) = std::env::var_os("X3F_TEST_FILES").map(PathBuf::from) else {
@@ -1384,7 +1659,7 @@ fn quattro_as_shot_matches_recorded_profile_and_raw() {
             .unwrap();
         assert_eq!(reader.dng_color_mode(), header_mode);
         let data = std::fs::read(&path).unwrap();
-        assert_mode_profiles(&data, named, &modes);
+        assert_mode_profiles(&data, named.name(), &modes);
         outputs.push(data);
         std::fs::remove_file(path).unwrap();
     }
@@ -1464,7 +1739,7 @@ fn write_color_mode_camera_fixtures() {
             )
             .unwrap();
         let data = std::fs::read(&output).unwrap();
-        assert_mode_profiles(&data, x3f_sys::ColorMode::Standard, &modes);
+        assert_mode_profiles(&data, x3f_sys::ColorMode::Standard.name(), &modes);
         let primary = root(&data);
         let raw = directory(
             &data,

@@ -752,11 +752,11 @@ impl Reader {
             return None;
         }
         // SAFETY: de is non-null and loaded; .image_data.data points at
-        // the JPEG payload of length (*de).input.size.
+        // the JPEG payload of length image_data.data_size.
         let (data, size) = unsafe {
             (
                 (*de).header.data_subsection.image_data.data,
-                (*de).input.size as usize,
+                (*de).header.data_subsection.image_data.data_size as usize,
             )
         };
         if data.is_null() || size == 0 {

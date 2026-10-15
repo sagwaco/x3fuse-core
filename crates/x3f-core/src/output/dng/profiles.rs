@@ -24,6 +24,7 @@ use super::tiff_writer::{DirectoryWriter, Value};
 pub(super) struct PreparedColorModes {
     modes: Vec<x3f_sys::ColorModeParameters>,
     selected: usize,
+    monochrome: bool,
     native: x3f_sys::ColorModeCalibration,
 }
 
@@ -31,12 +32,25 @@ pub(super) struct ColorModeProfiles {
     name: String,
     color: [f32; 9],
     forward: [f32; 9],
-    fit: classic::ClassicFit,
+    fit: Option<classic::ClassicFit>,
     pub(super) white_xy: [f64; 2],
     exposure_offset: f32,
     pub(super) extra_blob: Vec<u8>,
     pub(super) extra_offsets: Vec<u32>,
     rendering: NativeRendering,
+}
+
+fn as_shot_monochrome(reader: &Reader) -> bool {
+    if reader.header_version() >= 0x0004_0000 {
+        reader
+            .dng_thumb_jpeg_bytes()
+            .and_then(|jpeg| x3f_sys::jpeg_exif::parse_jpeg_exif(&jpeg))
+            .and_then(|exif| exif.picture_mode)
+            .as_deref()
+            == Some("Monochrome")
+    } else {
+        reader.dng_color_mode() == "Monochrome"
+    }
 }
 
 impl PreparedColorModes {
@@ -48,6 +62,13 @@ impl PreparedColorModes {
         control: x3f_sys::Control<'_>,
     ) -> Result<Self, Error> {
         control.check()?;
+        // Use Standard calibration and preview for the synthetic Monochrome default.
+        let monochrome = selection == x3f_sys::ColorMode::AsShot && as_shot_monochrome(reader);
+        let selection = if monochrome {
+            x3f_sys::ColorMode::Standard
+        } else {
+            selection
+        };
         // Resolve before raw processing consumes the decoded sensor buffer.
         let selected = unsafe { x3f_sys::resolve_color_mode(reader.x3f.as_ptr(), selection) }?;
         if selected.as_shot_fallback {
@@ -77,6 +98,7 @@ impl PreparedColorModes {
         Ok(Self {
             modes,
             selected: index,
+            monochrome,
             native,
         })
     }
@@ -139,9 +161,7 @@ impl PreparedColorModes {
             let name = mode.mode.name().to_owned();
             let color = mat3_to_f32(&matrices.color);
             let forward = mat3_to_f32(&matrices.forward);
-            if index == self.selected {
-                primary = Some((name, color, forward, fit, rendering));
-            } else {
+            if index != self.selected || self.monochrome {
                 append_profile(
                     &mut extra_blob,
                     &mut extra_offsets,
@@ -156,7 +176,14 @@ impl PreparedColorModes {
                     ),
                 )?;
             }
+            if index == self.selected {
+                primary = Some((name, color, forward, fit, rendering));
+            }
         }
+        let (mut name, mut color, mut forward, fit, rendering) = primary.ok_or(
+            x3f_sys::Error::InvalidData("missing selected DNG Color Mode profile"),
+        )?;
+        let mut fit = Some(fit);
         // WhiteXY needs a row correction to retain each legacy as-shot neutral.
         let physical_white = multiply(
             &color0,
@@ -165,19 +192,28 @@ impl PreparedColorModes {
         let maximum = physical_white.into_iter().fold(0.0, f64::max);
         let physical_white = physical_white.map(|v| v / maximum);
         for profile in &PROFILES[1..] {
-            let (color, forward) = compute_matrices(reader, wb, calibration, profile).ok_or(
-                x3f_sys::Error::InvalidData("missing legacy synthetic profile calibration"),
-            )?;
-            let color = classic::legacy_color(color.map(f64::from), physical_white, white_xy)?;
-            append_profile(
-                &mut extra_blob,
-                &mut extra_offsets,
-                &build_mmcr_profile(profile.name, mat3_to_f32(&color), forward, None, None),
-            )?;
+            let (legacy_color, legacy_forward) = compute_matrices(reader, wb, calibration, profile)
+                .ok_or(x3f_sys::Error::InvalidData(
+                    "missing legacy synthetic profile calibration",
+                ))?;
+            let legacy_color = mat3_to_f32(&classic::legacy_color(
+                legacy_color.map(f64::from),
+                physical_white,
+                white_xy,
+            )?);
+            if self.monochrome && profile.name == "Monochrome" {
+                name = profile.name.to_owned();
+                color = legacy_color;
+                forward = legacy_forward;
+                fit = None;
+            } else {
+                append_profile(
+                    &mut extra_blob,
+                    &mut extra_offsets,
+                    &build_mmcr_profile(profile.name, legacy_color, legacy_forward, None, None),
+                )?;
+            }
         }
-        let (name, color, forward, fit, rendering) = primary.ok_or(x3f_sys::Error::InvalidData(
-            "missing selected DNG Color Mode profile",
-        ))?;
         Ok(ColorModeProfiles {
             name,
             color,
@@ -252,27 +288,23 @@ fn append_profile(blob: &mut Vec<u8>, offsets: &mut Vec<u32>, profile: &[u8]) ->
 impl ColorModeProfiles {
     pub(super) fn write_default(&self, ifd: &mut DirectoryWriter) {
         add_profile_tags(ifd, &self.name, self.color, self.forward);
-        ifd.add(
-            t::CALIBRATION_ILLUMINANT1,
-            Value::Short(vec![t::CALIB_ILLUMINANT_D65]),
-        );
-        ifd.add(
-            t::PROFILE_TONE_CURVE,
-            Value::Float(self.fit.curve.knots.clone()),
-        );
-        ifd.add(
-            t::PROFILE_LOOK_TABLE_DIMS,
-            Value::Long(classic::LOOK_DIMS.map(|v| v as u32).to_vec()),
-        );
-        ifd.add(
-            t::PROFILE_LOOK_TABLE_DATA,
-            Value::Float(self.fit.map.clone()),
-        );
-        ifd.add(t::PROFILE_LOOK_TABLE_ENCODING, Value::Long(vec![1]));
-        ifd.add(
-            t::BASELINE_EXPOSURE_OFFSET,
-            srational_from_floats(&[self.exposure_offset], 10_000),
-        );
+        if let Some(fit) = &self.fit {
+            ifd.add(
+                t::CALIBRATION_ILLUMINANT1,
+                Value::Short(vec![t::CALIB_ILLUMINANT_D65]),
+            );
+            ifd.add(t::PROFILE_TONE_CURVE, Value::Float(fit.curve.knots.clone()));
+            ifd.add(
+                t::PROFILE_LOOK_TABLE_DIMS,
+                Value::Long(classic::LOOK_DIMS.map(|v| v as u32).to_vec()),
+            );
+            ifd.add(t::PROFILE_LOOK_TABLE_DATA, Value::Float(fit.map.clone()));
+            ifd.add(t::PROFILE_LOOK_TABLE_ENCODING, Value::Long(vec![1]));
+            ifd.add(
+                t::BASELINE_EXPOSURE_OFFSET,
+                srational_from_floats(&[self.exposure_offset], 10_000),
+            );
+        }
         ifd.add(
             t::AS_SHOT_PROFILE_NAME,
             Value::Ascii(CString::new(self.name.as_str()).expect("profile name without NUL")),
