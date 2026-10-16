@@ -420,11 +420,7 @@ pub fn merge(
                             } else {
                                 1.0
                             };
-                            let mut w = if valid {
-                                sat * dark / var[group].max(1e-12)
-                            } else {
-                                0.0
-                            };
+                            let mut w = if valid { sat * dark / var[group] } else { 0.0 };
                             if i == 0 && valid {
                                 w = w.max(1e-3);
                             }
@@ -709,6 +705,27 @@ mod tests {
             assert_eq!(pixel[0], pixel[1]);
             assert!((pixel[2] - 0.28).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn raw_noise_floor_scales_with_exposure() {
+        let options = MergeOptions {
+            noise_k: [0.0; 3],
+            noise_sigma: Some(0.0),
+            ..MergeOptions::default()
+        };
+        let scene = merge(
+            2,
+            |i| {
+                let mut f = frame([1000, 2000][i], 0.25);
+                f.bmt.fill(if i == 0 { 0.2 } else { 0.6 });
+                Ok(f)
+            },
+            &options,
+            Control::none(),
+        )
+        .unwrap();
+        assert!(scene.bmt.iter().all(|v| (*v - 0.28).abs() < 1e-6));
     }
 
     #[test]
