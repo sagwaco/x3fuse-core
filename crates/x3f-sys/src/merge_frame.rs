@@ -13,8 +13,7 @@
 pub struct MergeFrame {
     /// Position of the frame in the X3I directory. Frame 0 is the 0 EV reference.
     pub frame_index: usize,
-    /// Exposure time of the frame in microseconds, from the CAMF entry that
-    /// holds microseconds (see the plan, section 2, and `exif.rs`).
+    /// Exposure time of the frame in microseconds, from CAMF `CaptureShutter`.
     pub shutter_us: u32,
     /// Width of the expanded full-resolution raster, in pixels.
     pub width: u32,
@@ -26,27 +25,34 @@ pub struct MergeFrame {
     /// which is the order `camera_to_rgb` consumes. Channel 2 is the top layer.
     /// Each sample is `(value - black) / (white - black)` of the processed
     /// image levels: white is 1.0 and the intermediate bias is removed.
+    /// These values come from the expanded u16 area. They include quantization
+    /// and clamps: Y = min(4T, 65535), and the intermediate bias floor is 0.
+    /// Expansion uses repaired intermediate planes when `fix_bad` is enabled.
     /// Spatial gain is multiplied in when `gain` is `Some`. No color matrix
     /// is applied.
     pub bmt: Vec<f32>,
     /// Spatial gain per pixel and channel that is already multiplied into
     /// `bmt`, `width * height * 3` long. `None` means a gain of 1.0 everywhere.
     pub gain: Option<Vec<f32>>,
-    /// Raw top-layer counts before normalisation and before bad-pixel repair,
-    /// one `u16` per expanded pixel, `width * height` long.
+    /// Top-layer intermediate counts after normalization and bad-pixel repair
+    /// when `fix_bad` is enabled. These are the samples that expansion reads.
+    /// One `u16` per expanded pixel, `width * height` long.
+    /// The intermediate encoding clamps at 0, which truncates negative noise.
     pub raw_top: Vec<u16>,
-    /// Raw counts of the two half-resolution layers before normalisation and
-    /// before bad-pixel repair, interleaved in channel order 0, 1,
-    /// `raw_half_width * raw_half_height * 2` long.
+    /// Intermediate counts of the two half-resolution layers after normalization
+    /// and bad-pixel repair when `fix_bad` is enabled. These are the samples that
+    /// expansion reads, interleaved in channel order 0, 1,
+    /// `raw_half_width * raw_half_height * 2` long. The snapshot excludes the
+    /// top-layer sum in channel 2. The encoding clamps at 0 and truncates negative noise.
     pub raw_half: Vec<u16>,
     /// Width of the half-resolution raw planes, in samples.
     pub raw_half_width: u32,
     /// Height of the half-resolution raw planes, in samples.
     pub raw_half_height: u32,
-    /// Raw black level per channel (0, 1, top), in raw counts.
+    /// Intermediate black level per channel (0, 1, top), in snapshot counts.
     pub raw_black: [f64; 3],
-    /// Raw white level per channel (0, 1, top), in raw counts. This is the
-    /// `max_raw` level that `preprocess_data_impl` uses.
+    /// Intermediate white level per channel (0, 1, top), in snapshot counts.
+    /// A normalized snapshot sample is `(value - raw_black) / (raw_white - raw_black)`.
     pub raw_white: [f64; 3],
     /// Read noise per channel (0, 1, top) as a fraction of
     /// `raw_white - raw_black`, measured on the dark shields of this frame.

@@ -207,6 +207,7 @@ pub use color_modes::{
     resolve_color_mode, ColorMode, ColorModeCalibration, ColorModeColorDq, ColorModeParameters,
     ColorModeRenderLuts, ColorModeSensor, ColorModeToneParameters,
 };
+pub use process::get_merge_frame_controlled;
 pub use process::{
     color_mode_calibration, get_image_controlled, get_preview_controlled,
     get_scene_linear_controlled, x3f_get_bmt_to_xyz, x3f_get_digital_iso_gain,

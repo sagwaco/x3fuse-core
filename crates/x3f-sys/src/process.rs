@@ -1440,7 +1440,46 @@ pub unsafe extern "C" fn preprocess_data(
     wb: *mut libc::c_char,
     ilevels: *mut x3f_image_levels_t,
 ) -> libc::c_int {
-    unsafe { preprocess_data_impl(x3f, fix_bad, wb, ilevels, None, None, Control::none()) }
+    unsafe {
+        preprocess_data_impl(x3f, fix_bad, wb, ilevels, None, None, None, Control::none())
+            .unwrap_or(0)
+    }
+}
+
+unsafe fn snapshot_merge_plane(
+    area: &x3f_area16_t,
+    width: u32,
+    height: u32,
+    channels: usize,
+    control: Control<'_>,
+) -> crate::Result<Vec<u16>> {
+    if area.data.is_null()
+        || width == 0
+        || height == 0
+        || width > area.columns
+        || height > area.rows
+        || channels > area.channels as usize
+        || width as usize * area.channels as usize > area.row_stride as usize
+    {
+        return Err(crate::Error::InvalidData("invalid merge raw plane"));
+    }
+    let length = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(channels))
+        .ok_or(crate::Error::Allocation)?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(length)
+        .map_err(|_| crate::Error::Allocation)?;
+    for row in 0..height as usize {
+        control.check()?;
+        for col in 0..width as usize {
+            let off = row * area.row_stride as usize + col * area.channels as usize;
+            let pixel = unsafe { std::slice::from_raw_parts(area.data.add(off), channels) };
+            output.extend_from_slice(pixel);
+        }
+    }
+    Ok(output)
 }
 
 // Provenance belongs to one conversion, never to the C image layout or a
@@ -1452,10 +1491,11 @@ unsafe fn preprocess_data_impl(
     ilevels: *mut x3f_image_levels_t,
     provenance: Option<&mut Option<SensorReliability>>,
     merrill_black: Option<[f64; 3]>,
+    merge: Option<&mut MergeFrame>,
     control: Control<'_>,
-) -> libc::c_int {
+) -> crate::Result<libc::c_int> {
     if control.check().is_err() {
-        return 0;
+        return Ok(0);
     }
     let mut image: x3f_area16_t = unsafe { std::mem::zeroed() };
     let mut qtop: x3f_area16_t = unsafe { std::mem::zeroed() };
@@ -1464,12 +1504,12 @@ unsafe fn preprocess_data_impl(
     let colors_in = if quattro { 2 } else { 3 };
 
     if unsafe { x3f_image_area(x3f, &mut image) } == 0 || image.channels < 3 {
-        return 0;
+        return Ok(0);
     }
     if quattro
         && (qtop.channels < 1 || qtop.rows < 2 * image.rows || qtop.columns < 2 * image.columns)
     {
-        return 0;
+        return Ok(0);
     }
 
     let mut black_level = [0.0_f64; 3];
@@ -1503,7 +1543,7 @@ unsafe fn preprocess_data_impl(
         unsafe {
             x3f_printf(x3f_verbosity_t_ERR, c"Could not get black level\n".as_ptr());
         }
-        return 0;
+        return Ok(0);
     }
     if let Some(level) = merrill_black {
         black_level = level;
@@ -1529,7 +1569,7 @@ unsafe fn preprocess_data_impl(
                 c"Could not get maximum RAW level\n".as_ptr(),
             );
         }
-        return 0;
+        return Ok(0);
     }
     unsafe {
         x3f_printf(
@@ -1546,7 +1586,7 @@ unsafe fn preprocess_data_impl(
     let render_gain = if merrill_black.is_some() {
         match unsafe { merrill_wb_gain(x3f, wb) } {
             Some(gain) => Some(gain),
-            None => return 0,
+            None => return Ok(0),
         }
     } else {
         None
@@ -1555,7 +1595,7 @@ unsafe fn preprocess_data_impl(
     let bias_ok = if let Some(gain) = render_gain {
         let levels = intermediate_levels(gain, [1.0; 3], 0.0);
         if levels == [0; 3] {
-            return 0;
+            return Ok(0);
         }
         for c in 0..3 {
             intermediate_bias = intermediate_bias.max(
@@ -1582,7 +1622,7 @@ unsafe fn preprocess_data_impl(
                 c"Could not get intermediate bias\n".as_ptr(),
             );
         }
-        return 0;
+        return Ok(0);
     }
     unsafe {
         x3f_printf(
@@ -1608,7 +1648,7 @@ unsafe fn preprocess_data_impl(
                 c"Could not get maximum intermediate level\n".as_ptr(),
             );
         }
-        return 0;
+        return Ok(0);
     }
     unsafe {
         x3f_printf(
@@ -1639,7 +1679,7 @@ unsafe fn preprocess_data_impl(
     let img_cols = image.columns as usize;
     let il_black = il.black;
     if image.rows == 0 || img_cols == 0 || img_row_stride == 0 {
-        return 0;
+        return Ok(0);
     }
     let mut reliability = if provenance.is_some() && !quattro {
         let noise = std::array::from_fn(|c| {
@@ -1799,11 +1839,26 @@ unsafe fn preprocess_data_impl(
         unsafe { interpolate_bad_pixels_controlled(x3f, &mut image, 3, control) };
     }
 
+    if let Some(merge) = merge {
+        merge.raw_half_width = image.columns;
+        merge.raw_half_height = image.rows;
+        merge.raw_black = il.black;
+        merge.raw_white = il.white.map(f64::from);
+        merge.sigma = std::array::from_fn(|c| {
+            (black_dev[c].abs() / (max_raw[c] as f64 - black_level[c])) as f32
+        });
+        // Capture the normalized and repaired planes that expansion will read.
+        merge.raw_half =
+            unsafe { snapshot_merge_plane(&image, image.columns, image.rows, 2, control) }?;
+        merge.raw_top =
+            unsafe { snapshot_merge_plane(&qtop, 2 * image.columns, 2 * image.rows, 1, control) }?;
+    }
+
     if let Some(output) = provenance {
         *output = reliability;
     }
 
-    control.check().is_ok() as libc::c_int
+    Ok(control.check().is_ok() as libc::c_int)
 }
 
 // ----------------------------------------------------------------------
@@ -5341,7 +5396,7 @@ pub unsafe extern "C" fn apply_highlight_clip_dng(
         highlight_scale: 1.0,
         shoulder_ceiling: 1.0,
     };
-    unsafe {
+    let _ = unsafe {
         apply_highlight_clip_dng_impl(
             x3f,
             image,
@@ -5354,11 +5409,33 @@ pub unsafe extern "C" fn apply_highlight_clip_dng(
             Control::none(),
             &mut info,
             None,
+            None,
             true,
         )
     };
     DNG_HIGHLIGHT_SCALE.with(|c| c.set(info.highlight_scale));
     DNG_SHOULDER_CEILING.with(|c| c.set(info.shoulder_ceiling));
+}
+
+unsafe fn merge_pixel_gain(ctx: &DngCtx, row: usize, col: usize) -> [f64; 3] {
+    std::array::from_fn(|c| {
+        let gain = unsafe {
+            x3f_calc_spatial_gain(
+                ctx.sgain,
+                ctx.sgain_num,
+                row as i32,
+                col as i32,
+                c as i32,
+                ctx.rows,
+                ctx.cols,
+            )
+        };
+        if gain.is_finite() && gain > 0.0 && (gain as f32).is_finite() && gain as f32 > 0.0 {
+            gain
+        } else {
+            1.0
+        }
+    })
 }
 
 unsafe fn apply_highlight_clip_dng_impl(
@@ -5373,13 +5450,14 @@ unsafe fn apply_highlight_clip_dng_impl(
     control: Control<'_>,
     info: &mut ProcessingInfo,
     linear: Option<&mut SceneLinearData>,
+    mut merge: Option<&mut MergeFrame>,
     apply_sgain: bool,
-) {
+) -> crate::Result<()> {
     if control.check().is_err() {
-        return;
+        return Ok(());
     }
     if image.is_null() || ilevels.is_null() {
-        return;
+        return Ok(());
     }
     let img = unsafe { &mut *image };
     let il = unsafe { &mut *ilevels };
@@ -5389,17 +5467,17 @@ unsafe fn apply_highlight_clip_dng_impl(
         || img.columns == 0
         || (0..3).any(|c| !il.black[c].is_finite() || il.white[c] as f64 <= il.black[c])
     {
-        return;
+        return Ok(());
     }
     let stride = img.row_stride as usize;
     let channels = img.channels as usize;
     let cols = img.columns as usize;
     let rows = img.rows as usize;
     let Some(row_len) = cols.checked_mul(channels) else {
-        return;
+        return Ok(());
     };
     if stride < row_len {
-        return;
+        return Ok(());
     }
     // Cropped views need not own padding after their final visible row.
     let Some(total) = (rows - 1)
@@ -5407,7 +5485,7 @@ unsafe fn apply_highlight_clip_dng_impl(
         .and_then(|length| length.checked_add(row_len))
         .filter(|length| *length <= isize::MAX as usize / std::mem::size_of::<u16>())
     else {
-        return;
+        return Ok(());
     };
     let mut conv_matrix = [0.0_f64; 9];
     let mut lut_dummy = [0.0_f64; LUTSIZE as usize];
@@ -5424,15 +5502,37 @@ unsafe fn apply_highlight_clip_dng_impl(
         )
     } == 0
     {
-        return;
+        return Ok(());
     }
 
+    if let Some(merge) = merge.as_deref_mut() {
+        let length = rows
+            .checked_mul(cols)
+            .and_then(|n| n.checked_mul(3))
+            .ok_or(crate::Error::Allocation)?;
+        merge
+            .bmt
+            .try_reserve_exact(length)
+            .map_err(|_| crate::Error::Allocation)?;
+        merge.bmt.resize(length, 0.0);
+    }
     let mut sgain: [x3f_spatial_gain_corr_t; MAX_CORR] = unsafe { std::mem::zeroed() };
     let sgain_num = if apply_sgain {
         unsafe { x3f_get_spatial_gain(x3f, wb, sgain.as_mut_ptr()) }
     } else {
         0
     };
+    if let Some(merge) = merge.as_deref_mut() {
+        if sgain_num > 0 {
+            let mut gain = Vec::new();
+            if gain.try_reserve_exact(merge.bmt.len()).is_err() {
+                unsafe { x3f_cleanup_spatial_gain(sgain.as_mut_ptr(), sgain_num) };
+                return Err(crate::Error::Allocation);
+            }
+            gain.resize(merge.bmt.len(), 0.0);
+            merge.gain = Some(gain);
+        }
+    }
     let mut hp: highlight_params_t = unsafe { std::mem::zeroed() };
     let mut prior = [0.0; 3];
     unsafe {
@@ -5441,8 +5541,9 @@ unsafe fn apply_highlight_clip_dng_impl(
     }
     // Editor preparation is controlled by its own options, not process-wide
     // research overrides. Keep the legacy environment contract unchanged.
-    let no_chroma = linear.is_none() && env_present("X3F_NO_CHROMA_LUT");
-    let cap = if linear.is_none() {
+    let legacy = linear.is_none() && merge.is_none();
+    let no_chroma = legacy && env_present("X3F_NO_CHROMA_LUT");
+    let cap = if legacy {
         env_atof("X3F_CHROMA_LUT_CAP").filter(|v| v.is_finite() && *v > 0.0)
     } else {
         None
@@ -5471,7 +5572,7 @@ unsafe fn apply_highlight_clip_dng_impl(
     let mut clut: chroma_lut_t = unsafe { std::mem::zeroed() };
     let mut use_clut = recovery && !no_chroma;
     if use_clut {
-        crate::highlight::chroma_lut_defaults(&mut clut, linear.is_none());
+        crate::highlight::chroma_lut_defaults(&mut clut, legacy);
         let source_mask = local.as_ref().filter(|model| model.has_camera_maps());
         use_clut = unsafe {
             crate::highlight::chroma_lut_build_from_image_masked(
@@ -5481,15 +5582,15 @@ unsafe fn apply_highlight_clip_dng_impl(
                 prior.as_ptr(),
                 source_mask,
                 control,
-                linear.is_none(),
+                legacy,
             )
         } != 0;
     }
     let mut stats: chroma_lut_apply_stats_t = unsafe { std::mem::zeroed() };
-    let trace = linear.is_none() && env_present("X3F_CHROMA_LUT_TRACE");
+    let trace = legacy && env_present("X3F_CHROMA_LUT_TRACE");
     let mut repair: repair_pix_t = unsafe { std::mem::zeroed() };
     let mut sat_map = ptr::null_mut();
-    let mut use_repair = linear.is_none() && recovery && env_present("X3F_REPAIR_PIX");
+    let mut use_repair = legacy && recovery && env_present("X3F_REPAIR_PIX");
     if use_repair {
         unsafe { repair_pix_init_defaults(&mut repair) };
         sat_map = unsafe {
@@ -5498,14 +5599,12 @@ unsafe fn apply_highlight_clip_dng_impl(
         use_repair = !sat_map.is_null();
         repair.valid = use_repair as i32;
     }
-    let gate_thr = linear
-        .is_none()
+    let gate_thr = legacy
         .then(|| env_atof("X3F_GATE_THR"))
         .flatten()
         .filter(|v| v.is_finite())
         .unwrap_or(0.20);
-    let gate_width = linear
-        .is_none()
+    let gate_width = legacy
         .then(|| env_atof("X3F_GATE_WIDTH"))
         .flatten()
         .filter(|v| v.is_finite())
@@ -5618,6 +5717,42 @@ unsafe fn apply_highlight_clip_dng_impl(
             linear.height = rows as u32;
             linear.camera_to_rgb = conv_matrix;
         }
+    } else if let Some(merge) = merge {
+        merge
+            .bmt
+            .par_chunks_mut(cols * 3)
+            .enumerate()
+            .for_each(|(row, out)| {
+                if control.check().is_err() {
+                    return;
+                }
+                for (col, pixel) in out.chunks_exact_mut(3).enumerate() {
+                    let off = row * stride + col * channels;
+                    let gain = unsafe { merge_pixel_gain(&ctx, row, col) };
+                    for c in 0..3 {
+                        pixel[c] = (((data[off + c] as f64 - ctx.black[c])
+                            / (ctx.white[c] as f64 - ctx.black[c]))
+                            * gain[c]) as f32;
+                    }
+                }
+            });
+        if let Some(gain) = merge.gain.as_mut() {
+            gain.par_chunks_mut(cols * 3)
+                .enumerate()
+                .for_each(|(row, out)| {
+                    if control.check().is_err() {
+                        return;
+                    }
+                    for (col, pixel) in out.chunks_exact_mut(3).enumerate() {
+                        pixel.copy_from_slice(
+                            &unsafe { merge_pixel_gain(&ctx, row, col) }.map(|v| v as f32),
+                        );
+                    }
+                });
+        }
+        merge.width = cols as u32;
+        merge.height = rows as u32;
+        merge.camera_to_rgb = conv_matrix;
     } else if recovery {
         let evaluate_row = |row: usize, data: &[u16], stats: *mut chroma_lut_apply_stats_t| {
             let mut maximum = 1.0_f64;
@@ -5714,6 +5849,7 @@ unsafe fn apply_highlight_clip_dng_impl(
     } else {
         1.0
     };
+    Ok(())
 }
 
 fn crop_reliability(
@@ -5914,6 +6050,7 @@ pub unsafe fn get_scene_linear_controlled(
             control,
             &mut info,
             Some(&mut output),
+            None,
         )
     };
     // As in get_image_controlled, the area owns the processed allocation;
@@ -5926,6 +6063,80 @@ pub unsafe fn get_scene_linear_controlled(
     if output.data.is_empty() || output.data.iter().any(|v| !v.is_finite()) {
         return Err(crate::Error::InvalidData(
             "could not prepare finite scene-linear image",
+        ));
+    }
+    Ok(output)
+}
+
+/// Prepare one Quattro exposure without crop, denoise, or highlight recovery.
+/// # Safety
+/// `x3f` must uniquely own loaded CAMF, property and freshly decoded RAW sections.
+pub unsafe fn get_merge_frame_controlled(
+    x3f: *mut x3f_t,
+    fix_bad: bool,
+    apply_sgain: bool,
+    control: Control<'_>,
+) -> crate::Result<MergeFrame> {
+    control.check()?;
+    if x3f.is_null() {
+        return Err(crate::Error::InvalidData("missing processing image"));
+    }
+    let mut qtop: x3f_area16_t = unsafe { std::mem::zeroed() };
+    if unsafe { x3f_image_area_qtop(x3f, &mut qtop) } == 0 {
+        return Err(crate::Error::InvalidData(
+            "merge export requires a Quattro sensor",
+        ));
+    }
+    let mut shutter = 0.0;
+    if unsafe { x3f_get_camf_float(x3f, c"CaptureShutter".as_ptr() as *mut _, &mut shutter) } == 0
+        || !shutter.is_finite()
+        || shutter < 1.0
+        || shutter > u32::MAX as f64
+    {
+        return Err(crate::Error::InvalidData("invalid merge exposure time"));
+    }
+    let mut output = MergeFrame {
+        shutter_us: shutter.round() as u32,
+        ..MergeFrame::default()
+    };
+    let mut area: x3f_area16_t = unsafe { std::mem::zeroed() };
+    let mut levels: x3f_image_levels_t = unsafe { std::mem::zeroed() };
+    let mut info = ProcessingInfo {
+        highlight_scale: 1.0,
+        shoulder_ceiling: 1.0,
+    };
+    let result = unsafe {
+        get_image_impl(
+            x3f,
+            &mut area,
+            &mut levels,
+            x3f_color_encoding_e_NONE,
+            0,
+            fix_bad as i32,
+            0,
+            apply_sgain as i32,
+            ptr::null_mut(),
+            ProcessingOptions::default(),
+            control,
+            &mut info,
+            None,
+            Some(&mut output),
+        )
+    };
+    unsafe { libc::free(area.buf) };
+    control.check()?;
+    result?;
+    if output.bmt.is_empty()
+        || output.bmt.iter().any(|v| !v.is_finite())
+        || output.camera_to_rgb.iter().any(|v| !v.is_finite())
+        || (0..3).any(|c| {
+            !output.sigma[c].is_finite()
+                || output.sigma[c] < 0.0
+                || output.raw_black[c] >= output.raw_white[c]
+        })
+    {
+        return Err(crate::Error::InvalidData(
+            "could not prepare finite merge frame",
         ));
     }
     Ok(output)
@@ -5971,6 +6182,7 @@ pub unsafe fn get_image_controlled(
             control,
             &mut info,
             None,
+            None,
         )
     };
     let result = control.check().and(result);
@@ -5999,6 +6211,7 @@ unsafe fn get_image_impl(
     control: Control<'_>,
     info: &mut ProcessingInfo,
     linear: Option<&mut SceneLinearData>,
+    mut merge: Option<&mut MergeFrame>,
 ) -> crate::Result<()> {
     let dng_recovery = options.dng_highlight_recovery;
     if options.spp_denoise {
@@ -6185,9 +6398,10 @@ unsafe fn get_image_impl(
             &mut il,
             if capture { Some(&mut provenance) } else { None },
             merrill.as_ref().map(|render| render.black),
+            merge.as_deref_mut(),
             control,
         )
-    } == 0
+    }? == 0
     {
         control.check()?;
         return Err(crate::Error::InvalidData("could not preprocess image"));
@@ -6227,7 +6441,7 @@ unsafe fn get_image_impl(
     // the DNG highlight pass.
     let applied_dng = encoding == x3f_color_encoding_e_NONE
         && !cineon
-        && (!is_quattro || dng_recovery || linear.is_some());
+        && (!is_quattro || dng_recovery || linear.is_some() || merge.is_some());
     if applied_dng {
         let current = unsafe { &*image };
         let already_cropped = current.data != original_image.data
@@ -6235,7 +6449,7 @@ unsafe fn get_image_impl(
             || current.columns != original_image.columns;
         let provenance =
             provenance.and_then(|mask| crop_reliability(mask, &original_image, unsafe { &*image }));
-        let spatial_gain = linear.is_none() || apply_sgain != 0;
+        let spatial_gain = (linear.is_none() && merge.is_none()) || apply_sgain != 0;
         unsafe {
             apply_highlight_clip_dng_impl(
                 x3f,
@@ -6249,9 +6463,10 @@ unsafe fn get_image_impl(
                 control,
                 info,
                 linear,
+                merge,
                 spatial_gain,
             )
-        };
+        }?;
     }
 
     if encoding != x3f_color_encoding_e_NONE {
@@ -6616,6 +6831,166 @@ static _A_X3F_GET_PREVIEW: unsafe extern "C" fn(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn merge_gain_records_channel_and_pixel_coordinates() {
+        use super::*;
+        let mut values = [1.0, 2.0, 3.0, 3.0, 4.0, 5.0, 5.0, 6.0, 7.0, 7.0, 8.0, 9.0];
+        let mut correction = x3f_spatial_gain_corr_t {
+            gain: values.as_mut_ptr(),
+            rows: 2,
+            cols: 2,
+            channels: 3,
+            rowpitch: 1,
+            colpitch: 1,
+            ..unsafe { std::mem::zeroed() }
+        };
+        let mut ctx: DngCtx = unsafe { std::mem::zeroed() };
+        ctx.rows = 2;
+        ctx.cols = 2;
+        assert_eq!(unsafe { merge_pixel_gain(&ctx, 0, 0) }, [1.0; 3]);
+        ctx.sgain = &mut correction;
+        ctx.sgain_num = 1;
+        assert_eq!(unsafe { merge_pixel_gain(&ctx, 0, 0) }, [1.0, 2.0, 3.0]);
+        assert_eq!(unsafe { merge_pixel_gain(&ctx, 1, 1) }, [4.0, 5.0, 6.0]);
+        values[..3].copy_from_slice(&[f64::NAN, -1.0, 0.0]);
+        assert_eq!(unsafe { merge_pixel_gain(&ctx, 0, 0) }, [1.0; 3]);
+        values[..3].copy_from_slice(&[f64::INFINITY, f64::MAX, f64::MIN_POSITIVE]);
+        assert_eq!(unsafe { merge_pixel_gain(&ctx, 0, 0) }, [1.0; 3]);
+    }
+
+    // This comparison decodes four full-resolution rasters. Run it in release mode.
+    #[test]
+    #[ignore = "run with --release --include-ignored for the full-raster comparison"]
+    fn merge_camera_matrix_matches_uncropped_linear_export() {
+        use super::*;
+        let corpus = std::env::var_os("X3F_TEST_FILES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../x3f_test_files")
+            });
+        let path = corpus.join("_SDI8284.X3F");
+        if !path.is_file() {
+            eprintln!("skip: _SDI8284.X3F is required for merge export coverage");
+            return;
+        }
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let prepare = |apply_sgain, linear: bool| unsafe {
+            let file = libc::fopen(path.as_ptr(), c"rb".as_ptr());
+            assert!(!file.is_null());
+            let x3f = x3f_new_from_file(file.cast());
+            assert!(!x3f.is_null());
+            for entry in [x3f_get_prop(x3f), x3f_get_camf(x3f), x3f_get_raw(x3f)] {
+                if !entry.is_null() {
+                    crate::load_data(x3f, entry, Control::none()).unwrap();
+                }
+            }
+            let mut output = SceneLinearData::default();
+            let mut merge = MergeFrame::default();
+            if linear {
+                let mut area = std::mem::zeroed();
+                let mut levels = std::mem::zeroed();
+                let mut info = ProcessingInfo {
+                    highlight_scale: 1.0,
+                    shoulder_ceiling: 1.0,
+                };
+                let result = get_image_impl(
+                    x3f,
+                    &mut area,
+                    &mut levels,
+                    x3f_color_encoding_e_NONE,
+                    0,
+                    1,
+                    0,
+                    apply_sgain as i32,
+                    ptr::null_mut(),
+                    ProcessingOptions::default(),
+                    Control::none(),
+                    &mut info,
+                    Some(&mut output),
+                    None,
+                );
+                libc::free(area.buf);
+                result.unwrap();
+            } else {
+                merge =
+                    get_merge_frame_controlled(x3f, true, apply_sgain, Control::none()).unwrap();
+            }
+            x3f_delete(x3f);
+            libc::fclose(file);
+            (output, merge)
+        };
+        for apply_sgain in [false, true] {
+            let (_, merge) = prepare(apply_sgain, false);
+            let (linear, _) = prepare(apply_sgain, true);
+            assert_eq!((merge.width, merge.height), (linear.width, linear.height));
+            assert_eq!(merge.camera_to_rgb, linear.camera_to_rgb);
+            assert_eq!(merge.bmt.len(), linear.data.len());
+            let mut max_relative = 0.0_f64;
+            let mut max_absolute = 0.0_f64;
+            for (pixel, expected) in merge.bmt.chunks_exact(3).zip(linear.data.chunks_exact(3)) {
+                let rgb = mat3x1_mul_native(
+                    &merge.camera_to_rgb,
+                    [pixel[0] as f64, pixel[1] as f64, pixel[2] as f64],
+                );
+                for c in 0..3 {
+                    // The f32 camera export adds rounding before matrix cancellation.
+                    let scale = (0..3)
+                        .map(|k| (merge.camera_to_rgb[3 * c + k] * pixel[k] as f64).abs())
+                        .sum::<f64>()
+                        .max(1e-6);
+                    let error = (rgb[c] - expected[c] as f64).abs();
+                    max_absolute = max_absolute.max(error);
+                    max_relative = max_relative.max(error / (expected[c] as f64).abs().max(1e-30));
+                    assert!(
+                        error
+                            <= 1e-4 * (expected[c] as f64).abs()
+                                + 4.0 * f32::EPSILON as f64 * scale
+                    );
+                }
+            }
+            eprintln!("merge matrix gain={apply_sgain}: max absolute={max_absolute:e}, max relative={max_relative:e}");
+            if apply_sgain {
+                let gain = merge
+                    .gain
+                    .as_ref()
+                    .expect("fixture has spatial gain tables");
+                assert_eq!(gain.len(), merge.bmt.len());
+                assert!(gain.iter().all(|v| v.is_finite() && *v > 0.0));
+                assert!(gain.iter().any(|v| *v != 1.0));
+            } else {
+                assert!(merge.gain.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn merge_raw_snapshot_crops_padding_and_unused_channels() {
+        use super::*;
+        let mut data = vec![1, 2, 99, 3, 4, 99, 88, 88, 5, 6, 99, 7, 8, 99];
+        let area = x3f_area16_t {
+            data: data.as_mut_ptr(),
+            columns: 2,
+            rows: 2,
+            channels: 3,
+            row_stride: 8,
+            ..unsafe { std::mem::zeroed() }
+        };
+        let half = unsafe { snapshot_merge_plane(&area, 2, 2, 2, Control::none()) }.unwrap();
+        assert_eq!(half, [1, 2, 3, 4, 5, 6, 7, 8]);
+        let top = unsafe { snapshot_merge_plane(&area, 1, 2, 1, Control::none()) }.unwrap();
+        assert_eq!(top, [1, 5]);
+        assert!(matches!(
+            unsafe { snapshot_merge_plane(&area, 3, 2, 1, Control::none()) },
+            Err(crate::Error::InvalidData(_))
+        ));
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        assert!(matches!(
+            unsafe { snapshot_merge_plane(&area, 2, 2, 2, Control::new(&cancel)) },
+            Err(crate::Error::Cancelled)
+        ));
+        assert_eq!(data, [1, 2, 99, 3, 4, 99, 88, 88, 5, 6, 99, 7, 8, 99]);
+    }
+
     use super::{intermediate_levels, shoulder_compress, INTERMEDIATE_UNIT};
 
     #[test]
