@@ -7,6 +7,11 @@
 //! The merge applies no signal-dependent dark weight. Unsigned DNG encoding
 //! clamps negative merged samples to zero.
 //!
+//! The expansion builds its half-resolution top sum from unrepaired samples.
+//! A defective top pixel can contaminate chroma in its 8x8 expanded block.
+//! Repaired raw_top does not expose this defect to the merge. This existing
+//! single-frame pipeline limit remains in phase 1.
+//!
 //! Buffer budget for N expanded pixels. Producer scratch is additional:
 //! - Persistent: 3 weighted-sum, 2 weight, 3 fallback and 2 SNR f32 planes,
 //!   or 40N bytes. SNR stays f32 to preserve fallback candidate ordering.
