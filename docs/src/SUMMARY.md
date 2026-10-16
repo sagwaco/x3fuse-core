@@ -5,6 +5,7 @@
 # Architecture
 
 - [Conversion pipeline](./pipeline.md)
+- [Merrill rendering alignment](./spp-alignment.md)
 - [Workspace layout](./workspace.md)
 - [X3F format reference](./format.md)
 

@@ -140,9 +140,12 @@ impl Reader {
                 sgain,
                 cwb_ptr(&cwb),
                 sys::ProcessingOptions {
+                    spp_denoise: opts.spp_denoise,
                     dng_highlight_recovery: opts.dng_highlight_recovery,
                     dng_shoulder: opts.dng_highlight_mapping.to_raw() == 1,
                     cineon: opts.cineon,
+                    rgb_chroma_lut: opts.rgb_chroma_lut,
+                    color_mode: opts.color_mode,
                 },
                 control,
             )
@@ -179,6 +182,8 @@ impl Reader {
     /// Render an 8-bit downsampled preview of `image`. `max_width` caps the
     /// output dimensions (the legacy DNG writer uses 300). `image` must have
     /// been produced by [`Self::get_image`] so its `levels` are populated.
+    /// This legacy camera-space preview does not apply `color_mode`.
+    /// DNG export creates its selected-mode preview separately.
     pub fn get_preview(
         &self,
         image: &Image,

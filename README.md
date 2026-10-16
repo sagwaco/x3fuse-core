@@ -54,7 +54,9 @@ Enable the optional `serde` feature to persist these settings.
 
 Version **0.2.0** adds `denoise_backend` and
 `denoise_options` to `ProcessOptions` and `SceneLinearOptions`, and GPU errors to the Rust error
-enums. Downstream exhaustive struct literals and error matches must be updated;
+enums. This branch also adds `spp_denoise` and `color_mode` to `ProcessOptions`.
+`SceneLinearImage` adds optional `color_mode_calibration` for rendering camera profiles.
+Downstream exhaustive struct literals and error matches must be updated;
 use `..Default::default()` when constructing options. These source changes
 must not be published as a 0.1.x patch. The C ABI remains unchanged.
 
@@ -90,14 +92,17 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 | `-o <DIR>`                | write output to `<DIR>`                                                            |
 | `-v` / `-q`               | verbose / quiet (errors only)                                                      |
 | `-color <SPACE>`          | RGB color space: `none`, `sRGB`, `AdobeRGB`, `ProPhotoRGB` (does not affect DNG)   |
+| `-color-mode <MODE>` | experimental Merrill/dp Quattro camera look for color TIFF or DNG; see the compatibility limit below |
 | `-compress`               | lossless compression (DNG: lossless JPEG, TIFF: Deflate/ZIP)                       |
 | `-denoise <0-10>`         | Denoise intensity: `0` = off, `10` = full strength (**default**); intermediate values scale filter strength |
 | `-no-denoise`             | disable denoising (alias for `-denoise 0`)                               |
 | `-denoiser <nlm\|bm3d>` | algorithm (default: NLM); see [advanced controls](docs/src/performance.md#algorithm-and-advanced-controls) |
 | `-denoise-backend <auto\|cpu\|gpu>` | execution backend; `auto` falls back to CPU, `gpu` fails if acceleration is unavailable |
+| `-spp-pipeline` | Merrill SPP recovery and denoise on CPU with neutral noise sliders; full-resolution color TIFF, PPM or histogram |
 | `-no-crop`                | do not crop to the active image area                                               |
 | `-no-sgain` / `-sgain`    | disable / force spatial-gain (lens color) compensation                             |
 | `-no-fix-bad`             | do not fix bad pixels                                                              |
+| `-chroma-lut` / `-no-chroma-lut` | enable / disable scene-derived RGB highlight LUT; override `X3F_NO_CHROMA_LUT` |
 | `-wb <PRESET>`            | select a white-balance preset                                                      |
 | `-unprocessed`            | dump RAW with no preprocessing                                                     |
 | `-qtop`                   | dump the Quattro top layer, unprocessed                                            |
@@ -118,6 +123,9 @@ x3f_extract -dng input.X3F
 # 16-bit sRGB TIFF
 x3f_extract -tiff -color sRGB input.X3F
 
+# Explicitly retain scene-derived chroma-LUT highlight recovery for RGB
+x3f_extract -tiff -chroma-lut input.X3F
+
 # Deflate-compressed TIFF into an output directory
 x3f_extract -tiff -compress -o out/ input.X3F
 
@@ -127,16 +135,70 @@ x3f_extract -dng -denoise 5 input.X3F
 # Require GPU denoising (use -v to report the adapter and stage timings)
 x3f_extract -v -dng -denoise-backend gpu input.X3F
 
+# Merrill SPP processing with neutral noise sliders
+x3f_extract -tiff -color ProPhotoRGB -spp-pipeline input.X3F
+
 # Metadata dump
 x3f_extract -meta input.X3F
 ```
 
+## RGB highlight recovery
+
+For rendered RGB, `-chroma-lut` and `-no-chroma-lut` explicitly enable or disable
+the scene-derived LUT, overriding `X3F_NO_CHROMA_LUT`. The default remains on
+unless that environment variable is present. Disabling the LUT retains the
+prior recovery and matrix gate; it does not select native Sigma recovery. These
+RGB options do not affect DNG or Cineon output. The LUT uses the original
+x3fuse pipeline and does not select SPP. `-chroma-lut` cannot combine with
+`-spp-pipeline`; select one pipeline. `-no-chroma-lut` is accepted with SPP
+and does not disable SPP's camera-based highlight recovery.
+
+`-spp-pipeline` selects the complete Merrill float path, including camera-based
+highlight repair, tiled denoise and sharpening. It requires an HI Merrill file,
+color output and denoise intensity 10. DNG, Cineon, monochrome, MED/LOW and a
+forced GPU backend return an error. Rust callers set `ProcessOptions::spp_denoise`.
+SPP requires the default `DenoiseOptions`; BM3D and custom NLM controls return
+an error because SPP uses a separate filter pipeline.
+The default is false. See the [SPP alignment notes](docs/src/spp-alignment.md)
+for supported settings and native verification.
+
+## Camera Color Modes (development)
+
+Set `-color-mode Vivid`, another named mode, or `-color-mode as-shot` to use
+the new camera-mode path. TIFF applies the look to its pixels. Merrill has
+Standard, Vivid, Neutral, Portrait, Landscape and FOV Classic Blue. dp Quattro
+adds Sunset Red, Forest Green, FOV Classic Yellow, Cinema and Teal and Orange.
+sd Quattro and sd Quattro H need a further calibration port and return an error.
+
+DNG profile names match these camera labels without a prefix. Quote names
+with spaces in the CLI, for example `-color-mode "FOV Classic Blue"`.
+Existing short names such as `FCBlue` and `TealAndOrange` remain accepted.
+
+Rust callers set `ProcessOptions::color_mode` and can query
+`Reader::available_color_modes()`. This new public field requires updates to
+exhaustive Rust struct literals; `..Default::default()` retains the existing
+output. The C ABI is unchanged. The option is separate from output color
+encoding and is accepted for TIFF and DNG exports only.
+
+The DNG implementation is not ready for release. It preserves raw samples and
+embeds named profiles. Lightroom 9.5.1 Local ignored the initial RGBTables
+looks. The replacement classic-profile controls pass for cast, exposure, look
+tables and long tone curves, with JPEG export checks for cast, exposure and hue.
+The full Merrill and dp Quattro mode files now pass the combined Lightroom
+check: defaults, visible switching, JPEG export, reopen and editable controls.
+Source review and workspace checks pass. Full SPP image parity is unverified.
+DNG looks approximate native rendering at the export white balance. Later
+WB edits keep the profile fixed and can differ from SPP. Highlights outside
+the DNG profile gamut can also differ.
+See the [implementation status and remaining gates](docs/COLOR-MODES-PLAN.md).
+Omitting `-color-mode` retains the existing TIFF and DNG behavior.
+
 ## DNG output
 
-Foveon sensors have no demosaicing step, so DNGs are written as **Linear DNGs** (`PhotometricInterpretation = LinearRaw`). To render consistently across RAW engines (Adobe Camera Raw / Lightroom, LibRaw / RawTherapee, Capture One, and Apple's RAW engine) the writer bakes per-channel saturation into the raster and tags a uniform `BlackLevel = 0` / `WhiteLevel = 65535`, and never relies on optional hints like `BaselineExposure`.
+Foveon sensors have no demosaicing step, so DNGs are written as **Linear DNGs** (`PhotometricInterpretation = LinearRaw`). The writer bakes per-channel saturation into the raster and tags a uniform `BlackLevel = 0` / `WhiteLevel = 65535`. `BaselineExposure` carries ISO brightening and any linear highlight-headroom compensation; readers that ignore it can show a darker image.
 
 - **`-compress`**: lossless compression. TIFF uses Deflate/ZIP; DNG uses **lossless JPEG** (`Compression = 7`), the only 16-bit integer raw compression the spec allows and the one every engine decodes. Compressed output is bit-identical to uncompressed.
-- **`-dng-highlight-recovery`**: reconstructs clipped channels from a scene-derived chroma LUT and folds recovered highlights back under `WhiteLevel` via a soft shoulder baked into the raster (published as `LinearResponseLimit`).
+- **`-dng-highlight-recovery`**: reconstructs clipped channels and preserves recovered headroom linearly by default. Add `-dng-highlight-mapping shoulder` to bake the legacy soft shoulder into the raster.
 
 See the [conversion pipeline](docs/src/pipeline.md) chapter for the full DNG writer design.
 

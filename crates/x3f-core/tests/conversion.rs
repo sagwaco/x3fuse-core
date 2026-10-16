@@ -190,6 +190,19 @@ fn concurrent_conversions_match_serial_for_per_file_options() {
         };
         jobs.push((file, OutputFormat::Dng, normal.clone()));
         jobs.push((file, OutputFormat::Tiff, normal.clone()));
+        let mut reader = x3f_core::Reader::open(file).unwrap();
+        if let Ok(modes) = reader.available_color_modes() {
+            for mode in modes.into_iter().take(2) {
+                jobs.push((
+                    file,
+                    OutputFormat::Tiff,
+                    ProcessOptions {
+                        color_mode: Some(mode),
+                        ..normal.clone()
+                    },
+                ));
+            }
+        }
         jobs.push((
             file,
             OutputFormat::Dng,
@@ -214,6 +227,35 @@ fn concurrent_conversions_match_serial_for_per_file_options() {
             },
         ));
     }
+    // This fixture actually changes with the LUT; the first two Quattros do not.
+    let clipped = files[0].with_file_name("CLIPPED_IMAGE_MERRILL.X3F");
+    let lut_start = jobs.len();
+    if clipped.is_file() {
+        for enabled in [true, false] {
+            jobs.push((
+                &clipped,
+                OutputFormat::Tiff,
+                ProcessOptions {
+                    denoise_intensity: 0,
+                    rgb_chroma_lut: Some(enabled),
+                    ..ProcessOptions::default()
+                },
+            ));
+        }
+        for mode in [x3f_core::ColorMode::Standard, x3f_core::ColorMode::Vivid] {
+            jobs.push((
+                &clipped,
+                OutputFormat::Tiff,
+                ProcessOptions {
+                    denoise_intensity: 0,
+                    color_mode: Some(mode),
+                    ..ProcessOptions::default()
+                },
+            ));
+        }
+    } else {
+        eprintln!("skip: CLIPPED_IMAGE_MERRILL.X3F missing for concurrent LUT overrides");
+    }
     let cancel = AtomicBool::new(false);
     for (index, (file, format, options)) in jobs.iter().enumerate() {
         convert_file(
@@ -225,6 +267,13 @@ fn concurrent_conversions_match_serial_for_per_file_options() {
             |_| {},
         )
         .unwrap();
+    }
+    if clipped.is_file() {
+        assert!(
+            std::fs::read(output.join(format!("serial-{lut_start}"))).unwrap()
+                != std::fs::read(output.join(format!("serial-{}", lut_start + 1))).unwrap(),
+            "concurrent LUT fixture must exercise different pixels"
+        );
     }
     // The inner row-parallel processing must safely share these same workers
     // with another Reader using different highlight and Cineon options.
@@ -313,5 +362,139 @@ fn cancellation_interrupts_camera_processing_and_encoding() {
                 assert!(canceller.join().unwrap().elapsed() < Duration::from_secs(5));
             });
         }
+    }
+}
+
+#[test]
+fn spp_errors_and_cancellation_do_not_publish_output() {
+    use std::time::{Duration, Instant};
+    use x3f_core::{ColorEncoding, DenoiseBackend};
+
+    let directory = std::env::var_os("X3F_TEST_FILES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../x3f_test_files"));
+    let options = ProcessOptions {
+        spp_denoise: true,
+        denoise_backend: DenoiseBackend::Cpu,
+        ..ProcessOptions::default()
+    };
+    let output = std::env::temp_dir().join(format!("x3f-spp-errors-{}.tif", std::process::id()));
+    let cancel = AtomicBool::new(false);
+    let mut checked = 0;
+    for name in ["_P2M0358.X3F", "sigma_sd1_merrill_15.x3f", "_SDI8284.X3F"] {
+        let file = directory.join(name);
+        if !file.is_file() {
+            continue;
+        }
+        checked += 1;
+        if name == "_SDI8284.X3F" {
+            let error = convert_file(
+                &file,
+                &output,
+                OutputFormat::Tiff,
+                &options,
+                &cancel,
+                |_| {},
+            )
+            .unwrap_err();
+            assert!(matches!(error, Error::InvalidData(_)), "{error:?}");
+            assert!(!output.exists());
+            continue;
+        }
+        for format in [OutputFormat::Dng, OutputFormat::Jpeg] {
+            let error =
+                convert_file(&file, &output, format, &options, &cancel, |_| {}).unwrap_err();
+            assert!(matches!(error, Error::InvalidData(_)), "{error:?}");
+            assert!(!output.exists());
+        }
+        let reader = loaded_reader(&file);
+        for invalid in [
+            ProcessOptions {
+                denoise_options: x3f_core::DenoiseOptions {
+                    algorithm: x3f_core::DenoiseAlgorithm::Bm3d,
+                    ..Default::default()
+                },
+                ..options.clone()
+            },
+            ProcessOptions {
+                denoise_options: x3f_core::DenoiseOptions {
+                    luminance: true,
+                    ..Default::default()
+                },
+                ..options.clone()
+            },
+            ProcessOptions {
+                rgb_chroma_lut: Some(true),
+                ..options.clone()
+            },
+            ProcessOptions {
+                denoise_intensity: 0,
+                ..options.clone()
+            },
+            ProcessOptions {
+                cineon: true,
+                ..options.clone()
+            },
+            ProcessOptions {
+                color_encoding: ColorEncoding::None,
+                ..options.clone()
+            },
+            ProcessOptions {
+                denoise_backend: DenoiseBackend::Gpu,
+                ..options.clone()
+            },
+        ] {
+            match reader.get_image(&invalid) {
+                Ok(_) => panic!("invalid SPP options succeeded"),
+                Err(error) => assert!(
+                    matches!(error, Error::InvalidData(_) | Error::Gpu(_)),
+                    "{error:?}"
+                ),
+            }
+            for existing in [false, true] {
+                if existing {
+                    std::fs::write(&output, b"existing histogram").unwrap();
+                }
+                assert!(reader.dump_histogram(&output, &invalid, false).is_err());
+                if existing {
+                    assert_eq!(std::fs::read(&output).unwrap(), b"existing histogram");
+                    std::fs::remove_file(&output).unwrap();
+                } else {
+                    assert!(!output.exists());
+                }
+            }
+        }
+        drop(reader);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        cancel.store(false, Ordering::Relaxed);
+        std::thread::scope(|scope| {
+            let cancel_ref = &cancel;
+            let canceller = scope.spawn(move || {
+                receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+                std::thread::sleep(Duration::from_millis(25));
+                cancel_ref.store(true, Ordering::Relaxed);
+                Instant::now()
+            });
+            let result = convert_file(
+                &file,
+                &output,
+                OutputFormat::Tiff,
+                &options,
+                &cancel,
+                |stage| {
+                    if stage == ConversionStage::Process {
+                        sender.send(()).unwrap();
+                    }
+                },
+            );
+            drop(sender);
+            assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+            assert!(!output.exists());
+            assert!(canceller.join().unwrap().elapsed() < Duration::from_secs(5));
+        });
+        cancel.store(false, Ordering::Relaxed);
+    }
+    if checked == 0 {
+        eprintln!("skip: set X3F_TEST_FILES for SPP API errors and cancellation");
     }
 }

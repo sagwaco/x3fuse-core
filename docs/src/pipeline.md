@@ -53,51 +53,80 @@ resolves a directory entry and dispatches by section type:
 
 [`crates/x3f-sys/src/process.rs`](../../crates/x3f-sys/src/process.rs)
 + [`crates/x3f-sys/src/highlight.rs`](../../crates/x3f-sys/src/highlight.rs).
-The `convert_data` function is the hot loop. In order:
+The ordinary rendered-image path runs in this order. The
+[Merrill alignment notes](./spp-alignment.md) distinguish the recovered Sigma
+stages from the remaining legacy algorithms.
 
-1. **black-level subtraction** — driven by `DarkShieldTop` /
-   `DarkShieldBottom` and the left/right `DarkShieldColRange` columns;
-   per-camera firmware-bug workarounds (DP2 → skip Bottom; sd Quattro
-   H → skip Bottom; Merrill family → skip Right) are preserved
-   verbatim.
-2. **white-level normalisation** + per-pixel `out = scale*(raw -
-   black) + bias` clamp. Intermediate encoding ranges are proportional
-   to `WhiteBalanceGains * DigitalISOGain`, normalized so the largest
-   range fits the intermediate buffer. This makes equal intermediate
-   channel values neutral, as required by Quattro's Yis4T detail
-   reconstruction and denoising. Each channel's range is also used in
-   the inverse normalization, so this does not apply digital gain to
-   normalized raw values or discard highlight headroom. Actual digital
-   brightening happens at stage 7, or through DNG color metadata and
-   `BaselineExposure`.
-3. **spatial gain (lens shading) correction** —
-   [`crates/x3f-sys/src/spatial_gain.rs`](../../crates/x3f-sys/src/spatial_gain.rs).
-   Reads `IncludeBlocks` and the four nearest neighbours in
-   (1/aperture, lens-position) space, builds bilinear weights, and
-   assembles per-channel `mgain[]` tables.
-4. **bad-pixel interpolation** — iterative neighbour-averaging from
-   `BadPixels` / `BadPixelsF20` / `Jpeg_BadClusters` /
-   `HighlightPixelsInfo` / `BadPixelsLumaF23` /
-   `BadPixelsChromaF23` / the hardcoded sd Quattro AF pixel grid.
-5. **WB-conditional radial color shading** (Merrill only) —
-   `pix[B] *= 1 + a·rr⁴ + b·rr²` and `pix[T] *= 1 + c·rr⁴ + d·rr²`
-   from `WhiteBalanceColorShadingFactor`.
-6. **white balance** — multiplies from `WhiteBalanceGains` /
-   `DP1_WhiteBalanceGains`.
-7. **color-matrix transform** — sensor RGB → sRGB / AdobeRGB /
-   ProPhoto / linear via the M6a matrix kernel. `get_conv` scales the
-   matrix by `CaptureISO/SensorISO` and folds the per-channel CAMF
-   `DigitalISOGain` in as a column scale (`conv_matrix · diag(g)`,
-   Merrill bodies skip-listed in `x3f_get_digital_iso_gain`), so the
-   digital part of ISO brightening happens after highlight recovery
-   has seen honest sensor data.
-8. **highlight recovery** — the chroma LUT, RepairPix, and
-   matrix-pathology gate ported in M6e4. Active research area: see
-   the project memory entries on Foveon highlight handling.
-9. **gamma LUT application** — sRGB / AdobeRGB-2.2 / ProPhoto-1.8 (D65
-   → D50 Bradford for ProPhoto).
+1. **Black level** — ordinary Merrill RGB uses a 1% trimmed mean of
+   `DarkShieldTop`. Other paths retain the combined shield means and camera
+   firmware workarounds. Stored CAMF rectangle endpoints are inclusive.
+2. **Intermediate encoding** — write `round(scale*(raw-black)+bias)` to the
+   uint16 buffer, with channel ranges proportional to WB and applicable digital
+   gain. Original sensor spans are retained separately for Merrill RGB so its
+   later tone input can be reconstructed in sensor-count units.
+3. **WB-dependent radial shading** — Merrill C0/C2 corrections from
+   `WhiteBalanceColorShadingFactor`, still applied in the integer intermediate.
+4. **Bad pixels** — interpolate the camera-specific bad-pixel and cluster lists.
+5. **Denoise or Quattro expansion**: portable/GPU NLM or BM3D according to the caller's
+   options. This is not Sigma's native tiled filter pipeline.
+6. **RGB highlight handling and spatial gain** — build the normalized chroma
+   LUT; per pixel, recover highlights, optionally run RepairPix, apply the
+   matrix-pathology gate, and evaluate spatial gain. Merrill uses the recovered
+   aperture/focus or chief-ray-angle tables and native pixel interpolation;
+   EXIF FNumber supplies aperture, with the managed PROP fallback. This ordering
+   still differs from Sigma's preprocessing-time gain and highlight restoration.
+7. **Camera color** — Merrill RGB restores gained counts and applies selected
+   WB correction, float32 ISO scaling/remaps and color-mode compensation.
+   It then applies native ColorDQ chroma correction and the residual stage's
+   `[0,32766]` bounds with neutral residual gain.
+   Remaining render paths retain `get_conv`'s sensor-to-XYZ-to-output matrix
+   and per-channel digital ISO column scaling.
+8. **Tone and output color** — Merrill applies its recovered tone LUT, Q12
+   output matrix selected by EXIF source ColorSpace and requested target, then
+   the 65,536-entry integer gamma LUT. Adobe-source conversion includes the
+   native Adobe matrix inverse. Other paths
+   retain the interpolated gamma/Cineon LUT. The tone stage is excluded from
+   DNG and scene-linear output.
+9. **File output** — TIFF embeds the actual RGB transfer profile and camera
+   orientation. Raw/undefined encodings have no named-space profile. PPM stores
+   samples without TIFF metadata.
 
-The DNG path replaces stages 7–9 with highlight handling in sensor BMT
+RGB chroma-LUT recovery remains an explicit option: `-chroma-lut` enables it
+and `-no-chroma-lut` disables it for rendered sRGB, Adobe RGB and ProPhoto RGB
+TIFF, PPM and histograms through the original x3fuse pipeline. It does not
+select SPP processing or impose SPP's denoise limits. Both override
+`X3F_NO_CHROMA_LUT`; omitting the flags preserves the existing default (on unless
+that environment variable is present). Rust callers set
+`ProcessOptions::rgb_chroma_lut` to `Some(true)`, `Some(false)`, or `None` for
+that default. The choice belongs to each conversion, including concurrent calls.
+Disabling this LUT retains prior-based recovery and the matrix-pathology gate;
+it does not select Sigma's native highlight routine. `-spp-pipeline` selects
+the separate SPP pipeline and cannot combine with `-chroma-lut`. It uses
+camera-based highlight recovery with an
+omitted LUT flag or `-no-chroma-lut`. DNG, scene-linear,
+`-color none`, unprocessed and Cineon output ignore the RGB override.
+`X3F_NO_CHROMA_LUT` still controls the separate DNG-recovery LUT, including
+camera-space (`-color none`) output. The RGB LUT remains available as an
+alternative while Sigma's native pipeline is reconstructed.
+
+An explicit `ProcessOptions::color_mode` uses the shared validated resolver
+for TIFF and DNG. Merrill tone rows use the contrast-list ordinal. dp Quattro
+uses its native enum bounds, built-in tone shapes and quarter-resolution
+curve reconstruction. TIFF applies the mode before its output ICC encoding.
+The option defaults to `None`; the stages above keep their existing behavior
+when it is absent. sd Quattro and sd Quattro H modes remain unsupported.
+
+The experimental DNG mode path clears the creative selection before raw
+processing, then builds profile metadata and a selected-mode preview from
+that same image. Raw samples, levels and recovery scale stay independent of
+the selected mode. The replacement classic profiles use creative CM/FM values
+and a shared AsShotWhiteXY. Its separate cast, exposure, look-table and long-curve
+controls pass in Lightroom. The combined Merrill and dp Quattro files also
+pass profile switching, export, reopen and editable-control checks. The
+embedded preview uses the native renderer and can differ from the profile fit. The
+[Color Modes plan](../COLOR-MODES-PLAN.md) records evidence and remaining gates.
+
+The DNG path replaces stages 6–9 with highlight handling in sensor BMT
 space. Recovery is opt-in through `-dng-highlight-recovery`. On Merrill
 and older sensors, reliable nearby layer ratios propose reconstruction of
 one or two clipped layers. Local proposals must also agree with the
@@ -218,6 +247,28 @@ Orientation and camera WB calibration accompany the pixels. The renderer must
 apply orientation once and preserve negative channels and values above one until
 its chosen output transform.
 
+`SceneLinearImage::color_mode_calibration` captures native Color Mode calibration
+from the same decoded RAW before sensor processing changes it. It uses the
+as-shot WB and returns `None` for unsupported sensors or invalid native
+calibration. Cancellation and other errors still stop preparation. Editors can
+reuse this value without decoding RAW a second time.
+
+For a prepared pixel, `inverse(white_balance.camera_to_rgb) * scene_rgb` gives
+the normalized BMT input to this calibration. Spatial gain, sensor denoise,
+repair and any requested highlight recovery are already in that input. Do not
+apply spatial gain again. Black, white and WB normalization match DNG samples,
+but spatial gain follows `SceneLinearOptions::apply_sgain` and can differ from
+DNG export. DNG output scaling and final integer encoding are absent; the
+earlier sensor intermediates still use integers.
+
+Multiply by the matrix from `render_matrix` and add its offset to obtain native
+counts. Then apply `color_dq` when present before the sensor's count bounds and
+tone lookup. The calibration is fixed at as-shot WB; it does not reproduce a
+native WB preset change. Scene
+preparation uses different filters and spatial-gain tables from native SPP.
+Merrill's black-offset and spatial-gain order also differ. This mapping does
+not undo sensor processing or establish whole-image SPP parity.
+
 `read_as_shot_crop` reads camera framing without decoding RAW pixels. It uses
 the embedded JPEG aspect and CAMF active area, matching DNG `DefaultUserCrop`,
 and returns normalized `[x, y, width, height]` in EXIF-oriented coordinates.
@@ -244,9 +295,10 @@ One of:
 - **DNG** — pure-Rust IFD writer in
   [`crates/x3f-core/src/output/dng/`](../../crates/x3f-core/src/output/dng/).
   Emits standard TIFF, EXIF, and DNG tags, including ForwardMatrix1
-  and DefaultBlackRender. Standard is the default camera profile; the
-  currently enabled extra profiles are five monochrome variants and
-  Unconverted. Additional Sigma picture modes remain disabled. The writer embeds
+  and DefaultBlackRender. Without `-color-mode`, Standard is the default
+  camera profile, with five monochrome variants and Unconverted as extras.
+  The legacy CMCM picture modes remain disabled. Explicit Color Modes use the
+  separate profile path described above. The writer embeds
   Sigma's flat-fielding `OpcodeList3` blobs (lens-correction GainMaps)
   when `-opcodes-dir opcodes` is passed. `-compress` encodes the raw
   plane as lossless JPEG (`Compression = 7`, the pure-Rust LJ92
@@ -259,7 +311,7 @@ One of:
   dcraw-lineage decoders stop after the first strip of a multi-strip
   lossless-JPEG plane — single-strip LJ92 is the layout everything
   decodes. Required UniqueCameraModel and LinearResponseLimit live in
-  IFD0; DefaultUserCrop is RATIONAL[4] in the raw IFD. Hue/saturation
+  IFD0; DefaultUserCrop is RATIONAL[4] in the raw IFD. Legacy hue/saturation
   maps use `[21, 2, 1]` dimensions, with saturation varying fastest and
   identical corrections at both saturation endpoints.
 - **16-bit TIFF** —
@@ -311,6 +363,17 @@ sensor's base NLM sigma. `10` → `scale = 1.0` is full-strength denoise; `0`
 gates the pass out entirely. (Denoise output is not part of the byte-parity
 gate — every tier-2/3 test runs with `-no-denoise`.)
 
+`-spp-pipeline` selects a separate Merrill float path before normalized sensor
+processing. `ProcessOptions::spp_denoise` carries this choice per conversion.
+The path runs float gains and ordered repairs, native highlight restoration,
+despeckle, row/column correction, tiled bilateral and residual denoise,
+sharpening, active-area crop, and the shared Merrill tone and output stages.
+It accepts HI color TIFF, PPM and histogram output with neutral noise sliders.
+It uses CPU execution for `Auto` or `Cpu`; forced `Gpu` returns an error.
+It requires default `DenoiseOptions` and rejects BM3D or custom NLM controls.
+Unsupported cameras, resolution, calibration and output modes return errors.
+The [SPP alignment notes](./spp-alignment.md) describe its verification and limits.
+
 Native CLI builds also include wgpu implementations of NLM and BM3D in
 [`denoise/`](../../crates/x3f-sys/src/denoise/). `-denoise-backend auto` (default)
 tries Metal/Vulkan/DX12 and retries on CPU if initialization or execution fails.
@@ -333,6 +396,6 @@ preserving the existing per-pixel arithmetic order. WASM remains serial CPU
 with no GPU imports. See [performance notes](performance.md#gpu-denoising) for
 numerical tolerances, benchmarks, and the BM3D implementation.
 
-Everything else under [`src/`](../../src/) is the legacy archive —
-header files are still consumed by bindgen for typedefs, but the `.c`
-function bodies have all been deleted or migrated.
+Legacy C headers and the two log/version shims are in
+[`crates/x3f-sys/csrc/`](../../crates/x3f-sys/csrc/). Bindgen consumes the
+headers for ABI types. The other C function bodies have been ported to Rust.

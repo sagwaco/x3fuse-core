@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use x3f_core::{set_max_printed_matrix_elements, set_offset_legacy, set_verbosity};
-use x3f_core::{ColorEncoding, DngHighlightMapping, ProcessOptions, Reader, Verbosity};
+use x3f_core::{ColorEncoding, ColorMode, DngHighlightMapping, ProcessOptions, Reader, Verbosity};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum FileType {
@@ -51,10 +51,13 @@ struct Args {
     /// 10 is full strength (legacy default).
     denoise_intensity: u8,
     denoise_backend: x3f_core::DenoiseBackend,
+    spp_denoise: bool,
+    rgb_chroma_lut: Option<bool>,
     denoise_options: x3f_core::DenoiseOptions,
     apply_sgain: Option<bool>,
     file_type: FileType,
     color_encoding: ColorEncoding,
+    color_mode: Option<ColorMode>,
     log_hist: bool,
     wb: Option<String>,
     compress: bool,
@@ -84,10 +87,13 @@ impl Default for Args {
             fix_bad: true,
             denoise_intensity: 10,
             denoise_backend: x3f_core::DenoiseBackend::Auto,
+            spp_denoise: false,
+            rgb_chroma_lut: None,
             denoise_options: x3f_core::DenoiseOptions::default(),
             apply_sgain: None,
             file_type: FileType::Dng,
             color_encoding: ColorEncoding::Srgb,
+            color_mode: None,
             log_hist: false,
             wb: None,
             compress: false,
@@ -129,9 +135,22 @@ fn usage(progname: &str) -> ! {
          \x20                  'none' means neither scaling, applying gamma\n\
          \x20                  nor converting color space.\n\
          \x20                  This switch does not affect DNG output\n\
+         \x20  -color-mode <MODE>  Select a camera color mode at normal strength\n\
+         \x20                  as-shot, Standard, Vivid, Neutral, Portrait,\n\
+         \x20                  Landscape, FOV Classic Blue; dp Quattro also supports\n\
+         \x20                  Sunset Red, Forest Green, FOV Classic Yellow, Cinema,\n\
+         \x20                  Teal and Orange. Quote names that contain spaces.\n\
+         \x20                  Short names such as FCBlue remain accepted.\n\
+         \x20                  Color TIFF applies the look to pixels. DNG embeds\n\
+         \x20                  selectable profiles with this requested default.\n\
+         \x20                  DNG looks are approximations at export white balance.\n\
+         \x20                  Omitting the option preserves existing output.\n\
          \x20  -unprocessed    Dump RAW without any preprocessing\n\
          \x20  -qtop           Dump Quattro top layer without preprocessing\n\
          \x20  -no-crop        Do not crop to active area\n\
+         \x20  -spp-pipeline   Use Merrill SPP recovery and denoise on CPU\n\
+         \x20                  Neutral noise sliders; TIFF, PPM or histogram\n\
+         \x20                  Requires default denoise options and -denoise 10\n\
          \x20  -no-denoise     Disable denoising (same as -denoise 0)\n\
          \x20  -denoiser <nlm|bm3d>  Select algorithm (default: nlm)\n\
          \x20  -denoise-luma / -no-denoise-luma  Luminance (default: off)\n\
@@ -145,6 +164,15 @@ fn usage(progname: &str) -> ! {
          \x20                  values scale the selected filter strength.\n\
          \x20  -no-sgain       Do not apply spatial gain (color compensation)\n\
          \x20  -no-fix-bad     Do not fix bad pixels\n\
+         \x20  -chroma-lut     Enable scene-derived RGB highlight recovery\n\
+         \x20  -no-chroma-lut  Disable that LUT; retain prior recovery and gate\n\
+         \x20                  Both override X3F_NO_CHROMA_LUT for rendered\n\
+         \x20                  sRGB/AdobeRGB/ProPhotoRGB output.\n\
+         \x20                  Default: LUT on unless the environment disables it.\n\
+         \x20                  -chroma-lut cannot combine with -spp-pipeline.\n\
+         \x20                  DNG, -color none, raw and Cineon ignore these flags.\n\
+         \x20                  The environment still controls the separate DNG\n\
+         \x20                  recovery LUT, including -color none output.\n\
          \x20  -sgain          Apply spatial gain (default except for Quattro)\n\
          \x20  -wb <WB>        Select white balance preset\n\
          \x20  -compress       Enable lossless compression (DNG: lossless\n\
@@ -278,6 +306,14 @@ fn parse_args(argv: &[String]) -> Args {
                 };
                 args.color_explicit = true;
             }
+            "-color-mode" => {
+                i += 1;
+                let value = argv.get(i).unwrap_or_else(|| usage(progname));
+                args.color_mode = Some(value.parse().unwrap_or_else(|_| {
+                    eprintln!("Unknown camera color mode: {value}");
+                    usage(progname)
+                }));
+            }
             "-cineon" => args.cineon = true,
             "-o" => {
                 i += 1;
@@ -296,7 +332,10 @@ fn parse_args(argv: &[String]) -> Args {
             }
             "-no-crop" => args.crop = false,
             "-no-fix-bad" => args.fix_bad = false,
+            "-chroma-lut" => args.rgb_chroma_lut = Some(true),
+            "-no-chroma-lut" => args.rgb_chroma_lut = Some(false),
             "-no-denoise" => args.denoise_intensity = 0,
+            "-spp-pipeline" => args.spp_denoise = true,
             "-denoiser" => {
                 i += 1;
                 args.denoise_options.algorithm = argv
@@ -417,6 +456,49 @@ fn normalize(args: &mut Args) {
 /// usage()-style exit. Kept as a pure function so the unit tests can
 /// exercise it without `process::exit`.
 fn validate_args(args: &Args) -> Result<(), String> {
+    if args.color_mode.is_some() {
+        if !matches!(args.file_type, FileType::Tiff | FileType::Dng) {
+            return Err("-color-mode requires color TIFF or DNG output".into());
+        }
+        if args.cineon
+            || (args.file_type == FileType::Tiff
+                && !matches!(
+                    args.color_encoding,
+                    ColorEncoding::Srgb | ColorEncoding::AdobeRgb | ColorEncoding::ProPhotoRgb
+                ))
+        {
+            return Err("-color-mode requires color TIFF without Cineon, or DNG output".into());
+        }
+    }
+    if args.spp_denoise {
+        if args.rgb_chroma_lut == Some(true) {
+            return Err(
+                "-spp-pipeline cannot combine with -chroma-lut; select one pipeline".into(),
+            );
+        }
+        if !matches!(
+            args.file_type,
+            FileType::Tiff | FileType::PpmP3 | FileType::PpmP6 | FileType::Histogram
+        ) || args.cineon
+            || !matches!(
+                args.color_encoding,
+                ColorEncoding::Srgb | ColorEncoding::AdobeRgb | ColorEncoding::ProPhotoRgb
+            )
+        {
+            return Err("-spp-pipeline requires color TIFF, PPM or histogram output".into());
+        }
+        if args.denoise_intensity != 10 {
+            return Err(
+                "-spp-pipeline uses neutral SPP noise sliders and requires -denoise 10".into(),
+            );
+        }
+        if args.denoise_backend == x3f_core::DenoiseBackend::Gpu {
+            return Err("-spp-pipeline supports -denoise-backend auto or cpu".into());
+        }
+        if args.denoise_options != x3f_core::DenoiseOptions::default() {
+            return Err("-spp-pipeline requires default denoise options".into());
+        }
+    }
     if args.cineon && args.file_type != FileType::Tiff {
         return Err(
             "-cineon is only meaningful with -tiff (other formats apply their own gamma/profile)"
@@ -521,10 +603,13 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
 
     let opts = ProcessOptions {
         color_encoding: args.color_encoding,
+        color_mode: args.color_mode,
         crop: args.crop,
         fix_bad: args.fix_bad,
         denoise_intensity: args.denoise_intensity,
         denoise_backend: args.denoise_backend,
+        spp_denoise: args.spp_denoise,
+        rgb_chroma_lut: args.rgb_chroma_lut,
         denoise_options: args.denoise_options,
         apply_sgain: args.apply_sgain,
         wb: args.wb.clone(),
@@ -640,6 +725,19 @@ mod tests {
     }
 
     #[test]
+    fn rgb_chroma_lut_override_is_explicit_and_last_wins() {
+        assert_eq!(parse(&["in.X3F"]).rgb_chroma_lut, None);
+        for (flags, expected) in [
+            (vec!["-chroma-lut", "in.X3F"], true),
+            (vec!["-no-chroma-lut", "in.X3F"], false),
+            (vec!["-chroma-lut", "-no-chroma-lut", "in.X3F"], false),
+            (vec!["-no-chroma-lut", "-chroma-lut", "in.X3F"], true),
+        ] {
+            assert_eq!(parse(&flags).rgb_chroma_lut, Some(expected));
+        }
+    }
+
+    #[test]
     fn dng_recovery_defaults_to_linear_headroom() {
         let args = parse(&["-dng-highlight-recovery", "in.X3F"]);
         assert!(args.dng_highlight_recovery);
@@ -718,6 +816,49 @@ mod tests {
         assert_eq!(a.color_encoding, ColorEncoding::Unprocessed);
         let a = parse(&["-color", "sRGB", "-qtop", "in.X3F"]);
         assert_eq!(a.color_encoding, ColorEncoding::Qtop);
+    }
+
+    #[test]
+    fn color_mode_is_separate_from_output_encoding_and_opt_in() {
+        assert_eq!(parse(&["in.X3F"]).color_mode, None);
+        let args = parse(&[
+            "-tiff",
+            "-color",
+            "AdobeRGB",
+            "-color-mode",
+            "Vivid",
+            "in.X3F",
+        ]);
+        assert_eq!(args.color_mode, Some(ColorMode::Vivid));
+        assert_eq!(args.color_encoding, ColorEncoding::AdobeRgb);
+        assert!(validate_args(&args).is_ok());
+        let args = parse(&["-dng", "-color", "none", "-color-mode", "as-shot", "in.X3F"]);
+        assert_eq!(args.color_mode, Some(ColorMode::AsShot));
+        assert!(validate_args(&args).is_ok());
+        for name in ["FOV Classic Blue", "FCBlue"] {
+            let args = parse(&["-dng", "-color-mode", name, "in.X3F"]);
+            assert_eq!(args.color_mode, Some(ColorMode::FCBlue));
+            assert!(validate_args(&args).is_ok());
+        }
+    }
+
+    #[test]
+    fn color_mode_rejects_outputs_outside_tiff_and_dng() {
+        for flags in [
+            vec!["-jpg"],
+            vec!["-raw"],
+            vec!["-meta"],
+            vec!["-ppm"],
+            vec!["-histogram"],
+            vec!["-tiff", "-cineon"],
+            vec!["-tiff", "-unprocessed"],
+            vec!["-tiff", "-qtop"],
+            vec!["-tiff", "-color", "none"],
+        ] {
+            let mut command = flags;
+            command.extend(["-color-mode", "Standard", "in.X3F"]);
+            assert!(validate_args(&parse(&command)).is_err(), "{command:?}");
+        }
     }
 
     #[test]
@@ -812,6 +953,115 @@ mod tests {
             DenoiseBackend::Gpu
         );
         assert!("opencl".parse::<DenoiseBackend>().is_err());
+    }
+
+    #[test]
+    fn spp_pipeline_is_explicit_and_rejects_unsupported_modes() {
+        assert!(!parse(&["in.X3F"]).spp_denoise);
+        for format in ["-tiff", "-ppm-ascii", "-ppm", "-histogram"] {
+            let args = parse(&[format, "-color", "sRGB", "-spp-pipeline", "in.X3F"]);
+            assert!(args.spp_denoise);
+            assert!(validate_args(&args).is_ok(), "{format}");
+        }
+        for flags in [
+            vec!["-dng"],
+            vec!["-jpg"],
+            vec!["-meta"],
+            vec!["-tiff", "-cineon"],
+            vec!["-tiff", "-color", "none"],
+            vec!["-tiff", "-no-denoise"],
+            vec!["-tiff", "-denoise", "5"],
+            vec!["-tiff", "-denoise-backend", "gpu"],
+        ] {
+            let mut command = flags;
+            command.extend(["-spp-pipeline", "in.X3F"]);
+            assert!(validate_args(&parse(&command)).is_err(), "{command:?}");
+        }
+        assert!(validate_args(&parse(&[
+            "-tiff",
+            "-spp-pipeline",
+            "-denoise-backend",
+            "cpu",
+            "in.X3F"
+        ]))
+        .is_ok());
+    }
+
+    #[test]
+    fn spp_pipeline_requires_default_denoise_options() {
+        for flags in [
+            vec!["-denoiser", "bm3d"],
+            vec!["-denoise-luma"],
+            vec!["-no-denoise-chroma"],
+            vec!["-denoise-strength", "1.5"],
+            vec!["-nlm-luma-patch", "7"],
+            vec!["-nlm-chroma-patch", "7"],
+            vec!["-nlm-luma-search", "21"],
+            vec!["-nlm-chroma-search", "21"],
+        ] {
+            for spp_first in [false, true] {
+                let mut command = vec!["-tiff"];
+                if spp_first {
+                    command.push("-spp-pipeline");
+                }
+                command.extend(&flags);
+                if !spp_first {
+                    command.push("-spp-pipeline");
+                }
+                command.push("in.X3F");
+                let error = validate_args(&parse(&command)).unwrap_err();
+                assert!(
+                    error.contains("default denoise options"),
+                    "{command:?}: {error}"
+                );
+            }
+        }
+        let args = parse(&[
+            "-tiff",
+            "-spp-pipeline",
+            "-denoiser",
+            "nlm",
+            "-no-denoise-luma",
+            "-denoise-chroma",
+            "-denoise-strength",
+            "1",
+            "-nlm-luma-patch",
+            "3",
+            "-nlm-chroma-patch",
+            "3",
+            "-nlm-luma-search",
+            "11",
+            "-nlm-chroma-search",
+            "11",
+            "in.X3F",
+        ]);
+        assert!(validate_args(&args).is_ok());
+    }
+
+    #[test]
+    fn recovery_pipelines_are_separate() {
+        for flags in [
+            vec!["-chroma-lut", "-spp-pipeline"],
+            vec!["-spp-pipeline", "-chroma-lut"],
+        ] {
+            let mut command = vec!["-tiff"];
+            command.extend(flags);
+            command.push("in.X3F");
+            let error = validate_args(&parse(&command)).unwrap_err();
+            assert!(error.contains("select one pipeline"), "{error}");
+        }
+        for flags in [
+            vec!["-chroma-lut", "-no-denoise"],
+            vec!["-chroma-lut", "-denoise", "5"],
+            vec!["-chroma-lut", "-denoise-backend", "gpu"],
+            vec!["-spp-pipeline", "-no-chroma-lut"],
+            vec!["-spp-pipeline", "-chroma-lut", "-no-chroma-lut"],
+        ] {
+            let mut command = vec!["-tiff"];
+            command.extend(flags);
+            command.push("in.X3F");
+            assert!(validate_args(&parse(&command)).is_ok(), "{command:?}");
+        }
     }
 
     #[test]

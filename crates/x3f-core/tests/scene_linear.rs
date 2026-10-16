@@ -60,6 +60,11 @@ fn camera_sources_preserve_headroom_and_repeat_from_fresh_readers() {
                     image.width as usize * image.height as usize * 3
                 );
                 assert!((1..=8).contains(&image.orientation));
+                assert_eq!(
+                    image.color_mode_calibration.is_some(),
+                    name != "SDQH5085.X3F",
+                    "{name}: native Color Mode calibration availability"
+                );
                 assert!(image.data.iter().all(|v| v.is_finite()));
                 let low = image.data.iter().copied().fold(f32::INFINITY, f32::min);
                 let high = image.data.iter().copied().fold(f32::NEG_INFINITY, f32::max);

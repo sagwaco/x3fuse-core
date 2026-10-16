@@ -1,0 +1,24 @@
+sigma_sd1_merrill_15.x3f	raw	7c72a916bf673cba
+sigma_sd1_merrill_15.x3f	detect	7c72a916bf673cba	primary=180863 jpeg=0 detected=4 from_primary=4 overrides_changed=4
+sigma_sd1_merrill_15.x3f	gains	b9d43d1a54d46ec8	black=[402f706cda635676, 402f6842bde221ac, 402f7c526ccd29e6] gain=[40110883f2211dde, 40002c42c56a345d, 3ff24fcac9745d17] spatial=true
+sigma_sd1_merrill_15.x3f	radial	b9d43d1a54d46ec8	applied=false
+sigma_sd1_merrill_15.x3f	listed	4472fd809839f06b	label=3 minimum=2
+sigma_sd1_merrill_15.x3f	jpeg	4472fd809839f06b	records=0
+sigma_sd1_merrill_15.x3f	detected	9651f4c7431bb80f	records=4
+sigma_sd1_merrill_15.x3f	clusters	9651f4c7431bb80f	badness=2 margin=25 records=0 points=0 zero=0
+sigma_sd1_merrill_15.x3f	highlight	9651f4c7431bb80f	donors=624 removed=0 occupied=8 dense=0 lut=true
+sigma_sd1_merrill_15.x3f	despeckle	0925b122b9be696e	records=13622
+sigma_sd1_merrill_15.x3f	offset	56063287e30af3b1	patches=19274 accepted=1588 rows=58306
+sigma_sd1_merrill_15.x3f	prepared	56063287e30af3b1	4928x3264 stride=14784 burst=false sat=[0, 0, 0] offset_iso=44480000
+_P2M0358.X3F	raw	993237520a95a302
+_P2M0358.X3F	detect	993237520a95a302	primary=143827 jpeg=41 detected=7 from_primary=7 overrides_changed=3
+_P2M0358.X3F	gains	4647cf03161f2772	black=[403f8d1b582eaac5, 403f6597e0a3ba81, 403fac6b03e51270] gain=[4013cedf28a33e34, 400284437855da00, 3ff64b2768000000] spatial=true
+_P2M0358.X3F	radial	62d1b444342f5737	applied=true
+_P2M0358.X3F	listed	c88c1ba20c516d94	label=3 minimum=2
+_P2M0358.X3F	jpeg	4bcd7adc99219146	records=41
+_P2M0358.X3F	detected	efc96c6e9f79ba55	records=7
+_P2M0358.X3F	clusters	3e5c09c065979908	badness=2 margin=25 records=5 points=36 zero=0
+_P2M0358.X3F	highlight	79c62cd827acdcf6	donors=2277923 removed=238 occupied=27 dense=11830 lut=true
+_P2M0358.X3F	despeckle	48877d7e1762d5d7	records=4002
+_P2M0358.X3F	offset	3c55b894154e40a7	patches=19274 accepted=2902 rows=102676
+_P2M0358.X3F	prepared	3c55b894154e40a7	4928x3264 stride=14784 burst=false sat=[2, 10039, 395621] offset_iso=42c7ce00

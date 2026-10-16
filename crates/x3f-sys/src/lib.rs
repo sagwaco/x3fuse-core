@@ -26,6 +26,8 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 // `libc::*` call sites resolve through the shim on wasm32 without
 // touching their bodies.
 pub mod control;
+#[doc(hidden)] // Shared implementation detail for x3f-core's metadata writer.
+pub mod jpeg_exif;
 pub mod sysabi;
 pub use control::{Control, Error, Result};
 mod parse;
@@ -48,9 +50,7 @@ mod _wasm_c_shim_anchors {
     static A1: unsafe extern "C" fn(c_int, *const c_char, c_int) = super::wasm_c_shims::x3f_printf;
 }
 
-// Pure-Rust Non-Local Means denoise, called directly by the pipeline
-// (`process::run_denoising` and the Quattro passes in `quattro`) on every
-// target. No C/C++ and no FFI boundary — see the module header.
+// Rust NLM and BM3D denoising, called directly by the pipeline on every target.
 mod denoise;
 pub use denoise::{DenoiseAlgorithm, DenoiseBackend, DenoiseOptions, NlmOptions};
 
@@ -133,6 +133,7 @@ pub use load::{load_data, load_image_block, x3f_err, x3f_load_data, x3f_load_ima
 // pattern as the M4 ports: C source removed from cc-rs, bindgen forward
 // declarations blocklisted, Rust definitions re-exported.
 mod matrix;
+mod merrill;
 pub use matrix::{
     x3f_3x1_comp_mul, x3f_3x1_invert, x3f_3x1_print, x3f_3x3_3x1_mul, x3f_3x3_3x3_mul,
     x3f_3x3_diag, x3f_3x3_identity, x3f_3x3_inverse, x3f_3x3_ones, x3f_3x3_print,
@@ -184,6 +185,12 @@ pub use spatial_gain::{
     x3f_get_spatial_gain,
 };
 
+// Research modules for the ordered Merrill float frontend and SPP denoise
+// kernels, including image resampling. These modules are crate-private.
+pub(crate) mod cr_offset;
+pub(crate) mod float_front;
+pub(crate) mod spp_denoise;
+
 // M6e: incremental native Rust port of src/x3f_process.c. M6e1 lifts
 // the color math accessors (x3f_get_gain, x3f_get_bmt_to_xyz,
 // x3f_get_raw_to_xyz) — the pure CAMF-and-matrix stages — out of C.
@@ -191,13 +198,20 @@ pub use spatial_gain::{
 // bad-pixel interpolation; M6e4 (in highlight.rs) the highlight
 // recovery family. preprocess_data / convert_data / convert entry
 // points remain C until later phases.
+mod color_modes;
 mod process;
+pub use color_modes::{
+    available_color_modes, color_mode_linear_tone_lut, color_mode_tone_index, color_mode_tone_lut,
+    resolve_color_mode, ColorMode, ColorModeCalibration, ColorModeColorDq, ColorModeParameters,
+    ColorModeRenderLuts, ColorModeSensor, ColorModeToneParameters,
+};
 pub use process::{
-    get_image_controlled, get_preview_controlled, get_scene_linear_controlled, x3f_get_bmt_to_xyz,
-    x3f_get_digital_iso_gain, x3f_get_dng_highlight_scale, x3f_get_dng_shoulder_ceiling,
-    x3f_get_dng_shoulder_knee, x3f_get_gain, x3f_get_image, x3f_get_preview,
-    x3f_get_preview_with_scale, x3f_get_raw_to_xyz, x3f_set_cineon, x3f_set_dng_highlight_mapping,
-    x3f_set_dng_highlight_recovery, ProcessingInfo, ProcessingOptions, SceneLinearData,
+    color_mode_calibration, get_image_controlled, get_preview_controlled,
+    get_scene_linear_controlled, x3f_get_bmt_to_xyz, x3f_get_digital_iso_gain,
+    x3f_get_dng_highlight_scale, x3f_get_dng_shoulder_ceiling, x3f_get_dng_shoulder_knee,
+    x3f_get_gain, x3f_get_image, x3f_get_preview, x3f_get_preview_with_scale, x3f_get_raw_to_xyz,
+    x3f_set_cineon, x3f_set_dng_highlight_mapping, x3f_set_dng_highlight_recovery, ProcessingInfo,
+    ProcessingOptions, SceneLinearData,
 };
 
 // M6e4: highlight-recovery family (highlight_params, chroma LUT, sat

@@ -751,7 +751,7 @@ pub unsafe extern "C" fn chroma_lut_apply_pixel_bmt(
         return 1;
     }
     let lut = unsafe { &*lut };
-    if lut.valid == 0 {
+    if lut.valid_b == 0 && lut.valid_m == 0 {
         return 0;
     }
     let s = unsafe { std::slice::from_raw_parts_mut(s, 3) };
@@ -1439,6 +1439,35 @@ mod tests {
         assert!((s[1] - 0.7).abs() < 1e-6, "M' = {}", s[1]);
         assert_eq!(s[0], 0.5);
         assert_eq!(s[2], 0.5);
+    }
+
+    #[test]
+    fn bmt_apply_uses_each_valid_table_without_t_donors() {
+        for clipped in [0, 1] {
+            let mut lut: chroma_lut_t = unsafe { std::mem::zeroed() };
+            chroma_lut_defaults(&mut lut, false);
+            if clipped == 0 {
+                lut.valid_b = 1;
+                lut.lut_b.fill(1.5);
+            } else {
+                lut.valid_m = 1;
+                lut.lut_m.fill(1.5);
+            }
+            let mut samples = [0.5; 3];
+            samples[clipped] = 1.0;
+            let mut stats: chroma_lut_apply_stats_t = unsafe { std::mem::zeroed() };
+
+            let applied =
+                unsafe { chroma_lut_apply_pixel_bmt(samples.as_mut_ptr(), &lut, &mut stats) };
+
+            assert_eq!(applied, 1, "independent table for channel {clipped}");
+            let mut expected = [0.5; 3];
+            expected[clipped] = 0.75;
+            assert_eq!(samples, expected);
+            assert_eq!(stats.applied_b, u64::from(clipped == 0));
+            assert_eq!(stats.applied_m, u64::from(clipped == 1));
+            assert_eq!(stats.applied, 0);
+        }
     }
 
     #[test]

@@ -35,7 +35,7 @@ use std::ptr::NonNull;
 
 use thiserror::Error;
 use x3f_sys as sys;
-pub use x3f_sys::{DenoiseAlgorithm, DenoiseBackend, DenoiseOptions, NlmOptions};
+pub use x3f_sys::{ColorMode, DenoiseAlgorithm, DenoiseBackend, DenoiseOptions, NlmOptions};
 // Shadow the external libc crate with x3f-sys's compat shim. On every
 // target except wasm32-unknown-unknown this is `pub use libc::*;`; on
 // wasm32 it provides Rust-native equivalents for the few libc symbols
@@ -120,6 +120,14 @@ impl DngHighlightMapping {
 pub struct ProcessOptions {
     /// Target color space / processing mode for the output.
     pub color_encoding: ColorEncoding,
+    /// Camera color mode for this conversion. None preserves the existing output.
+    /// TIFF and get_image apply the mode to RGB pixels. DNG embeds selectable
+    /// profiles and uses this mode as the default without changing raw samples.
+    /// DNG looks approximate native rendering at the export white balance.
+    /// Later white-balance edits can differ from SPP.
+    /// PPM, histogram and embedded JPEG exports do not accept this option.
+    /// AsShot uses the recorded camera mode at normal strength.
+    pub color_mode: Option<ColorMode>,
     /// Crop to the active sensor area (default: true).
     pub crop: bool,
     /// Run bad-pixel interpolation (default: true).
@@ -143,6 +151,25 @@ pub struct ProcessOptions {
     /// Enable the `gpu` Cargo feature for native acceleration. Auto falls back
     /// to CPU when unavailable; Gpu fails instead. WASM always uses CPU in Auto.
     pub denoise_backend: DenoiseBackend,
+    /// Use the Merrill SPP float pipeline for full-resolution color TIFF, PPM or histogram output.
+    /// This CPU path uses neutral SPP noise sliders. The default is false.
+    /// Requires default `denoise_options` because SPP uses its own denoiser.
+    /// Requires full denoise intensity; other sensor and output modes return an error.
+    /// Uses sharpness 0, fill light 0, saturation 0 and Highlight Control 1.
+    /// `fix_bad=false` skips listed and detected repairs; `crop=false` returns
+    /// the full Keep area. These modifiers extend the native export behavior.
+    pub spp_denoise: bool,
+    /// Use scene-derived chroma-LUT recovery for sRGB, Adobe RGB or ProPhoto RGB.
+    /// `None` (default) enables it unless `X3F_NO_CHROMA_LUT` is present;
+    /// `Some(true)` or `Some(false)` overrides that environment setting for
+    /// this conversion. Disabling the LUT retains the prior-based recovery
+    /// and matrix-pathology gate; it does not select Sigma's native recovery.
+    /// `Some(true)` cannot combine with `spp_denoise=true`: select one pipeline.
+    /// SPP uses its own highlight recovery with `None` or `Some(false)`.
+    /// Ignored by DNG, scene-linear, `ColorEncoding::None`, unprocessed and
+    /// Cineon output. `X3F_NO_CHROMA_LUT` still controls the separate DNG
+    /// recovery LUT, including camera-space (`None`) output.
+    pub rgb_chroma_lut: Option<bool>,
     /// Algorithm and advanced sensor-space denoising controls.
     pub denoise_options: DenoiseOptions,
     /// Directory of pre-rendered DNG `OpcodeList3` blobs (Sigma's per-
@@ -194,6 +221,7 @@ impl Default for ProcessOptions {
     fn default() -> Self {
         Self {
             color_encoding: ColorEncoding::default(),
+            color_mode: None,
             crop: true,
             fix_bad: true,
             apply_sgain: None,
@@ -201,6 +229,8 @@ impl Default for ProcessOptions {
             compress: false,
             denoise_intensity: 10,
             denoise_backend: DenoiseBackend::Auto,
+            spp_denoise: false,
+            rgb_chroma_lut: None,
             denoise_options: DenoiseOptions::default(),
             opcodes_dir: None,
             dng_highlight_recovery: false,
@@ -495,6 +525,15 @@ impl Reader {
         self.load_directory_entry(de)
     }
 
+    /// Load camera metadata and return the valid named color modes for this file.
+    /// This does not decode raw pixels or include AsShot as a separate mode.
+    pub fn available_color_modes(&mut self) -> Result<Vec<ColorMode>, Error> {
+        self.load_camf()?;
+        self.load_property_list()?;
+        // SAFETY: this reader owns the loaded metadata for the whole call.
+        unsafe { sys::available_color_modes(self.x3f.as_ptr()) }.map_err(Into::into)
+    }
+
     /// Load and decode the RAW image data.
     pub fn load_raw(&mut self) -> Result<(), Error> {
         // SAFETY: self.x3f is valid.
@@ -577,23 +616,21 @@ impl Reader {
     pub fn dump_tiff(&self, out: impl AsRef<Path>, opts: &ProcessOptions) -> Result<(), Error> {
         let out = out.as_ref();
         let image = self.get_image(opts)?;
-        // Embed an ICC profile only in cineon mode — non-cineon output
-        // already has the encoding's gamma curve baked in, and renderers
-        // default to sRGB which matches the historical behaviour. The
-        // cineon ICC declares the chosen primaries with a *linear* TRC
-        // so colour-managed readers leave the log encoding intact (the
-        // file is meant to look flat in viewers; the colourist supplies
-        // their own log→linear input transform when grading).
-        let icc = if opts.cineon {
-            icc::cineon_log_profile(opts.color_encoding)
-        } else {
-            None
-        };
-        output::tiff::write(&image, out, opts.compress, icc.as_deref()).map_err(|source| {
-            Error::Io {
-                path: out.display().to_string(),
-                source,
-            }
+        let icc = icc::processed_profile(opts.color_encoding, opts.cineon);
+        let orientation = output::dng::exif::CaptureMetadata::from_reader(self)
+            .orientation
+            .unwrap_or(1);
+        output::tiff::write_controlled(
+            &image,
+            out,
+            opts.compress,
+            icc.as_deref(),
+            orientation,
+            sys::Control::none(),
+        )
+        .map_err(|source| Error::Io {
+            path: out.display().to_string(),
+            source,
         })
     }
 
@@ -604,6 +641,11 @@ impl Reader {
         opts: &ProcessOptions,
         binary: bool,
     ) -> Result<(), Error> {
+        if opts.color_mode.is_some() {
+            return Err(Error::InvalidData(
+                "camera color modes require color TIFF or DNG output".into(),
+            ));
+        }
         let out = out.as_ref();
         let image = self.get_image(opts)?;
         output::ppm::write(&image, out, binary).map_err(|source| Error::Io {
@@ -620,6 +662,22 @@ impl Reader {
         opts: &ProcessOptions,
         log_exposure: bool,
     ) -> Result<(), Error> {
+        if opts.color_mode.is_some() {
+            return Err(Error::InvalidData(
+                "camera color modes require color TIFF or DNG output".into(),
+            ));
+        }
+        if opts.spp_denoise && opts.cineon {
+            return Err(Error::InvalidData(
+                "SPP denoise requires color output without Cineon".into(),
+            ));
+        }
+        #[cfg(target_arch = "wasm32")]
+        if opts.spp_denoise {
+            return Err(Error::InvalidData(
+                "SPP histogram output requires a native build".into(),
+            ));
+        }
         let cpath = path_to_cstring(out.as_ref())?;
         let cwb = wb_cstring(opts.wb.as_deref())?;
         let sgain = self.resolve_sgain(opts.apply_sgain);
@@ -636,9 +694,12 @@ impl Reader {
                 sgain,
                 cwb_ptr(&cwb),
                 log_exposure as i32,
-                // Histogram output retains its legacy processing behavior;
-                // DNG highlight and TIFF Cineon options do not apply here.
-                sys::ProcessingOptions::default(),
+                // DNG highlight and TIFF Cineon options do not apply to histograms.
+                sys::ProcessingOptions {
+                    spp_denoise: opts.spp_denoise,
+                    rgb_chroma_lut: opts.rgb_chroma_lut,
+                    ..sys::ProcessingOptions::default()
+                },
                 sys::Control::none()
                     .with_denoise_backend(opts.denoise_backend)
                     .with_denoise_options(opts.denoise_options)?,

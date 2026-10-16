@@ -171,8 +171,8 @@ error followed by automatic CPU fallback, failed/poisoned contexts, and
 cancellation while waiting for initialization. CPU loop cancellation is
 triggered after 64 output pixels rather than inferred from a timer. These do
 not simulate every driver failure: actual device loss and GPU hangs still
-require platform-specific validation. Native histograms retain their legacy
-behavior and ignore DNG highlight/TIFF Cineon options; histogram dumping is
+require platform-specific validation. Native RGB histograms honor the
+per-conversion RGB LUT override and ignore DNG highlight/TIFF Cineon options; histogram dumping is
 unsupported on WASM.
 
 Kernel output must be within one 16-bit code value of the CPU reference.

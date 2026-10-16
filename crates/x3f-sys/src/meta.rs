@@ -58,7 +58,10 @@ unsafe fn camf_table<'a>(x3f: *mut x3f_t) -> Option<&'a [camf_entry_t]> {
     Some(unsafe { std::slice::from_raw_parts(table.element, table.size as usize) })
 }
 
-unsafe fn camf_find_by_name<'a>(x3f: *mut x3f_t, name: *const c_char) -> Option<&'a camf_entry_t> {
+pub(crate) unsafe fn camf_find_by_name<'a>(
+    x3f: *mut x3f_t,
+    name: *const c_char,
+) -> Option<&'a camf_entry_t> {
     let table = unsafe { camf_table(x3f) }?;
     for entry in table {
         if unsafe { cstr_eq(name, entry.name_address) } {

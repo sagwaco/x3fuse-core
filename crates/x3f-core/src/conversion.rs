@@ -56,6 +56,16 @@ pub fn convert_file(
 ) -> Result<ConversionReport, Error> {
     let control = Control::new(cancel);
     control.check()?;
+    if options.color_mode.is_some() && format == OutputFormat::Jpeg {
+        return Err(Error::InvalidData(
+            "camera color modes require a rendered color or DNG export".into(),
+        ));
+    }
+    if options.spp_denoise && format == OutputFormat::Jpeg {
+        return Err(Error::InvalidData(
+            "SPP denoise requires a color export".into(),
+        ));
+    }
     // Reserve ownership before any writer can truncate a caller's file.
     let reserved = OpenOptions::new()
         .write(true)
@@ -103,11 +113,22 @@ pub fn convert_file(
                 &mut report.warnings,
             )?,
             OutputFormat::Tiff => {
-                let image = reader.get_image_with_control(options, control)?;
-                let profile = options
-                    .cineon
-                    .then(|| crate::icc::cineon_log_profile(options.color_encoding))
-                    .flatten();
+                let mut render_options = options.clone();
+                // Read the fallback before rendering consumes the decoded sensor buffer.
+                if options.color_mode == Some(crate::ColorMode::AsShot) {
+                    // SAFETY: this reader owns the metadata loaded above.
+                    let resolved = unsafe {
+                        sys::resolve_color_mode(reader.x3f.as_ptr(), crate::ColorMode::AsShot)
+                    }?;
+                    if resolved.as_shot_fallback {
+                        report.warnings.push(
+                            "Unknown or empty as-shot Color Mode resolved to Standard".to_owned(),
+                        );
+                    }
+                    render_options.color_mode = Some(resolved.mode);
+                }
+                let image = reader.get_image_with_control(&render_options, control)?;
+                let profile = crate::icc::processed_profile(options.color_encoding, options.cineon);
                 on_stage(ConversionStage::Write);
                 control.check()?;
                 crate::output::tiff::write_controlled(
@@ -115,6 +136,9 @@ pub fn convert_file(
                     output,
                     options.compress,
                     profile.as_deref(),
+                    crate::output::dng::exif::CaptureMetadata::from_reader(&reader)
+                        .orientation
+                        .unwrap_or(1),
                     control,
                 )
                 .map_err(|error| output_error(output, error))?;
@@ -215,6 +239,29 @@ mod tests {
         let jpeg = [0xff, 0xd8, 0xff, 0xd9];
         std::fs::write(&input, jpeg_container(&jpeg)).unwrap();
         let cancel = AtomicBool::new(false);
+        let mode_options = ProcessOptions {
+            color_mode: Some(crate::ColorMode::Vivid),
+            ..ProcessOptions::default()
+        };
+        let result = convert_file(
+            &input,
+            &output,
+            OutputFormat::Jpeg,
+            &mode_options,
+            &cancel,
+            |_| panic!("invalid options must fail before conversion starts"),
+        );
+        assert!(matches!(result, Err(Error::InvalidData(_))));
+        assert!(!output.exists());
+        let reader = Reader::open(&input).unwrap();
+        for result in [
+            reader.dump_ppm(&output, &mode_options, true),
+            reader.dump_histogram(&output, &mode_options, false),
+        ] {
+            assert!(matches!(result, Err(Error::InvalidData(_))));
+            assert!(!output.exists());
+        }
+        drop(reader);
         let mut stages = Vec::new();
         convert_file(
             &input,

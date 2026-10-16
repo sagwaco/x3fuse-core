@@ -61,12 +61,17 @@ mirror of what used to be in `src/`:
 | `io.rs` | `x3f_io.c` directory walker, header parse, cleanup, getters | M4c, M5e |
 | `load.rs` | `x3f_load_data` + section loaders + CAMF decoders | M4d |
 | `matrix.rs` | `x3f_matrix.c` (3×3 mul, color-space matrices, gamma LUT) | M6a |
+| `jpeg_exif.rs` | Shared JPEG EXIF reader for render calibration and DNG metadata | Native Rust |
+| `merrill.rs` | Reconstructed Sigma Merrill tone and RGB output kernels | SPP alignment |
+| `float_front.rs`, `float_front/repair.rs` | Merrill float gains, shading and ordered defect repair | SPP integration |
+| `spp_denoise.rs`, `spp_denoise/` | Native noise parameters, resampling, bilateral filters, residuals and tiling | SPP integration |
+| `process/spp.rs` | Per-conversion SPP metadata, float processing and color export | SPP integration |
 | `meta.rs` | `x3f_meta.c` (CAMF / property accessors) | M4a |
 | `print_meta.rs` | `x3f_print_meta.c` (tier-2-MD5-pinned text dump) | M4b |
 | `process.rs` | `x3f_process.c` master pipeline (preprocess, convert, expand, denoise) | M6e1–10 |
 | `quattro.rs` | Quattro 2×2 expansion (replaces M0 `exit(2)` stub) | M5a |
 | `denoise.rs` | pure-Rust NLM denoise (replaced the OpenCV `x3f_denoise.cpp`) | — |
-| `spatial_gain.rs` | `x3f_spatial_gain.c` | M6d |
+| `spatial_gain.rs` | `x3f_spatial_gain.c`; recovered Merrill table construction and interpolation | M6d + SPP alignment |
 | `sysabi.rs` | wasm32-unknown-unknown libc shim (allocator + no-op file I/O) | M8d-α |
 | `wasm_c_shims.rs` | Rust no-op shim for the variadic `x3f_printf` on wasm32 | M8d-α-2 |
 | `histogram_wasm_stub.rs`, `print_meta_wasm_stub.rs` | wasm32 fallbacks (no variadics) | M8d-α |
