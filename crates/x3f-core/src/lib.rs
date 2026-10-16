@@ -50,9 +50,7 @@ mod image;
 pub mod output;
 mod scene;
 mod x3i;
-mod x3i_merge;
-
-pub use x3i_merge::{merge, to_image, MergeOptions, MergeReport, MergedScene};
+pub mod x3i_merge;
 
 pub use conversion::{convert_file, ConversionReport, ConversionStage, OutputFormat};
 pub use globals::{
