@@ -79,6 +79,7 @@ pub(crate) fn write_controlled(
     on_write: &mut dyn FnMut(),
     warnings: &mut Vec<String>,
 ) -> Result<(), Error> {
+    let control = reader.with_control(control);
     control.check()?;
 
     if opts.spp_denoise {
@@ -724,8 +725,14 @@ impl Reader {
         }
         // Loading is required for the dimensions to be populated.
         // SAFETY: de is non-null.
-        let r = unsafe { x3f_sys::x3f_load_data(self.x3f.as_ptr(), de) };
-        if r != x3f_sys::x3f_return_e_X3F_OK {
+        let r = unsafe {
+            x3f_sys::load_data(
+                self.x3f.as_ptr(),
+                de,
+                self.with_control(x3f_sys::Control::none()),
+            )
+        };
+        if r.is_err() {
             return None;
         }
         // SAFETY: de is non-null and now loaded.
@@ -747,8 +754,14 @@ impl Reader {
             return None;
         }
         // SAFETY: de is non-null.
-        let r = unsafe { x3f_sys::x3f_load_data(self.x3f.as_ptr(), de) };
-        if r != x3f_sys::x3f_return_e_X3F_OK {
+        let r = unsafe {
+            x3f_sys::load_data(
+                self.x3f.as_ptr(),
+                de,
+                self.with_control(x3f_sys::Control::none()),
+            )
+        };
+        if r.is_err() {
             return None;
         }
         // SAFETY: de is non-null and loaded; .image_data.data points at

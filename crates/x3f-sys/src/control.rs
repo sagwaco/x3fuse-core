@@ -45,6 +45,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Clone, Copy, Default)]
 pub struct Control<'a> {
     cancel: Option<&'a AtomicBool>,
+    window: Option<(u64, u64)>,
     pub(crate) denoise_backend: crate::DenoiseBackend,
     pub(crate) denoise_options: crate::DenoiseOptions,
 }
@@ -53,6 +54,7 @@ impl<'a> Control<'a> {
     pub const fn new(cancel: &'a AtomicBool) -> Self {
         Self {
             cancel: Some(cancel),
+            window: None,
             denoise_backend: crate::DenoiseBackend::Auto,
             denoise_options: crate::DenoiseOptions::DEFAULT,
         }
@@ -60,6 +62,7 @@ impl<'a> Control<'a> {
     pub const fn none() -> Self {
         Self {
             cancel: None,
+            window: None,
             denoise_backend: crate::DenoiseBackend::Auto,
             denoise_options: crate::DenoiseOptions::DEFAULT,
         }
@@ -69,6 +72,16 @@ impl<'a> Control<'a> {
         self.denoise_backend = backend;
         self
     }
+    /// Restrict input reads to a frame at `base` with the given byte length.
+    pub const fn with_window(mut self, base: u64, length: u64) -> Self {
+        self.window = Some((base, length));
+        self
+    }
+
+    pub(crate) const fn window(self) -> Option<(u64, u64)> {
+        self.window
+    }
+
     pub fn check(self) -> Result<()> {
         if self.cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             Err(Error::Cancelled)
