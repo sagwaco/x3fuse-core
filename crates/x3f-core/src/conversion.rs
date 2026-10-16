@@ -77,6 +77,14 @@ pub fn convert_file(
     let result = (|| {
         on_stage(ConversionStage::Read);
         control.check()?;
+        if crate::is_x3i(input)? {
+            if format != OutputFormat::Dng {
+                return Err(Error::InvalidData(
+                    "X3I input supports DNG output only in this release".into(),
+                ));
+            }
+            return convert_x3i(input, output, options, control, &mut on_stage);
+        }
         let reader = Reader::open_with_control(input, control)?;
         let control = reader.with_control(control);
         on_stage(ConversionStage::Decode);
@@ -185,6 +193,95 @@ pub fn convert_file(
     result
 }
 
+fn convert_x3i(
+    input: &Path,
+    output: &Path,
+    options: &ProcessOptions,
+    control: Control<'_>,
+    on_stage: &mut impl FnMut(ConversionStage),
+) -> Result<ConversionReport, Error> {
+    use crate::{output::dng, x3i_merge, X3iContainer};
+
+    let container = X3iContainer::open(input)?;
+    let frame0 = container.open_frame(0)?;
+    let mut report = ConversionReport::default();
+    on_stage(ConversionStage::Decode);
+    let frame0_control = frame0.with_control(control);
+    frame0_control.check()?;
+    // SAFETY: frame0 owns these sections and its input window.
+    unsafe {
+        let x3f = frame0.x3f.as_ptr();
+        let property = sys::x3f_get_prop(x3f);
+        if !property.is_null() {
+            sys::load_data(x3f, property, frame0_control)?;
+        }
+        sys::load_data(x3f, sys::x3f_get_camf(x3f), frame0_control)?;
+        sys::load_data(x3f, sys::x3f_get_raw(x3f), frame0_control)?;
+    }
+    let inputs =
+        dng::WriterInputs::resolve(&frame0, options, frame0_control, &mut report.warnings)?;
+    let mut merge_options = x3i_merge::MergeOptions::from_env()?;
+    merge_options.process = inputs.opts.clone();
+    if options.denoise_intensity > 0 {
+        report
+            .warnings
+            .push("denoise is not applied to X3I merges yet".into());
+    }
+    merge_options.process.denoise_intensity = 0;
+    let scene = x3i_merge::merge(
+        container.frames().len(),
+        |i| {
+            on_stage(ConversionStage::Process);
+            control.check()?;
+            // Each reader applies its own window. Do not pass another frame's control.
+            let mut frame = if i == 0 {
+                frame0.merge_frame(&merge_options.process, control)?
+            } else {
+                container
+                    .open_frame(i)?
+                    .merge_frame(&merge_options.process, control)?
+            };
+            frame.frame_index = i;
+            Ok(frame)
+        },
+        &merge_options,
+        control,
+    )?;
+    for ((index, exposure), scale) in scene
+        .report
+        .frame_indices
+        .iter()
+        .zip(&scene.report.exposure_us)
+        .zip(&scene.report.scales)
+    {
+        report.warnings.push(format!(
+            "X3I frame {index}: shutter_us={exposure} scale={scale:.12}"
+        ));
+    }
+    report.warnings.push(format!(
+        "X3I merge: frames={} s={:.12} fallback_best_snr={} fallback_shortest={} fallback_zero={} clipped_samples={} minimum={:.17} maximum={:.17}",
+        scene.report.frames_used, scene.s, scene.report.fallback_best_snr,
+        scene.report.fallback_shortest, scene.report.fallback_zero, scene.report.clipped_samples,
+        scene.report.minimum, scene.report.maximum,
+    ));
+    report.warnings.extend(scene.report.warnings());
+    let image = x3i_merge::to_image(&scene)?;
+    drop(scene);
+    on_stage(ConversionStage::Write);
+    control.check()?;
+    dng::write_prepared(
+        &frame0,
+        inputs,
+        image,
+        output,
+        control,
+        &mut report.warnings,
+        true,
+    )?;
+    control.check()?;
+    Ok(report)
+}
+
 pub(crate) fn check_io(control: Control<'_>) -> io::Result<()> {
     control
         .check()
@@ -224,6 +321,42 @@ mod tests {
         }
         bytes.extend_from_slice(&directory.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn x3i_formats_fail_before_parsing_and_preserve_destinations() {
+        let input = std::env::temp_dir().join(format!("x3i-formats-{}.bin", std::process::id()));
+        let output = input.with_extension("out");
+        std::fs::write(&input, b"FOVi").unwrap();
+        let cancel = AtomicBool::new(false);
+        for format in [OutputFormat::Tiff, OutputFormat::Jpeg] {
+            let error = convert_file(
+                &input,
+                &output,
+                format,
+                &ProcessOptions::default(),
+                &cancel,
+                |_| {},
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, Error::InvalidData(ref message) if message == "X3I input supports DNG output only in this release")
+            );
+            assert!(!output.exists());
+        }
+        std::fs::write(&output, b"keep").unwrap();
+        assert!(convert_file(
+            &input,
+            &output,
+            OutputFormat::Dng,
+            &ProcessOptions::default(),
+            &cancel,
+            |_| panic!("reserved destination must fail first")
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"keep");
+        std::fs::remove_file(output).unwrap();
+        std::fs::remove_file(input).unwrap();
     }
 
     #[test]

@@ -101,6 +101,7 @@ impl WriterInputs {
         control: x3f_sys::Control<'_>,
         warnings: &mut Vec<String>,
     ) -> Result<Self, Error> {
+        let control = reader.with_control(control);
         control.check()?;
 
         if opts.spp_denoise {
@@ -156,6 +157,7 @@ pub(crate) fn write_prepared(
     warnings: &mut Vec<String>,
     prebuilt: bool,
 ) -> Result<(), Error> {
+    let control = reader.with_control(control);
     let WriterInputs {
         opts,
         wb,

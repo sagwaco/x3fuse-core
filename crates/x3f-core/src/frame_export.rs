@@ -12,6 +12,7 @@ impl Reader {
         options: &ProcessOptions,
         control: sys::Control<'_>,
     ) -> Result<sys::MergeFrame, Error> {
+        let control = self.with_control(control);
         control.check()?;
         if options.spp_denoise || options.denoise_intensity > 0 {
             return Err(Error::InvalidData(
@@ -193,6 +194,42 @@ mod tests {
                         (rgb - *expected as f64).abs()
                             <= 1e-4 * (*expected as f64).abs() + 4.0 * f32::EPSILON as f64 * scale
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_x3i_frame_applies_its_own_window() {
+        for name in ["DP0Q0002.X3I", "_DQH0978.X3I"] {
+            let Some(path) = corpus_file(name) else {
+                continue;
+            };
+            let container = crate::X3iContainer::open(path).unwrap();
+            let options = ProcessOptions {
+                denoise_intensity: 0,
+                ..Default::default()
+            };
+            for i in 0..container.frames().len() {
+                let frame = container
+                    .open_frame(i)
+                    .unwrap()
+                    .merge_frame(&options, sys::Control::none())
+                    .unwrap();
+                assert_eq!(
+                    frame.shutter_us,
+                    container.frame_exposure_us(i).unwrap(),
+                    "{name} frame {i}"
+                );
+                assert_eq!(frame.raw_half_width * 2, frame.width);
+                if i == 0 {
+                    let mut reader = container.open_frame(i).unwrap();
+                    reader.load_camf().unwrap();
+                    let shutter = reader.dng_camf_float("CaptureShutter").unwrap();
+                    let exp_time = reader.dng_camf_float("CaptureExpTime").unwrap();
+                    eprintln!("{name}: CaptureShutter={shutter} CaptureExpTime={exp_time}");
+                    assert_eq!(shutter.round() as u32, frame.shutter_us);
+                    assert_ne!(shutter, exp_time);
                 }
             }
         }

@@ -400,7 +400,7 @@ mod tests {
             &cancel,
             |_| {},
         );
-        assert!(result.unwrap_err().to_string().contains("X3iContainer"));
+        assert!(matches!(result, Err(Error::InvalidData(_))));
         assert!(!out.exists());
         std::fs::write(&out, b"keep").unwrap();
         assert!(crate::convert_file(
