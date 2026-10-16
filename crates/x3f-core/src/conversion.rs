@@ -261,6 +261,7 @@ mod tests {
             assert!(matches!(result, Err(Error::InvalidData(_))));
             assert!(!output.exists());
         }
+        drop(reader);
         let mut stages = Vec::new();
         convert_file(
             &input,
