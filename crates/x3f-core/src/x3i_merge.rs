@@ -390,12 +390,10 @@ pub fn merge(
                             .gain
                             .as_ref()
                             .map_or([1.0; 3], |g| [g[p * 3], g[p * 3 + 1], g[p * 3 + 2]]);
-                        // Mean squared chroma gain keeps channels 0 and 1 on one shared weight.
+                        // Sum the gained plane variances to keep one shared chroma weight.
                         let var = [
                             scale.powi(2)
-                                * (gain[0].powi(2) + gain[1].powi(2))
-                                * 0.5
-                                * (variance[0] + variance[1]),
+                                * (gain[0].powi(2) * variance[0] + gain[1].powi(2) * variance[1]),
                             scale.powi(2) * gain[2].powi(2) * variance[2],
                         ];
                         if var.iter().any(|v| !v.is_finite() || *v <= 0.0) {
@@ -674,6 +672,42 @@ mod tests {
             let expected = (0.2 * ratio + 0.6) / (ratio + 1.0);
             assert!(scene.bmt.iter().all(|v| (*v - expected).abs() < 1e-6));
             assert_eq!(scene.report.frame_indices, [10, 11]);
+        }
+    }
+
+    #[test]
+    fn chroma_variance_uses_each_planes_gain() {
+        let options = MergeOptions {
+            noise_k: [0.0; 3],
+            ..MergeOptions::default()
+        };
+        let scene = merge(
+            2,
+            |i| {
+                let mut f = frame(1000, 0.25);
+                f.sigma = if i == 0 {
+                    [0.01, 0.02, 0.01]
+                } else {
+                    [0.02, 0.01, 0.02]
+                };
+                let gain = if i == 0 {
+                    [2.0, 1.0, 1.0]
+                } else {
+                    [1.0, 3.0, 1.0]
+                };
+                f.gain = Some(gain.repeat(256));
+                f.bmt.fill(if i == 0 { 0.2 } else { 0.6 });
+                Ok(f)
+            },
+            &options,
+            Control::none(),
+        )
+        .unwrap();
+        let chroma = (0.2 * 1.625 + 0.6) / 2.625;
+        for pixel in scene.bmt.chunks(3) {
+            assert!((pixel[0] - chroma).abs() < 1e-6);
+            assert_eq!(pixel[0], pixel[1]);
+            assert!((pixel[2] - 0.28).abs() < 1e-6);
         }
     }
 
