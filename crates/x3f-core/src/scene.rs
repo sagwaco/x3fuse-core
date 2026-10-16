@@ -157,6 +157,7 @@ pub fn prepare_scene_linear(
     }
     on_stage(ConversionStage::Read);
     let reader = Reader::open_with_control(input, control)?;
+    let control = reader.with_control(control);
     on_stage(ConversionStage::Decode);
     control.check()?;
     // SAFETY: this call uniquely owns the fresh reader and all loaded sections.

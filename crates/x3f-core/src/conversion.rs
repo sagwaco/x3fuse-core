@@ -78,6 +78,7 @@ pub fn convert_file(
         on_stage(ConversionStage::Read);
         control.check()?;
         let reader = Reader::open_with_control(input, control)?;
+        let control = reader.with_control(control);
         on_stage(ConversionStage::Decode);
         control.check()?;
         let mut report = ConversionReport::default();

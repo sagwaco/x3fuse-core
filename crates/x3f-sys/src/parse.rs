@@ -41,6 +41,7 @@ pub(crate) fn checked_size(a: usize, b: usize) -> Result<usize> {
 
 pub(crate) struct Input<'a> {
     file: *mut libc::FILE,
+    base: u64,
     position: u64,
     end: u64,
     control: Control<'a>,
@@ -59,10 +60,15 @@ impl<'a> Input<'a> {
         if length < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
+        let (base, end) = control.window().unwrap_or((0, length as u64));
+        if base.checked_add(end).is_none_or(|end| end > length as u64) {
+            return Err(Error::InvalidData("window outside input"));
+        }
         let mut result = Self {
             file,
-            position: length as u64,
-            end: length as u64,
+            base,
+            position: end,
+            end,
             control,
         };
         result.seek(0)?;
@@ -84,7 +90,7 @@ impl<'a> Input<'a> {
         if position > self.end {
             return Err(Error::InvalidData("offset outside input"));
         }
-        let offset = libc::c_long::try_from(position)
+        let offset = libc::c_long::try_from(self.base + position)
             .map_err(|_| Error::InvalidData("input offset exceeds platform limits"))?;
         if unsafe { libc::fseek(self.file, offset, libc::SEEK_SET) } != 0 {
             return Err(std::io::Error::last_os_error().into());
@@ -181,5 +187,54 @@ pub(crate) fn cstr_at(data: &[u8], offset: usize) -> Result<()> {
         Ok(())
     } else {
         Err(Error::InvalidData("unterminated string"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_bound_positions_reads_and_section_limits() {
+        unsafe {
+            let file = libc::tmpfile();
+            assert!(!file.is_null());
+            let bytes = b"beforeFRAMEafter";
+            assert_eq!(
+                libc::fwrite(bytes.as_ptr().cast(), 1, bytes.len(), file),
+                bytes.len()
+            );
+            let mut input = Input::new(file, Control::none().with_window(6, 5)).unwrap();
+            assert_eq!(
+                (input.position(), input.end(), input.remaining()),
+                (0, 5, 5)
+            );
+            assert!(matches!(input.seek(6), Err(Error::InvalidData(_))));
+            assert!(matches!(input.limit(6), Err(Error::InvalidData(_))));
+            let mut data = [0; 6];
+            assert!(input.read(&mut data).is_err());
+            assert_eq!(input.position(), 0);
+            assert_eq!(libc::ftell(file), 6);
+            input.read(&mut data[..5]).unwrap();
+            assert_eq!(&data[..5], b"FRAME");
+            assert_eq!(input.remaining(), 0);
+            assert!(input.read(&mut data[..1]).is_err());
+            assert_eq!(libc::ftell(file), 11);
+            input.seek(1).unwrap();
+            input.limit(3).unwrap();
+            assert!(input.seek(4).is_err());
+            assert!(input.read(&mut data[..3]).is_err());
+            for (base, length) in [(6, 100), (u64::MAX, 1), (1, u64::MAX)] {
+                assert!(matches!(
+                    Input::new(file, Control::none().with_window(base, length)),
+                    Err(Error::InvalidData(_))
+                ));
+            }
+            let mut input = Input::new(file, Control::none()).unwrap();
+            assert_eq!(input.end(), bytes.len() as u64);
+            input.read(&mut data).unwrap();
+            assert_eq!(&data, b"before");
+            libc::fclose(file);
+        }
     }
 }

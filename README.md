@@ -82,6 +82,8 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 | `-jpg`       | embedded JPEG preview           |
 | `-raw`       | RAW area, undecoded             |
 | `-meta`      | metadata dump                   |
+| `-x3i-frame <n>` | Convert frame `n` of an X3I input (zero based). Append `_<n>` before the output extension. |
+| `-x3i-extract` | Copy all X3I frames to new `<stem>_<n>.X3F` files. Use `-o` to select a directory. Excludes output flags. |
 | `-histogram` | histogram CSV                   |
 | `-loghist`   | histogram CSV with log exposure |
 
