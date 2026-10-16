@@ -1,9 +1,21 @@
 //! Merge expanded X3I exposures in reference-frame camera units.
 //!
-//! Phase 1 does not exclude bad pixels because MergeFrame has no bad-pixel mask.
-//! The expansion quantises and clamps BMT to u16. It uses Y = min(4T, 65535)
-//! and floors the intermediate bias at zero. The dark roll-off is the only
-//! mitigation for these limits in this phase.
+//! With fix_bad enabled, the producer repairs samples before the footprint
+//! reads them. The snapshot uses the intermediate black and white levels.
+//! Its encoding clamps at zero, so it truncates negative noise. Expansion
+//! also quantises and clamps BMT to u16, including Y = min(4T, 65535).
+//! The merge applies no signal-dependent dark weight. Unsigned DNG encoding
+//! clamps negative merged samples to zero.
+//!
+//! Buffer budget for N expanded pixels. Producer scratch is additional:
+//! - Persistent: 3 weighted-sum, 2 weight, 3 fallback and 2 SNR f32 planes,
+//!   or 40N bytes. SNR stays f32 to preserve fallback candidate ordering.
+//! - One frame: 3 BMT and up to 3 gain f32 planes, or 24N bytes; N top and
+//!   N/2 half-plane u16 samples, or 3N bytes.
+//! - Footprint peak: one full and one half f32 plane, or 6N bytes. Erosion
+//!   reuses the full plane and one row. Accumulation retains one full plane.
+//!
+//! Gain is released after accumulation. Integration measures RSS on Quattro H.
 
 use rayon::prelude::*;
 use x3f_sys::{Control, MergeFrame};
@@ -21,15 +33,14 @@ pub struct MergeOptions {
     pub saturation_width: f32,
     /// Reject raw samples at or above one minus this margin.
     pub validity_margin: f32,
-    /// Read-noise multiplier for the quadratic near-black roll-off.
-    pub dark_sigma: f32,
     /// Placeholder coefficients. Phase 2 will fit these values from frame pairs.
     pub noise_k: [f32; 3],
     /// Quadratic raw-noise coefficients per plane.
     pub noise_q: [f32; 3],
     /// Override the measured read noise in all planes, in normalised raw units.
     pub noise_sigma: Option<f32>,
-    /// Minimum accumulated weight before a fallback. The default is 1e-3.
+    /// Minimum accumulated weight in inverse-variance units. The default is 1e-3.
+    /// Typical weights are 1e4 to 1e6. Fallback requires all weights near zero.
     pub w_min: f32,
     /// Optional safety limit in reference units. None preserves all headroom.
     pub max_s: Option<f32>,
@@ -42,7 +53,6 @@ impl Default for MergeOptions {
             saturation_knee: 0.9,
             saturation_width: 0.03,
             validity_margin: 0.02,
-            dark_sigma: 3.0,
             noise_k: [4e-5; 3],
             noise_q: [0.0; 3],
             noise_sigma: None,
@@ -95,8 +105,6 @@ impl MergeOptions {
             || self.saturation_width <= 0.0
             || !self.validity_margin.is_finite()
             || !(0.0..1.0).contains(&self.validity_margin)
-            || !self.dark_sigma.is_finite()
-            || self.dark_sigma < 0.0
             || !self.w_min.is_finite()
             || self.w_min <= 0.0
             || self
@@ -182,7 +190,7 @@ pub struct MergedScene {
     pub report: MergeReport,
 }
 
-fn validate_frame(frame: &MergeFrame, control: Control<'_>) -> Result<(), Error> {
+fn validate_frame(frame: &MergeFrame, control: Control<'_>) -> Result<[f64; 3], Error> {
     let pixels = (frame.width as usize).checked_mul(frame.height as usize);
     let samples = pixels.and_then(|n| n.checked_mul(3));
     if frame.width == 0
@@ -203,14 +211,20 @@ fn validate_frame(frame: &MergeFrame, control: Control<'_>) -> Result<(), Error>
                 || frame.raw_white[c] <= frame.raw_black[c]
                 || !frame.sigma[c].is_finite()
                 || frame.sigma[c] < 0.0
-                || !normalise(0, frame, c).is_finite()
-                || !normalise(u16::MAX, frame, c).is_finite()
         })
         || frame.camera_to_rgb.iter().any(|v| !v.is_finite())
     {
         return Err(Error::InvalidData(
             "invalid X3I frame layout or calibration".into(),
         ));
+    }
+    let factors = std::array::from_fn(|c| 1.0 / (frame.raw_white[c] - frame.raw_black[c]));
+    if (0..3).any(|c| {
+        !factors[c].is_finite()
+            || !normalise(0, frame.raw_black[c], factors[c]).is_finite()
+            || !normalise(u16::MAX, frame.raw_black[c], factors[c]).is_finite()
+    }) {
+        return Err(Error::InvalidData("invalid X3I normalisation range".into()));
     }
     for row in frame.bmt.chunks(frame.width as usize * 3) {
         control.check()?;
@@ -226,12 +240,11 @@ fn validate_frame(frame: &MergeFrame, control: Control<'_>) -> Result<(), Error>
             }
         }
     }
-    Ok(())
+    Ok(factors)
 }
 
-fn normalise(value: u16, frame: &MergeFrame, channel: usize) -> f32 {
-    ((value as f64 - frame.raw_black[channel])
-        / (frame.raw_white[channel] - frame.raw_black[channel])) as f32
+fn normalise(value: u16, black: f64, factor: f64) -> f32 {
+    ((value as f64 - black) * factor) as f32
 }
 
 fn taps(output: usize, size: usize) -> [usize; 4] {
@@ -248,7 +261,11 @@ fn taps(output: usize, size: usize) -> [usize; 4] {
 }
 
 /// Maximum normalised raw value over the exact expansion footprint.
-fn footprint_max(frame: &MergeFrame, control: Control<'_>) -> Result<Vec<f32>, Error> {
+fn footprint_max(
+    frame: &MergeFrame,
+    factors: [f64; 3],
+    control: Control<'_>,
+) -> Result<Vec<f32>, Error> {
     let width = frame.width as usize;
     let half_width = frame.raw_half_width as usize;
     let mut horizontal = vec![0.0f32; half_width * frame.raw_half_height as usize * 2];
@@ -260,17 +277,21 @@ fn footprint_max(frame: &MergeFrame, control: Control<'_>) -> Result<Vec<f32>, E
             for (x, value) in row.iter_mut().enumerate() {
                 *value = f32::NEG_INFINITY;
                 for sx in taps(x, half_width) {
-                    for c in 0..2 {
+                    for (c, factor) in factors.iter().enumerate().take(2) {
                         *value = value.max(normalise(
                             frame.raw_half[(y * half_width + sx) * 2 + c],
-                            frame,
-                            c,
+                            frame.raw_black[c],
+                            *factor,
                         ));
                     }
                     // The half-resolution T value sums this top-layer 2x2 block.
                     for ty in y * 2..y * 2 + 2 {
                         for tx in sx * 2..sx * 2 + 2 {
-                            *value = value.max(normalise(frame.raw_top[ty * width + tx], frame, 2));
+                            *value = value.max(normalise(
+                                frame.raw_top[ty * width + tx],
+                                frame.raw_black[2],
+                                factors[2],
+                            ));
                         }
                     }
                 }
@@ -284,7 +305,7 @@ fn footprint_max(frame: &MergeFrame, control: Control<'_>) -> Result<Vec<f32>, E
         .try_for_each(|(y, row)| -> Result<(), Error> {
             control.check()?;
             for (x, value) in row.iter_mut().enumerate() {
-                *value = normalise(frame.raw_top[y * width + x], frame, 2);
+                *value = normalise(frame.raw_top[y * width + x], frame.raw_black[2], factors[2]);
                 for sy in taps(y, frame.raw_half_height as usize) {
                     *value = value.max(horizontal[sy * width + x]);
                 }
@@ -295,28 +316,39 @@ fn footprint_max(frame: &MergeFrame, control: Control<'_>) -> Result<Vec<f32>, E
 }
 
 /// Erode validity and extend saturation maxima over the same 3x3 window.
-fn saturation_max(frame: &MergeFrame, control: Control<'_>) -> Result<Vec<f32>, Error> {
-    let footprint = footprint_max(frame, control)?;
+fn saturation_max(
+    frame: &MergeFrame,
+    factors: [f64; 3],
+    control: Control<'_>,
+) -> Result<Vec<f32>, Error> {
+    let mut footprint = footprint_max(frame, factors, control)?;
     let width = frame.width as usize;
-    let height = frame.height as usize;
-    let mut output = vec![0.0; footprint.len()];
-    output
+    footprint
         .par_chunks_mut(width)
-        .enumerate()
-        .try_for_each(|(y, row)| -> Result<(), Error> {
+        .try_for_each(|row| -> Result<(), Error> {
             control.check()?;
-            for (x, value) in row.iter_mut().enumerate() {
-                *value = f32::NEG_INFINITY;
-                // Clip the erosion window at the raster edge. Expansion taps reflect separately.
-                for sy in y.saturating_sub(1)..=(y + 1).min(height - 1) {
-                    for sx in x.saturating_sub(1)..=(x + 1).min(width - 1) {
-                        *value = value.max(footprint[sy * width + sx]);
-                    }
-                }
+            let mut left = row[0];
+            for x in 0..width {
+                let current = row[x];
+                row[x] = left.max(current).max(row[(x + 1).min(width - 1)]);
+                left = current;
             }
             Ok(())
         })?;
-    Ok(output)
+    let mut previous = vec![f32::NEG_INFINITY; width];
+    for y in 0..frame.height as usize {
+        control.check()?;
+        let (processed, remaining) = footprint.split_at_mut((y + 1) * width);
+        let row = &mut processed[y * width..];
+        for x in 0..width {
+            let current = row[x];
+            row[x] = previous[x]
+                .max(current)
+                .max(remaining.get(x).copied().unwrap_or(current));
+            previous[x] = current;
+        }
+    }
+    Ok(footprint)
 }
 
 /// Load and merge one exposure at a time. Frame zero defines reference units.
@@ -334,7 +366,7 @@ pub fn merge(
         ));
     }
     let reference = load(0)?;
-    validate_frame(&reference, control)?;
+    let reference_factors = validate_frame(&reference, control)?;
     let (width, height) = (reference.width, reference.height);
     let camera_to_rgb = reference.camera_to_rgb;
     let reference_us = reference.shutter_us;
@@ -349,19 +381,20 @@ pub fn merge(
     let mut first = Some(reference);
     for i in 0..frame_count {
         control.check()?;
-        let frame = if i == 0 {
-            first.take().unwrap()
+        let (mut frame, factors) = if i == 0 {
+            (first.take().unwrap(), reference_factors)
         } else {
-            load(i)?
+            let frame = load(i)?;
+            let factors = validate_frame(&frame, control)?;
+            (frame, factors)
         };
-        validate_frame(&frame, control)?;
         if (frame.width, frame.height) != (width, height) {
             return Err(Error::InvalidData(
                 "X3I frame dimensions differ from the reference".into(),
             ));
         }
         let scale = reference_us as f32 / frame.shutter_us as f32;
-        let d_max = saturation_max(&frame, control)?;
+        let d_max = saturation_max(&frame, factors, control)?;
         let sigma = options.noise_sigma.map_or(frame.sigma, |s| [s; 3]);
         let shortest = i == 0 || frame.shutter_us < shortest_us;
         sum.par_chunks_mut(width as usize * 3)
@@ -376,9 +409,9 @@ pub fn merge(
                         let p = y * width as usize + x;
                         let half = (y / 2 * frame.raw_half_width as usize + x / 2) * 2;
                         let r = [
-                            normalise(frame.raw_half[half], &frame, 0),
-                            normalise(frame.raw_half[half + 1], &frame, 1),
-                            normalise(frame.raw_top[p], &frame, 2),
+                            normalise(frame.raw_half[half], frame.raw_black[0], factors[0]),
+                            normalise(frame.raw_half[half + 1], frame.raw_black[1], factors[1]),
+                            normalise(frame.raw_top[p], frame.raw_black[2], factors[2]),
                         ];
                         let variance: [f32; 3] = std::array::from_fn(|c| {
                             (sigma[c] * sigma[c]
@@ -399,14 +432,11 @@ pub fn merge(
                         if var.iter().any(|v| !v.is_finite() || *v <= 0.0) {
                             return Err(Error::InvalidData("non-finite X3I variance".into()));
                         }
-                        let signal = [(r[0] + r[1]) * 0.5, r[2]];
                         let expected_signal = [
                             ((gain[0] * r[0].max(0.0)).powi(2) + (gain[1] * r[1].max(0.0)).powi(2))
                                 * 0.5,
                             (gain[2] * r[2].max(0.0)).powi(2),
                         ];
-                        let read_noise =
-                            [(sigma[0].powi(2) + sigma[1].powi(2)).sqrt() * 0.5, sigma[2]];
                         let valid = d_max[p] < 1.0 - options.validity_margin;
                         let sat = 1.0
                             / (1.0
@@ -414,13 +444,7 @@ pub fn merge(
                                     / options.saturation_width)
                                     .exp());
                         for group in 0..2 {
-                            let dark_limit = options.dark_sigma * read_noise[group];
-                            let dark = if dark_limit > 0.0 {
-                                (signal[group] / dark_limit).clamp(0.0, 1.0).powi(2)
-                            } else {
-                                1.0
-                            };
-                            let mut w = if valid { sat * dark / var[group] } else { 0.0 };
+                            let mut w = if valid { sat / var[group] } else { 0.0 };
                             if i == 0 && valid {
                                 w = w.max(1e-3);
                             }
@@ -442,6 +466,8 @@ pub fn merge(
                     Ok(())
                 },
             )?;
+        drop(frame.gain.take());
+        drop(d_max);
         shortest_us = shortest_us.min(frame.shutter_us);
         report.frames_used += 1;
         report.frame_indices.push(frame.frame_index);
@@ -610,6 +636,72 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_zero_scene_has_no_positive_selection_bias() {
+        let exposures = [1000, 125, 250, 500, 2000, 4000, 8000];
+        let pixels = 256 * 256;
+        let sigma = 0.01;
+        let mut seed = 42u64;
+        let mut uniform = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 11) as f64 + 0.5) / ((1u64 << 53) as f64)
+        };
+        let scene = merge(
+            exposures.len(),
+            |i| {
+                let mut f = frame(exposures[i], 0.0);
+                f.width = 256;
+                f.height = 256;
+                f.raw_half_width = 128;
+                f.raw_half_height = 128;
+                f.raw_black = [10000.0; 3];
+                f.raw_white = [50000.0; 3];
+                f.sigma = [sigma; 3];
+                f.raw_top = Vec::with_capacity(pixels);
+                f.bmt = Vec::with_capacity(pixels * 3);
+                for _ in 0..pixels {
+                    let gaussian =
+                        (-2.0 * uniform().ln()).sqrt() * (std::f64::consts::TAU * uniform()).cos();
+                    let value = gaussian as f32 * sigma;
+                    f.raw_top.push((10000.0 + value * 40000.0).round() as u16);
+                    // Keep signed floats to isolate weighting bias from the producer's zero clamp.
+                    f.bmt.extend([value; 3]);
+                }
+                f.raw_half = Vec::with_capacity(pixels / 2);
+                for y in 0..128 {
+                    for x in 0..128 {
+                        f.raw_half.extend([f.raw_top[y * 2 * 256 + x * 2]; 2]);
+                    }
+                }
+                Ok(f)
+            },
+            &MergeOptions {
+                noise_k: [0.0; 3],
+                ..MergeOptions::default()
+            },
+            Control::none(),
+        )
+        .unwrap();
+        let mean = scene
+            .bmt
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|p| f64::from(p[2]))
+            .sum::<f64>()
+            / pixels as f64;
+        let inverse_scale_squared: f64 = exposures
+            .iter()
+            .map(|us| (*us as f64 / 1000.0).powi(2))
+            .sum();
+        let standard_error = f64::from(sigma) / (inverse_scale_squared * pixels as f64).sqrt();
+        eprintln!("zero scene: mean {mean}, standard error {standard_error}");
+        assert!(
+            mean.abs() < 3.0 * standard_error,
+            "mean {mean}, standard error {standard_error}"
+        );
+    }
+
+    #[test]
     fn fallbacks_use_best_snr_then_shortest_and_count_samples() {
         let options = MergeOptions {
             w_min: f32::MAX,
@@ -752,8 +844,8 @@ mod tests {
         for (source, low, high) in [(4, 5, 12), (7, 11, 15), (0, 0, 4)] {
             let mut f = frame(1000, 0.25);
             f.raw_half[(source * 8 + source) * 2] = 10000;
-            let footprint = footprint_max(&f, Control::none()).unwrap();
-            let eroded = saturation_max(&f, Control::none()).unwrap();
+            let footprint = footprint_max(&f, [0.0001; 3], Control::none()).unwrap();
+            let eroded = saturation_max(&f, [0.0001; 3], Control::none()).unwrap();
             for y in 0..16 {
                 for x in 0..16 {
                     assert_eq!(
@@ -771,12 +863,12 @@ mod tests {
         }
         let mut f = frame(1000, 0.25);
         f.raw_top[8 * 16 + 8] = 10000;
-        let eroded = saturation_max(&f, Control::none()).unwrap();
+        let eroded = saturation_max(&f, [0.0001; 3], Control::none()).unwrap();
         let mut half_invalid = frame(1000, 0.25);
         half_invalid.raw_half[(4 * 8 + 4) * 2] = 10000;
         assert_eq!(
             eroded,
-            saturation_max(&half_invalid, Control::none()).unwrap()
+            saturation_max(&half_invalid, [0.0001; 3], Control::none()).unwrap()
         );
     }
 
