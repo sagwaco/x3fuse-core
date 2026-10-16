@@ -35,6 +35,7 @@ use std::ptr::NonNull;
 
 use thiserror::Error;
 use x3f_sys as sys;
+pub use x3f_sys::MergeFrame;
 pub use x3f_sys::{ColorMode, DenoiseAlgorithm, DenoiseBackend, DenoiseOptions, NlmOptions};
 // Shadow the external libc crate with x3f-sys's compat shim. On every
 // target except wasm32-unknown-unknown this is `pub use libc::*;`; on
