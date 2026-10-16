@@ -52,6 +52,8 @@ mod scene;
 mod x3i;
 mod x3i_merge;
 
+pub use x3i_merge::{merge, to_image, MergeOptions, MergeReport, MergedScene};
+
 pub use conversion::{convert_file, ConversionReport, ConversionStage, OutputFormat};
 pub use globals::{
     set_log_callback, set_max_printed_matrix_elements, set_offset_legacy, set_verbosity,
