@@ -2,7 +2,9 @@
 //!
 //! With fix_bad enabled, the producer repairs samples before the footprint
 //! reads them. The snapshot uses the intermediate black and white levels.
-//! Its encoding clamps at zero, so it truncates negative noise. Expansion
+//! With the real producer, r is bounded below by minus the intermediate bias
+//! fraction, so zero sigma cannot produce a negative variance.
+//! The intermediate encoding clamps at zero, so it truncates negative noise. Expansion
 //! also quantises and clamps BMT to u16, including Y = min(4T, 65535).
 //! The merge applies no signal-dependent dark weight. Unsigned DNG encoding
 //! clamps negative merged samples to zero.
@@ -640,8 +642,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn gaussian_zero_scene_has_no_positive_selection_bias() {
+    fn gaussian_zero_scene_means(options: &MergeOptions) -> ([f64; 3], f64) {
         let exposures = [1000, 125, 250, 500, 2000, 4000, 8000];
         let pixels = 256 * 256;
         let sigma = 0.01;
@@ -679,31 +680,62 @@ mod tests {
                 }
                 Ok(f)
             },
-            &MergeOptions {
-                noise_k: [0.0; 3],
-                ..MergeOptions::default()
-            },
+            options,
             Control::none(),
         )
         .unwrap();
-        let mean = scene
-            .bmt
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .map(|p| f64::from(p[2]))
-            .sum::<f64>()
-            / pixels as f64;
+        let means = std::array::from_fn(|c| {
+            scene
+                .bmt
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|p| f64::from(p[c]))
+                .sum::<f64>()
+                / pixels as f64
+        });
         let inverse_scale_squared: f64 = exposures
             .iter()
             .map(|us| (*us as f64 / 1000.0).powi(2))
             .sum();
         let standard_error = f64::from(sigma) / (inverse_scale_squared * pixels as f64).sqrt();
+        (means, standard_error)
+    }
+
+    #[test]
+    fn gaussian_zero_scene_has_no_positive_selection_bias() {
+        let ([_, _, mean], standard_error) = gaussian_zero_scene_means(&MergeOptions {
+            noise_k: [0.0; 3],
+            ..MergeOptions::default()
+        });
         eprintln!("zero scene: mean {mean}, standard error {standard_error}");
         assert!(
             mean.abs() < 3.0 * standard_error,
             "mean {mean}, standard error {standard_error}"
         );
+    }
+
+    #[test]
+    fn default_noise_model_zero_scene_has_bounded_negative_bias() {
+        let options = MergeOptions::default();
+        let (means, standard_error) = gaussian_zero_scene_means(&options);
+        let (read_noise_means, _) = gaussian_zero_scene_means(&MergeOptions {
+            noise_k: [0.0; 3],
+            ..options.clone()
+        });
+        for c in 0..3 {
+            // Sample-dependent variance adds a small negative bias of order k in frame units.
+            let bias = means[c] - read_noise_means[c];
+            // The largest exposure scale is 8, which converts this bound to reference units.
+            let reference_bias_bound = 8.0 * f64::from(options.noise_k[c]);
+            eprintln!(
+                "default zero scene: channel {c}, mean {}, bias {bias}",
+                means[c]
+            );
+            assert!(bias < 0.0 && bias > -reference_bias_bound);
+            assert!(means[c] > -reference_bias_bound - 3.0 * standard_error);
+            assert!(means[c] < 3.0 * standard_error);
+        }
     }
 
     #[test]
@@ -846,22 +878,28 @@ mod tests {
 
     #[test]
     fn footprint_and_erosion_follow_bicubic_taps_and_reflected_borders() {
-        for (source, low, high) in [(4, 5, 12), (7, 11, 15), (0, 0, 4)] {
+        for (source_x, source_y, x_range, y_range) in [
+            (4, 4, 5usize..=12, 5usize..=12),
+            (7, 7, 11..=15, 11..=15),
+            (0, 0, 0..=4, 0..=4),
+            (2, 6, 0..=8, 9..=15),
+        ] {
             let mut f = frame(1000, 0.25);
-            f.raw_half[(source * 8 + source) * 2] = 10000;
+            f.raw_half[(source_y * 8 + source_x) * 2] = 10000;
             let footprint = footprint_max(&f, [0.0001; 3], Control::none()).unwrap();
             let eroded = saturation_max(&f, [0.0001; 3], Control::none()).unwrap();
+            let eroded_x = x_range.start().saturating_sub(1)..=(x_range.end() + 1).min(15);
+            let eroded_y = y_range.start().saturating_sub(1)..=(y_range.end() + 1).min(15);
             for y in 0..16 {
                 for x in 0..16 {
                     assert_eq!(
                         footprint[y * 16 + x] >= 0.98,
-                        (low..=high).contains(&x) && (low..=high).contains(&y),
-                        "source {source}, ({x},{y})"
+                        x_range.contains(&x) && y_range.contains(&y),
+                        "source ({source_x},{source_y}), output ({x},{y})"
                     );
-                    let range = low.saturating_sub(1)..=(high + 1).min(15);
                     assert_eq!(
                         eroded[y * 16 + x] >= 0.98,
-                        range.contains(&x) && range.contains(&y)
+                        eroded_x.contains(&x) && eroded_y.contains(&y)
                     );
                 }
             }
