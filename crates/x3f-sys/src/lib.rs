@@ -199,6 +199,8 @@ pub(crate) mod spp_denoise;
 // recovery family. preprocess_data / convert_data / convert entry
 // points remain C until later phases.
 mod color_modes;
+mod merge_frame;
+pub use merge_frame::MergeFrame;
 mod process;
 pub use color_modes::{
     available_color_modes, color_mode_linear_tone_lut, color_mode_tone_index, color_mode_tone_lut,

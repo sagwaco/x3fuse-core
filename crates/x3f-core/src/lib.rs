@@ -43,11 +43,14 @@ pub use x3f_sys::{ColorMode, DenoiseAlgorithm, DenoiseBackend, DenoiseOptions, N
 use x3f_sys::sysabi as libc;
 
 mod conversion;
+mod frame_export;
 mod globals;
 mod icc;
 mod image;
 pub mod output;
 mod scene;
+mod x3i;
+mod x3i_merge;
 
 pub use conversion::{convert_file, ConversionReport, ConversionStage, OutputFormat};
 pub use globals::{
