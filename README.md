@@ -75,7 +75,7 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 
 | Flag         | Output                          |
 | ------------ | ------------------------------- |
-| `-dng`       | DNG `LinearRaw` (**default**)   |
+| `-dng`       | DNG `LinearRaw` (**default**). Merge all frames for X3I input.   |
 | `-tiff`      | 3×16-bit TIFF                   |
 | `-ppm`       | 3×16-bit PPM/P6 (binary)        |
 | `-ppm-ascii` | 3×16-bit PPM/P3 (ASCII)         |
@@ -83,6 +83,7 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 | `-raw`       | RAW area, undecoded             |
 | `-meta`      | metadata dump                   |
 | `-x3i-frame <n>` | Convert frame `n` of an X3I input (zero based). Append `_<n>` before the output extension. |
+| `-x3i-report` | With X3I `-dng`, write raw-plane ratios, noise, clipping, merge counts and peak RSS to `<input>.x3i-report`. |
 | `-x3i-extract` | Copy all X3I frames to new `<stem>_<n>.X3F` files. Use `-o` to select a directory. Excludes output flags. |
 | `-histogram` | histogram CSV                   |
 | `-loghist`   | histogram CSV with log exposure |

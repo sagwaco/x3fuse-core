@@ -6,6 +6,8 @@
 //! subcommand layout will be introduced in a later milestone after the test
 //! harness stabilises in M2.
 
+mod x3i_report;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -47,6 +49,7 @@ impl FileType {
 struct Args {
     x3i_frame: Option<usize>,
     x3i_extract: bool,
+    x3i_report: bool,
     output_explicit: bool,
     extract_jpg: bool,
     extract_raw: bool,
@@ -88,6 +91,7 @@ impl Default for Args {
         Self {
             x3i_frame: None,
             x3i_extract: false,
+            x3i_report: false,
             output_explicit: false,
             extract_jpg: false,
             extract_raw: true,
@@ -127,6 +131,7 @@ fn usage(progname: &str) -> ! {
          \x20  -o <DIR>        Use <DIR> as output directory\n\
          \x20  -v              Verbose output for debugging\n\
          \x20  -q              Suppress all messages except errors\n\
+         \x20  -x3i-report     Write X3I radiometry and peak RSS beside the DNG\n\
          \x20  -x3i-frame <n>  Convert X3I frame n (zero based)\n\
          \x20  -x3i-extract    Copy all X3I frames to new X3F files\n\
          ONE OFF THE FORMAT SWITCHWES\n\
@@ -263,6 +268,7 @@ fn parse_args(argv: &[String]) -> Args {
                 );
             }
             "-x3i-extract" => args.x3i_extract = true,
+            "-x3i-report" => args.x3i_report = true,
             "-jpg" => {
                 reset(&mut args);
                 args.extract_jpg = true;
@@ -474,14 +480,19 @@ fn normalize(args: &mut Args) {
 
 /// Reject unsupported flag combinations. Check X3I inputs by their magic.
 fn validate_args(args: &Args) -> Result<(), String> {
+    if args.x3i_report
+        && (args.file_type != FileType::Dng || args.x3i_frame.is_some() || args.x3i_extract)
+    {
+        return Err("-x3i-report requires an X3I merge with -dng".into());
+    }
     if args.x3i_extract && (args.output_explicit || args.x3i_frame.is_some()) {
         return Err("-x3i-extract cannot combine with output flags or -x3i-frame".into());
     }
-    if args.x3i_frame.is_some() || args.x3i_extract || args.spp_denoise {
+    if args.x3i_frame.is_some() || args.x3i_extract || args.x3i_report || args.spp_denoise {
         for path in &args.files {
             match is_x3i(path) {
                 Ok(x3i) => validate_x3i_input(args, x3i)?,
-                Err(error) if args.x3i_frame.is_some() || args.x3i_extract => {
+                Err(error) if args.x3i_frame.is_some() || args.x3i_extract || args.x3i_report => {
                     return Err(format!("{}: {error}", path.display()));
                 }
                 // The conversion reports ordinary input errors as before.
@@ -551,8 +562,8 @@ fn validate_args(args: &Args) -> Result<(), String> {
 }
 
 fn validate_x3i_input(args: &Args, x3i: bool) -> Result<(), String> {
-    if !x3i && (args.x3i_frame.is_some() || args.x3i_extract) {
-        return Err("-x3i-frame and -x3i-extract require an X3I input".into());
+    if !x3i && (args.x3i_frame.is_some() || args.x3i_extract || args.x3i_report) {
+        return Err("-x3i-frame, -x3i-extract and -x3i-report require an X3I input".into());
     }
     if x3i && args.spp_denoise {
         return Err("-spp-pipeline does not support X3I input".into());
@@ -595,6 +606,25 @@ fn make_paths(infile: &Path, outdir: Option<&Path>, ext: &str) -> (PathBuf, Path
 }
 
 fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
+    let opts = ProcessOptions {
+        color_encoding: args.color_encoding,
+        color_mode: args.color_mode,
+        crop: args.crop,
+        fix_bad: args.fix_bad,
+        denoise_intensity: args.denoise_intensity,
+        denoise_backend: args.denoise_backend,
+        spp_denoise: args.spp_denoise,
+        rgb_chroma_lut: args.rgb_chroma_lut,
+        denoise_options: args.denoise_options,
+        apply_sgain: args.apply_sgain,
+        wb: args.wb.clone(),
+        compress: args.compress,
+        opcodes_dir: args.opcodes_dir.clone(),
+        dng_highlight_recovery: args.dng_highlight_recovery,
+        dng_highlight_mapping: args.dng_highlight_mapping,
+        cineon: args.cineon,
+    };
+
     let container =
         if is_x3i(infile).map_err(|e| format!("could not open `{}`: {e}", infile.display()))? {
             Some(X3iContainer::open(infile).map_err(|e| e.to_string())?)
@@ -617,6 +647,48 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
         }
         return Ok(());
+    }
+    if let (Some(container), None) = (&container, args.x3i_frame) {
+        if args.file_type == FileType::Dng {
+            let (tmpfile, outfile) = make_paths(infile, args.outdir.as_deref(), ".dng");
+            let _ = std::fs::remove_file(&tmpfile);
+            let report = x3f_core::convert_file(
+                infile,
+                &tmpfile,
+                x3f_core::OutputFormat::Dng,
+                &opts,
+                &std::sync::atomic::AtomicBool::new(false),
+                |_| {},
+            )
+            .map_err(|e| e.to_string())?;
+            for warning in &report.warnings {
+                eprintln!("{warning}");
+            }
+            if args.x3i_report {
+                let (report_tmp, report_out) =
+                    make_paths(infile, args.outdir.as_deref(), ".x3i-report");
+                let _ = std::fs::remove_file(&report_tmp);
+                let result = (|| {
+                    let mut text = x3i_report::radiometry(container, &opts)?;
+                    for line in &report.warnings {
+                        text.push_str(line);
+                        text.push('\n');
+                    }
+                    text.push_str(&x3i_report::peak_rss()?);
+                    std::fs::write(&report_tmp, text).map_err(|e| e.to_string())?;
+                    std::fs::rename(&report_tmp, &report_out).map_err(|e| e.to_string())
+                })();
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&tmpfile);
+                    let _ = std::fs::remove_file(&report_tmp);
+                }
+                result?;
+            }
+            return std::fs::rename(&tmpfile, &outfile).map_err(|e| e.to_string());
+        }
+        if args.file_type != FileType::Meta {
+            return Err("X3I input: use -dng, -x3i-frame <n>, -x3i-extract or -meta".into());
+        }
     }
     let mut table = String::new();
     let mut reader = match (&container, args.x3i_frame, args.file_type) {
@@ -643,7 +715,7 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
             table.push('\n');
             container.open_frame(0)
         }
-        (Some(_), None, _) => return Err("X3I input: use -x3i-frame <n> or -x3i-extract".into()),
+        (Some(_), None, _) => unreachable!("X3I merge handled above"),
         _ => Reader::open(infile),
     }
     .map_err(|e| format!("could not open `{}`: {e}", infile.display()))?;
@@ -697,25 +769,6 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
     // Match legacy behavior: unlink the temp first so we never write through
     // a stale file from a previous failed run.
     let _ = std::fs::remove_file(&tmpfile);
-
-    let opts = ProcessOptions {
-        color_encoding: args.color_encoding,
-        color_mode: args.color_mode,
-        crop: args.crop,
-        fix_bad: args.fix_bad,
-        denoise_intensity: args.denoise_intensity,
-        denoise_backend: args.denoise_backend,
-        spp_denoise: args.spp_denoise,
-        rgb_chroma_lut: args.rgb_chroma_lut,
-        denoise_options: args.denoise_options,
-        apply_sgain: args.apply_sgain,
-        wb: args.wb.clone(),
-        compress: args.compress,
-        opcodes_dir: args.opcodes_dir.clone(),
-        dng_highlight_recovery: args.dng_highlight_recovery,
-        dng_highlight_mapping: args.dng_highlight_mapping,
-        cineon: args.cineon,
-    };
 
     let result = match args.file_type {
         FileType::Meta => reader.dump_meta(&tmpfile),
@@ -858,6 +911,40 @@ mod tests {
         for flags in [vec!["-x3i-frame", "0", name], vec!["-x3i-extract", name]] {
             assert!(validate_args(&parse(&flags)).unwrap_err().contains("X3I"));
         }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn x3i_report_requires_a_whole_container_dng() {
+        let path =
+            std::env::temp_dir().join(format!("x3i-report-flags-{}.bin", std::process::id()));
+        std::fs::write(&path, b"FOVi").unwrap();
+        let name = path.to_str().unwrap();
+        for flags in [vec!["-x3i-report", name], vec!["-dng", "-x3i-report", name]] {
+            let args = parse(&flags);
+            assert!(args.x3i_report);
+            assert!(validate_args(&args).is_ok());
+        }
+        for flag in [
+            "-meta",
+            "-jpg",
+            "-raw",
+            "-tiff",
+            "-ppm",
+            "-ppm-ascii",
+            "-histogram",
+            "-x3i-extract",
+        ] {
+            assert!(
+                validate_args(&parse(&[flag, "-x3i-report", name])).is_err(),
+                "{flag}"
+            );
+        }
+        assert!(validate_args(&parse(&["-x3i-frame", "0", "-x3i-report", name])).is_err());
+        std::fs::write(&path, b"FOVb").unwrap();
+        assert!(validate_args(&parse(&["-x3i-report", name]))
+            .unwrap_err()
+            .contains("X3I"));
         std::fs::remove_file(path).unwrap();
     }
 
