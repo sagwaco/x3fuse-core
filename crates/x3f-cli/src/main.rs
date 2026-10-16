@@ -9,7 +9,10 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use x3f_core::{set_max_printed_matrix_elements, set_offset_legacy, set_verbosity};
+use x3f_core::{
+    frame_ev, is_x3i, set_max_printed_matrix_elements, set_offset_legacy, set_verbosity,
+    X3iContainer,
+};
 use x3f_core::{ColorEncoding, ColorMode, DngHighlightMapping, ProcessOptions, Reader, Verbosity};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -42,6 +45,9 @@ impl FileType {
 
 #[derive(Debug)]
 struct Args {
+    x3i_frame: Option<usize>,
+    x3i_extract: bool,
+    output_explicit: bool,
     extract_jpg: bool,
     extract_raw: bool,
     extract_unconverted_raw: bool,
@@ -80,6 +86,9 @@ struct Args {
 impl Default for Args {
     fn default() -> Self {
         Self {
+            x3i_frame: None,
+            x3i_extract: false,
+            output_explicit: false,
             extract_jpg: false,
             extract_raw: true,
             extract_unconverted_raw: false,
@@ -118,6 +127,8 @@ fn usage(progname: &str) -> ! {
          \x20  -o <DIR>        Use <DIR> as output directory\n\
          \x20  -v              Verbose output for debugging\n\
          \x20  -q              Suppress all messages except errors\n\
+         \x20  -x3i-frame <n>  Convert X3I frame n (zero based)\n\
+         \x20  -x3i-extract    Copy all X3I frames to new X3F files\n\
          ONE OFF THE FORMAT SWITCHWES\n\
          \x20  -meta           Dump metadata\n\
          \x20  -jpg            Dump embedded JPEG\n\
@@ -237,11 +248,21 @@ fn parse_args(argv: &[String]) -> Args {
         let a = argv[i].as_str();
         // Reset closure for the format flags' Z-macro behaviour.
         let reset = |args: &mut Args| {
+            args.output_explicit = true;
             args.extract_jpg = false;
             args.extract_raw = false;
             args.extract_unconverted_raw = false;
         };
         match a {
+            "-x3i-frame" => {
+                i += 1;
+                args.x3i_frame = Some(
+                    argv.get(i)
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or_else(|| usage(progname)),
+                );
+            }
+            "-x3i-extract" => args.x3i_extract = true,
             "-jpg" => {
                 reset(&mut args);
                 args.extract_jpg = true;
@@ -451,11 +472,23 @@ fn normalize(args: &mut Args) {
     }
 }
 
-/// Reject argument combinations that the pipeline cannot honour. Returns
-/// `Err` with a human-readable message; the caller turns that into a
-/// usage()-style exit. Kept as a pure function so the unit tests can
-/// exercise it without `process::exit`.
+/// Reject unsupported flag combinations. Check X3I inputs by their magic.
 fn validate_args(args: &Args) -> Result<(), String> {
+    if args.x3i_extract && (args.output_explicit || args.x3i_frame.is_some()) {
+        return Err("-x3i-extract cannot combine with output flags or -x3i-frame".into());
+    }
+    if args.x3i_frame.is_some() || args.x3i_extract || args.spp_denoise {
+        for path in &args.files {
+            match is_x3i(path) {
+                Ok(x3i) => validate_x3i_input(args, x3i)?,
+                Err(error) if args.x3i_frame.is_some() || args.x3i_extract => {
+                    return Err(format!("{}: {error}", path.display()));
+                }
+                // The conversion reports ordinary input errors as before.
+                Err(_) => {}
+            }
+        }
+    }
     if args.color_mode.is_some() {
         if !matches!(args.file_type, FileType::Tiff | FileType::Dng) {
             return Err("-color-mode requires color TIFF or DNG output".into());
@@ -517,6 +550,16 @@ fn validate_args(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_x3i_input(args: &Args, x3i: bool) -> Result<(), String> {
+    if !x3i && (args.x3i_frame.is_some() || args.x3i_extract) {
+        return Err("-x3i-frame and -x3i-extract require an X3I input".into());
+    }
+    if x3i && args.spp_denoise {
+        return Err("-spp-pipeline does not support X3I input".into());
+    }
+    Ok(())
+}
+
 /// Produce `(tmpfile, outfile)` paths from an input filename, replicating
 /// the legacy `make_paths()` exactly.
 ///
@@ -552,8 +595,58 @@ fn make_paths(infile: &Path, outdir: Option<&Path>, ext: &str) -> (PathBuf, Path
 }
 
 fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
-    let mut reader =
-        Reader::open(infile).map_err(|e| format!("could not open `{}`: {e}", infile.display()))?;
+    let container =
+        if is_x3i(infile).map_err(|e| format!("could not open `{}`: {e}", infile.display()))? {
+            Some(X3iContainer::open(infile).map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
+    if args.x3i_extract {
+        let container = container
+            .as_ref()
+            .ok_or("-x3i-extract requires an X3I input")?;
+        let directory = args
+            .outdir
+            .as_deref()
+            .unwrap_or_else(|| infile.parent().unwrap_or(Path::new(".")));
+        for index in 0..container.frames().len() {
+            let mut name = infile.file_stem().unwrap_or_default().to_os_string();
+            name.push(format!("_{index}.X3F"));
+            container
+                .extract_frame(index, &directory.join(name))
+                .map_err(|e| e.to_string())?;
+        }
+        return Ok(());
+    }
+    let mut table = String::new();
+    let mut reader = match (&container, args.x3i_frame, args.file_type) {
+        (Some(container), Some(index), _) => container.open_frame(index),
+        (Some(container), None, FileType::Meta) => {
+            table.push_str("X3I frames\nindex offset length exposure_us EV\n");
+            let reference = container.frame_exposure_us(0).ok();
+            for (index, entry) in container.frames().iter().enumerate() {
+                let us = if index == 0 {
+                    reference
+                } else {
+                    container.frame_exposure_us(index).ok()
+                };
+                let ev = reference
+                    .zip(us)
+                    .map(|(reference, us)| format!("{:+.6}", frame_ev(reference, us)))
+                    .unwrap_or_else(|| "-".into());
+                let exposure = us.map(|us| us.to_string()).unwrap_or_else(|| "-".into());
+                table.push_str(&format!(
+                    "{index} {} {} {exposure} {ev}\n",
+                    entry.offset, entry.length
+                ));
+            }
+            table.push('\n');
+            container.open_frame(0)
+        }
+        (Some(_), None, _) => return Err("X3I input: use -x3i-frame <n> or -x3i-extract".into()),
+        _ => Reader::open(infile),
+    }
+    .map_err(|e| format!("could not open `{}`: {e}", infile.display()))?;
 
     if args.extract_jpg {
         reader.load_thumbnail_jpeg().map_err(|e| {
@@ -595,7 +688,11 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
         })?;
     }
 
-    let (tmpfile, outfile) = make_paths(infile, args.outdir.as_deref(), args.file_type.extension());
+    let extension = match args.x3i_frame {
+        Some(index) => format!("_{index}{}", args.file_type.extension()),
+        None => args.file_type.extension().to_string(),
+    };
+    let (tmpfile, outfile) = make_paths(infile, args.outdir.as_deref(), &extension);
 
     // Match legacy behavior: unlink the temp first so we never write through
     // a stale file from a previous failed run.
@@ -632,6 +729,12 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
     };
 
     result.map_err(|e| format!("could not dump to `{}`: {e}", tmpfile.display()))?;
+    if !table.is_empty() {
+        let metadata = std::fs::read(&tmpfile).map_err(|e| e.to_string())?;
+        let mut text = table.into_bytes();
+        text.extend(metadata);
+        std::fs::write(&tmpfile, text).map_err(|e| e.to_string())?;
+    }
     std::fs::rename(&tmpfile, &outfile).map_err(|e| {
         format!(
             "could not rename `{}` to `{}`: {e}",
@@ -709,6 +812,53 @@ mod tests {
         let mut argv = vec!["x3f_extract".to_string()];
         argv.extend(args.iter().map(|s| s.to_string()));
         parse_args(&argv)
+    }
+
+    #[test]
+    fn x3i_flags_validate_input_magic_and_output_combinations() {
+        let path = std::env::temp_dir().join(format!("x3i-cli-flags-{}.bin", std::process::id()));
+        std::fs::write(&path, b"FOVi").unwrap();
+        let name = path.to_str().unwrap();
+        for format in [
+            "-meta",
+            "-jpg",
+            "-raw",
+            "-tiff",
+            "-dng",
+            "-ppm-ascii",
+            "-ppm",
+            "-histogram",
+            "-loghist",
+        ] {
+            let args = parse(&[format, "-x3i-frame", "2", name]);
+            assert_eq!(args.x3i_frame, Some(2));
+            assert!(validate_args(&args).is_ok(), "{format}");
+            for flags in [
+                vec![format, "-x3i-extract", name],
+                vec!["-x3i-extract", format, name],
+            ] {
+                assert!(validate_args(&parse(&flags)).is_err(), "{flags:?}");
+            }
+        }
+        for flags in [
+            vec!["-x3i-extract", name],
+            vec!["-x3i-frame", "0", name],
+            vec!["-meta", name],
+        ] {
+            assert!(validate_args(&parse(&flags)).is_ok());
+        }
+        assert!(validate_args(&parse(&["-x3i-frame", "0", "-x3i-extract", name])).is_err());
+        assert!(validate_args(&parse(&["-tiff", "-spp-pipeline", name]))
+            .unwrap_err()
+            .contains("X3I"));
+        assert!(
+            validate_args(&parse(&["-tiff", "-spp-pipeline", "-x3i-frame", "0", name])).is_err()
+        );
+        std::fs::write(&path, b"FOVb").unwrap();
+        for flags in [vec!["-x3i-frame", "0", name], vec!["-x3i-extract", name]] {
+            assert!(validate_args(&parse(&flags)).unwrap_err().contains("X3I"));
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
