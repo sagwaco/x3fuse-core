@@ -228,7 +228,7 @@ fn convert_x3i(
             .push("denoise is not applied to X3I merges yet".into());
     }
     merge_options.process.denoise_intensity = 0;
-    let scene = x3i_merge::merge(
+    let mut scene = x3i_merge::merge(
         container.frames().len(),
         |i| {
             on_stage(ConversionStage::Process);
@@ -247,6 +247,9 @@ fn convert_x3i(
         &merge_options,
         control,
     )?;
+    if let Some(active) = frame0.dng_active_area_for_size(scene.height, scene.width) {
+        x3i_merge::mask_to_active_area(&mut scene, active, control)?;
+    }
     for ((index, exposure), scale) in scene
         .report
         .frame_indices

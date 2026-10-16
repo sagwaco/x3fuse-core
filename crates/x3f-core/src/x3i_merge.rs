@@ -531,6 +531,37 @@ pub fn merge(
     })
 }
 
+/// Exclude unwritten borders from the encoding range. Invalid crops use the full raster.
+pub(crate) fn mask_to_active_area(
+    scene: &mut MergedScene,
+    [top, left, bottom, right]: [u32; 4],
+    control: Control<'_>,
+) -> Result<(), Error> {
+    if bottom <= top || right <= left || bottom > scene.height || right > scene.width {
+        return Ok(());
+    }
+    let mut minimum = f32::INFINITY;
+    let mut maximum = f32::NEG_INFINITY;
+    for (y, row) in scene.bmt.chunks_mut(scene.width as usize * 3).enumerate() {
+        control.check()?;
+        if y < top as usize || y >= bottom as usize {
+            row.fill(0.0);
+        } else {
+            row[..left as usize * 3].fill(0.0);
+            row[right as usize * 3..].fill(0.0);
+        }
+        for &value in row.iter() {
+            minimum = minimum.min(value);
+            maximum = maximum.max(value);
+        }
+    }
+    scene.s = f64::from(maximum).max(1.0);
+    scene.report.s = scene.s;
+    scene.report.minimum = minimum;
+    scene.report.maximum = maximum;
+    Ok(())
+}
+
 /// Encode camera samples as unsigned linear DNG samples. Negative values become zero.
 pub fn to_image(scene: &MergedScene) -> Result<Image, Error> {
     let stride = scene.width.checked_mul(3);
@@ -596,6 +627,35 @@ mod tests {
             camera_to_rgb: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             ..MergeFrame::default()
         }
+    }
+
+    #[test]
+    fn masked_border_cannot_set_the_written_encoding_scale() {
+        let mut scene = merge(
+            1,
+            |_| Ok(frame(1000, 2.0)),
+            &MergeOptions::default(),
+            Control::none(),
+        )
+        .unwrap();
+        scene.bmt.fill(2.0);
+        scene.bmt[..16 * 3].fill(100.0);
+        scene.s = 100.0;
+        mask_to_active_area(&mut scene, [1, 2, 14, 13], Control::none()).unwrap();
+        assert_eq!(scene.s, 2.0);
+        assert_eq!(scene.report.s, 2.0);
+        assert_eq!(scene.report.maximum, 2.0);
+        let image = to_image(&scene).unwrap();
+        assert!(image.data[..16 * 3].iter().all(|&v| v == 0));
+        assert_eq!(image.data[(2 * 16 + 3) * 3], 65535);
+        let before = scene.bmt.clone();
+        mask_to_active_area(&mut scene, [0, 0, 17, 16], Control::none()).unwrap();
+        assert_eq!(scene.bmt, before);
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        assert!(matches!(
+            mask_to_active_area(&mut scene, [1, 2, 14, 13], Control::new(&cancel)),
+            Err(Error::Cancelled)
+        ));
     }
 
     #[test]
