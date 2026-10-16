@@ -51,7 +51,7 @@ mod image;
 pub mod output;
 mod scene;
 mod x3i;
-mod x3i_merge;
+pub mod x3i_merge;
 
 pub use conversion::{convert_file, ConversionReport, ConversionStage, OutputFormat};
 pub use globals::{

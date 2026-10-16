@@ -1844,3 +1844,160 @@ fn write_color_mode_camera_fixtures() {
     std::fs::write(destination.join("sdk-pixel-probes.tsv"), probes).unwrap();
     std::fs::write(destination.join("profiles.tsv"), names).unwrap();
 }
+
+#[test]
+fn prebuilt_x3i_scale_preserves_raw_and_disables_preview_gain() {
+    let corpus = std::env::var_os("X3F_TEST_FILES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../x3f_test_files"));
+    let input = corpus.join("_SDI8284.X3F");
+    if !input.is_file() {
+        eprintln!("skip: missing _SDI8284.X3F for the prebuilt DNG check");
+        return;
+    }
+    let reader = loaded_reader(&input);
+    let control = x3f_sys::Control::none();
+    let source_opts = crate::ProcessOptions {
+        denoise_intensity: 0,
+        apply_sgain: Some(false),
+        ..Default::default()
+    };
+    let source_inputs =
+        super::super::WriterInputs::resolve(&reader, &source_opts, control, &mut Vec::new())
+            .unwrap();
+    let source = reader
+        .get_image_with_control(&source_inputs.opts, control)
+        .unwrap();
+    drop(reader);
+    let destination = std::env::temp_dir().join(format!("x3f-prebuilt-{}", std::process::id()));
+    std::fs::create_dir_all(&destination).unwrap();
+    let mut outputs = Vec::new();
+    let mut baselines = Vec::new();
+    for (i, scale, gain) in [(0, 1.0, false), (1, 4.0, false), (2, 4.0, true)] {
+        let opts = crate::ProcessOptions {
+            denoise_intensity: 0,
+            apply_sgain: Some(gain),
+            ..Default::default()
+        };
+        let reader = loaded_reader(&input);
+        let inputs =
+            super::super::WriterInputs::resolve(&reader, &opts, control, &mut Vec::new()).unwrap();
+        // Keep the same raster in all runs. Only writer settings and S differ.
+        let image = crate::Image {
+            data: source.data.clone(),
+            dng_highlight_scale: scale,
+            ..source
+        };
+        let path = destination.join(format!("{i}.dng"));
+        super::super::write_prepared(
+            &reader,
+            inputs,
+            image,
+            &path,
+            control,
+            &mut Vec::new(),
+            true,
+        )
+        .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let root_offset = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let root = directory(&bytes, 0, root_offset, Order::Little);
+        baselines.push(root[&t::BASELINE_EXPOSURE].rationals()[0]);
+        outputs.push(bytes);
+        std::fs::remove_file(path).unwrap();
+    }
+    fn raw_strips(bytes: &[u8]) -> Vec<&[u8]> {
+        let primary = root(bytes);
+        let raw = directory(
+            bytes,
+            0,
+            primary[&t::SUB_IFDS].longs()[0] as usize,
+            Order::Little,
+        );
+        raw[&t::STRIP_OFFSETS]
+            .longs()
+            .into_iter()
+            .zip(raw[&t::STRIP_BYTE_COUNTS].longs())
+            .map(|(offset, count)| &bytes[offset as usize..(offset + count) as usize])
+            .collect()
+    }
+    assert_eq!(raw_strips(&outputs[0]), raw_strips(&outputs[1]));
+    assert_eq!(baselines[1] - baselines[0], 4.0f64.log2());
+    assert_eq!(
+        outputs[1], outputs[2],
+        "prebuilt preview applied spatial gain twice"
+    );
+    std::fs::remove_dir(destination).unwrap();
+}
+
+#[test]
+fn prebuilt_color_mode_uses_extended_scale_for_profile_and_preview() {
+    let corpus = std::env::var_os("X3F_TEST_FILES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../x3f_test_files"));
+    let input = corpus.join("_SDI8284.X3F");
+    if !input.is_file() {
+        eprintln!("skip: missing _SDI8284.X3F for the prebuilt Color Mode check");
+        return;
+    }
+    let destination =
+        std::env::temp_dir().join(format!("x3f-prebuilt-mode-{}", std::process::id()));
+    std::fs::create_dir_all(&destination).unwrap();
+    let mut outputs = Vec::new();
+    for (i, scale) in [1.0, 4.0].into_iter().enumerate() {
+        let reader = loaded_reader(&input);
+        let opts = crate::ProcessOptions {
+            color_mode: Some(x3f_sys::ColorMode::Standard),
+            denoise_intensity: 0,
+            apply_sgain: Some(true),
+            ..Default::default()
+        };
+        let control = x3f_sys::Control::none();
+        let inputs =
+            super::super::WriterInputs::resolve(&reader, &opts, control, &mut Vec::new()).unwrap();
+        let image = crate::Image {
+            data: vec![512; 16 * 16 * 3],
+            rows: 16,
+            columns: 16,
+            channels: 3,
+            row_stride: 48,
+            levels: crate::ImageLevels {
+                black: [0.0; 3],
+                white: [65535; 3],
+            },
+            dng_highlight_scale: scale,
+            dng_shoulder_ceiling: 1.0,
+        };
+        let path = destination.join(format!("{i}.dng"));
+        super::super::write_prepared(
+            &reader,
+            inputs,
+            image,
+            &path,
+            control,
+            &mut Vec::new(),
+            true,
+        )
+        .unwrap();
+        outputs.push(std::fs::read(&path).unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
+    assert_eq!(decoded_raw(&outputs[0]), decoded_raw(&outputs[1]));
+    let first = root(&outputs[0]);
+    let extended = root(&outputs[1]);
+    assert_eq!(
+        extended[&t::BASELINE_EXPOSURE].rationals()[0]
+            - first[&t::BASELINE_EXPOSURE].rationals()[0],
+        2.0
+    );
+    let preview = |bytes: &[u8], root: &BTreeMap<u16, Entry<'_>>| {
+        let offset = root[&t::STRIP_OFFSETS].longs()[0] as usize;
+        let count = root[&t::STRIP_BYTE_COUNTS].longs()[0] as usize;
+        bytes[offset..offset + count].to_vec()
+    };
+    assert_ne!(
+        preview(&outputs[0], &first),
+        preview(&outputs[1], &extended)
+    );
+    std::fs::remove_dir(destination).unwrap();
+}
