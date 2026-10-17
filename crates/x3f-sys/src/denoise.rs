@@ -1228,6 +1228,48 @@ unsafe fn yuv_to_bmt(area: *mut Area16, dt: DType) {
 // process.rs and the two Quattro passes in quattro.rs).
 // ----------------------------------------------------------------------
 
+/// Denoise a Quattro BMT raster with the selected backend and options.
+/// Width and height use pixels. Row stride uses u16 samples.
+/// Zero scale leaves samples unchanged.
+/// Cancellation leaves the input unchanged.
+pub fn denoise_u16(
+    data: &mut [u16],
+    width: u32,
+    height: u32,
+    channels: u32,
+    row_stride: u32,
+    scale: f32,
+    control: Control<'_>,
+) -> crate::Result<()> {
+    control.check()?;
+    let logical = width.checked_mul(channels);
+    let length = (height as usize).checked_mul(row_stride as usize);
+    if width == 0
+        || height == 0
+        || channels != 3
+        || logical.is_none_or(|n| n > row_stride)
+        || length != Some(data.len())
+        || !scale.is_finite()
+        || scale < 0.0
+    {
+        return Err(crate::Error::InvalidData("invalid u16 denoise raster"));
+    }
+    control
+        .denoise_options
+        .validate()
+        .map_err(crate::Error::InvalidData)?;
+    let mut area = Area16 {
+        data: data.as_mut_ptr(),
+        buf: std::ptr::null_mut(),
+        rows: height,
+        columns: width,
+        channels,
+        row_stride,
+    };
+    // SAFETY: the checks above cover each row. The kernel does not free this buffer.
+    unsafe { denoise_area_controlled(&mut area, DENOISE_F23, scale, control) }
+}
+
 /// BMT→YUV, full `denoise_nlm`, YUV→BMT (was the OpenCV `x3f_denoise`).
 ///
 /// # Safety
@@ -1344,6 +1386,47 @@ pub(crate) unsafe fn denoise_active_area(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn u16_bridge_validates_and_preserves_cancelled_or_disabled_input() {
+        use std::sync::atomic::AtomicBool;
+        let source: Vec<u16> = (0..8 * 8 * 3)
+            .map(|i| 3000 + (i * 71 % 200) as u16)
+            .collect();
+        let control = Control::none().with_denoise_backend(DenoiseBackend::Cpu);
+        let mut data = source.clone();
+        denoise_u16(&mut data, 8, 8, 3, 24, 0.0, control).unwrap();
+        assert_eq!(data, source);
+        for algorithm in [DenoiseAlgorithm::Nlm, DenoiseAlgorithm::Bm3d] {
+            let options = DenoiseOptions {
+                algorithm,
+                ..Default::default()
+            };
+            let selected = control.with_denoise_options(options).unwrap();
+            denoise_u16(&mut data, 8, 8, 3, 24, 0.3, selected).unwrap();
+            assert!(data.iter().all(|&v| (1000..6000).contains(&v)));
+        }
+        let before = data.clone();
+        let cancel = AtomicBool::new(true);
+        assert!(matches!(
+            denoise_u16(&mut data, 8, 8, 3, 24, 0.3, Control::new(&cancel)),
+            Err(crate::Error::Cancelled)
+        ));
+        assert_eq!(data, before);
+        for (width, height, channels, stride) in [
+            (0, 8, 3, 24),
+            (8, 0, 3, 24),
+            (8, 8, 2, 24),
+            (9, 8, 3, 24),
+            (8, 9, 3, 24),
+        ] {
+            assert!(matches!(
+                denoise_u16(&mut data, width, height, channels, stride, 0.3, control),
+                Err(crate::Error::InvalidData(_))
+            ));
+        }
+        assert!(denoise_u16(&mut data, 8, 8, 3, 24, f32::NAN, control).is_err());
+    }
 
     #[test]
     fn advanced_settings_validate_and_disabled_planes_are_exact() {
