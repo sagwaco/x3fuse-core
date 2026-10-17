@@ -731,11 +731,26 @@ fn raw(frame: &MergeFrame, plane: usize, p: usize) -> f32 {
     )
 }
 
-fn paired(p: usize, width: usize, height: usize, dx: isize, dy: isize) -> Option<usize> {
-    // The transform maps source coordinates to the reference grid.
-    let x = (p % width) as isize - dx;
-    let y = (p / width) as isize - dy;
-    (x >= 0 && y >= 0 && x < width as isize && y < height as isize)
+// Nearest source sample of plane sample p. B/M use divisor 2 and block centres 2h + 0.5.
+fn paired(
+    p: usize,
+    width: usize,
+    height: usize,
+    alignment: &Alignment,
+    divisor: usize,
+) -> Option<usize> {
+    let centre = (divisor - 1) as f32 * 0.5;
+    let rx = (p % width * divisor) as f32 + centre;
+    let ry = (p / width * divisor) as f32 + centre;
+    let [sx, sy] = alignment.source_at(rx, ry);
+    let x = (p % width) as isize - ((rx - sx) / divisor as f32).round() as isize;
+    let y = (p / width) as isize - ((ry - sy) / divisor as f32).round() as isize;
+    (sx.is_finite()
+        && sy.is_finite()
+        && x >= 0
+        && y >= 0
+        && x < width as isize
+        && y < height as isize)
         .then(|| y as usize * width + x as usize)
 }
 
@@ -752,14 +767,12 @@ fn ratio_fit(
         let divisor = if c == 2 { 1 } else { 2 };
         let width = reference.width as usize / divisor;
         let height = reference.height as usize / divisor;
-        let dx = (alignment.dx / divisor as f32).round() as isize;
-        let dy = (alignment.dy / divisor as f32).round() as isize;
         let mut ratios = Vec::new();
         for y in 0..height {
             control.check()?;
             for x in ((y % 3)..width).step_by(3) {
                 let p = y * width + x;
-                let Some(q) = paired(p, width, height, dx, dy) else {
+                let Some(q) = paired(p, width, height, alignment, divisor) else {
                     continue;
                 };
                 let a = raw(reference, c, p);
@@ -823,13 +836,7 @@ fn refined_ratio(
         for x in ((y % 3)..a.width as usize).step_by(3) {
             let p = y * a.width as usize + x;
             let level = raw(reference, 2, p) / ceiling;
-            let Some(source) = paired(
-                p,
-                b.width as usize,
-                b.height as usize,
-                alignment.dx.round() as isize,
-                alignment.dy.round() as isize,
-            ) else {
+            let Some(source) = paired(p, b.width as usize, b.height as usize, alignment, 1) else {
                 continue;
             };
             if raw(frame, 2, source) > minimum_frame
@@ -960,8 +967,6 @@ fn noise_fit(
         let divisor = if c == 2 { 1 } else { 2 };
         let width = reference.width as usize / divisor;
         let height = reference.height as usize / divisor;
-        let dx = (alignment.dx / divisor as f32).round() as isize;
-        let dy = (alignment.dy / divisor as f32).round() as isize;
         let read0 = options.noise_sigma.unwrap_or(reference.sigma[c]).powi(2);
         let read1 = options.noise_sigma.unwrap_or(frame.sigma[c]).powi(2);
         let mut fits = Vec::new();
@@ -973,7 +978,7 @@ fn noise_fit(
                 let mut valid = true;
                 for j in 0..64 {
                     let p = (y + j / 8) * width + x + j % 8;
-                    let Some(q) = paired(p, width, height, dx, dy) else {
+                    let Some(q) = paired(p, width, height, alignment, divisor) else {
                         valid = false;
                         break;
                     };
@@ -1137,13 +1142,7 @@ fn calibration_blocks(
             let mut valid = true;
             for j in 0..64 {
                 let p = (y + j / 8) * width + x + j % 8;
-                let Some(q) = paired(
-                    p,
-                    width,
-                    height,
-                    alignment.dx.round() as isize,
-                    alignment.dy.round() as isize,
-                ) else {
+                let Some(q) = paired(p, width, height, alignment, 1) else {
                     valid = false;
                     break;
                 };
@@ -1577,22 +1576,12 @@ pub fn merge(
                 .collect::<Vec<_>>();
         }
         let alignment = &report.alignments[i];
-        let dx = if alignment.skipped {
-            0
-        } else {
-            alignment.dx.round() as isize
-        };
-        let dy = if alignment.skipped {
-            0
-        } else {
-            alignment.dy.round() as isize
-        };
         let cutoff = 10.0 * options.noise_sigma.unwrap_or(frame.sigma[2]);
         let above_black: Vec<_> = if options.ghost_rejection {
             (0..pixels)
                 .map(|p| {
                     u8::from(
-                        paired(p, width as usize, height as usize, dx, dy)
+                        paired(p, width as usize, height as usize, alignment, 1)
                             .is_some_and(|q| raw(&frame, 2, q) > cutoff),
                     )
                 })
@@ -2794,8 +2783,8 @@ mod tests {
                                 yy * scene.width as usize + xx,
                                 scene.width as usize,
                                 scene.height as usize,
-                                alignment.dx.round() as isize,
-                                alignment.dy.round() as isize,
+                                alignment,
+                                1,
                             ) {
                                 raw_sum += raw(&frame, 2, p);
                                 count += 1;
@@ -2814,14 +2803,8 @@ mod tests {
                                     building_levels
                                         .push(raw(&frame, 2, p) / fitted.saturation.unwrap()[2]);
                                 }
-                                paired(
-                                    p,
-                                    scene.width as usize,
-                                    scene.height as usize,
-                                    alignment.dx.round() as isize,
-                                    alignment.dy.round() as isize,
-                                )
-                                .map_or(0.0, |q| raw(&frame, 2, q) / frame.sigma[2])
+                                paired(p, scene.width as usize, scene.height as usize, alignment, 1)
+                                    .map_or(0.0, |q| raw(&frame, 2, q) / frame.sigma[2])
                             })
                             .collect()
                     } else {
@@ -3015,9 +2998,82 @@ mod tests {
 
     #[test]
     fn integer_pairing_uses_source_to_reference_shift_and_excludes_borders() {
-        assert_eq!(paired(5 * 16 + 7, 16, 16, 2, -1), Some(6 * 16 + 5));
-        assert_eq!(paired(5 * 16 + 1, 16, 16, 2, 0), None);
-        assert_eq!(paired(15 * 16 + 7, 16, 16, 0, -1), None);
+        assert_eq!(
+            paired(
+                5 * 16 + 7,
+                16,
+                16,
+                &Alignment {
+                    dx: 2.0,
+                    dy: -1.0,
+                    ..Default::default()
+                },
+                1
+            ),
+            Some(6 * 16 + 5)
+        );
+        assert_eq!(
+            paired(
+                5 * 16 + 1,
+                16,
+                16,
+                &Alignment {
+                    dx: 2.0,
+                    ..Default::default()
+                },
+                1
+            ),
+            None
+        );
+        assert_eq!(
+            paired(
+                15 * 16 + 7,
+                16,
+                16,
+                &Alignment {
+                    dy: -1.0,
+                    ..Default::default()
+                },
+                1
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn raw_pairs_follow_similarity_and_skipped_alignment() {
+        let alignment = Alignment {
+            dx: 10.0,
+            dy: 8.0,
+            similarity: Some([1.0, -0.01, 12.0, 0.01, 1.0, 3.0]),
+            ..Default::default()
+        };
+        for divisor in [1, 2] {
+            let width = 2048 / divisor;
+            for p in [0, width - 1, width * (width - 1), width * width - 1] {
+                assert_eq!(
+                    paired(p, width, width, &Alignment::default(), divisor),
+                    Some(p)
+                );
+            }
+            for (x, y) in [(100, 100), (900, 100), (100, 900), (900, 900)] {
+                let centre = (divisor - 1) as f32 * 0.5;
+                let u = (x * divisor) as f32 + centre - 12.0;
+                let v = (y * divisor) as f32 + centre - 3.0;
+                let sx = ((u + 0.01 * v) / 1.0001 - centre) / divisor as f32;
+                let sy = ((v - 0.01 * u) / 1.0001 - centre) / divisor as f32;
+                let expected = sy.round() as usize * width + sx.round() as usize;
+                assert_eq!(
+                    paired(y * width + x, width, width, &alignment, divisor),
+                    Some(expected)
+                );
+            }
+        }
+        let skipped = Alignment {
+            skipped: true,
+            ..alignment
+        };
+        assert_eq!(paired(0, 2048, 2048, &skipped, 1), Some(0));
     }
 
     #[test]

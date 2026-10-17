@@ -132,7 +132,9 @@ knee. At least two clean bins must qualify. A trend above 2 percent across
 those bins, or a scale change above 0.3 EV, keeps the nominal shutter ratio.
 
 Raw reference/+1 EV frame pairs provide separate B, M and T shot-noise fits
-from flat 8x8 blocks. Each fit needs 50 blocks; otherwise its default or
+from flat 8x8 blocks. Raw pairs use the image warp's inverse transform and
+the nearest source sample. Half-resolution pairs use the centres of their
+2x2 blocks. Each fit needs 50 blocks; otherwise its default or
 explicit override remains. Effective variance fixes `c_ref=1` and calibrates
 separate T and B/M corrections from at least 50 flat blocks above ten read
 sigmas in both frames. Corrections stay in `[0.5,4]`. A reference model term
