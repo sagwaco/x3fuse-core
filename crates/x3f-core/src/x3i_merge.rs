@@ -4,6 +4,9 @@
 //! reads them. The snapshot uses the intermediate black and white levels.
 //! With the real producer, r is bounded below by minus the intermediate bias
 //! fraction, so zero sigma cannot produce a negative variance.
+//! Noise uses r = (sample - raw_black) / (raw_white - raw_black).
+//! Validity and saturation roll-off use d = r / saturation[plane].
+//! A measured sensor ceiling below the CAMF white changes only d, not noise units.
 //! The intermediate encoding clamps at zero, so it truncates negative noise. Expansion
 //! also quantises and clamps BMT to u16, including Y = min(4T, 65535).
 //! The merge applies no signal-dependent dark weight. Unsigned DNG encoding
@@ -422,7 +425,9 @@ pub fn merge(
             ));
         }
         let scale = reference_us as f32 / frame.shutter_us as f32;
-        let d_max = saturation_max(&frame, factors, control)?;
+        let ceilings = options.saturation.unwrap_or([1.0; 3]);
+        let saturation_factors = std::array::from_fn(|c| factors[c] / f64::from(ceilings[c]));
+        let d_max = saturation_max(&frame, saturation_factors, control)?;
         let sigma = options.noise_sigma.map_or(frame.sigma, |s| [s; 3]);
         let shortest = i == 0 || frame.shutter_us < shortest_us;
         sum.par_chunks_mut(width as usize * 3)
@@ -648,6 +653,38 @@ mod tests {
             camera_to_rgb: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             ..MergeFrame::default()
         }
+    }
+
+    #[test]
+    fn a_subwhite_sensor_plateau_does_not_suppress_bright_samples() {
+        let load = |i: usize| {
+            let mut f = frame([1000, 125, 8000][i], 0.3);
+            let value = (0.3 * f.shutter_us as f32 / 1000.0).min(0.45);
+            f.bmt.fill(value);
+            f.raw_top.fill((value * 10000.0).round() as u16);
+            f.raw_half.fill((value * 10000.0).round() as u16);
+            Ok(f)
+        };
+        let options = MergeOptions {
+            saturation: Some([0.45; 3]),
+            ..Default::default()
+        };
+        let fixed = merge(3, load, &options, Control::none()).unwrap();
+        assert!(fixed.bmt.iter().all(|v| (*v - 0.3).abs() < 1e-5));
+        let capped = merge(3, load, &MergeOptions::default(), Control::none()).unwrap();
+        assert!(capped.bmt.iter().all(|v| *v < 0.15));
+        // One is the old ceiling. It must preserve both signal and noise weighting.
+        let explicit_default = merge(
+            3,
+            load,
+            &MergeOptions {
+                saturation: Some([1.0; 3]),
+                ..Default::default()
+            },
+            Control::none(),
+        )
+        .unwrap();
+        assert_eq!(capped.bmt, explicit_default.bmt);
     }
 
     #[test]
