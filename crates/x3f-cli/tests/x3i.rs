@@ -243,7 +243,7 @@ fn corpus_dng_merge_writes_seven_frame_report() {
             let expected = common::file_md5(&dng);
             // This float output hash was recorded on macOS aarch64.
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            assert_eq!(expected, "2a48ebc1cd41e937923e3e78d542c368");
+            assert_eq!(expected, "494b455d3286dfdc1c5243ad60a31284");
             let report_path = scratch.0.join(format!("{name}.x3i-report"));
             std::fs::remove_file(&report_path).unwrap();
             std::fs::create_dir(&report_path).unwrap();
@@ -266,6 +266,88 @@ fn corpus_dng_merge_writes_seven_frame_report() {
             );
             assert!(!scratch.0.join(format!("{name}.dng.tmp")).exists());
             assert!(!scratch.0.join(format!("{name}.x3i-report.tmp")).exists());
+        } else {
+            run(
+                &input,
+                &scratch.0,
+                &["-dng", "-no-denoise", "-x3i-frame", "0"],
+            );
+            let (merged, exposure) = raw_dng(&scratch.0.join(format!("{name}.dng")));
+            let (reference, reference_exposure) = raw_dng(&scratch.0.join(format!("{name}_0.dng")));
+            assert_eq!(merged.len(), reference.len());
+            let scale = (exposure - reference_exposure).exp2();
+            assert!(scale > 1.0);
+            let mut values: [Vec<u16>; 3] = Default::default();
+            let mut refs: [Vec<u16>; 3] = Default::default();
+            for (pixel, reference) in merged
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .zip(reference.as_chunks::<3>().0)
+            {
+                // This band contains the curtain pixels affected by the soft shoulder.
+                if (0.08..=0.11).contains(&(f64::from(reference[0]) / 65535.0)) {
+                    for c in 0..3 {
+                        values[c].push(pixel[c]);
+                        refs[c].push(reference[c]);
+                    }
+                }
+            }
+            assert!(values[0].len() > 1000, "missing curtain region");
+            let median = |values: &mut [u16]| {
+                let n = values.len();
+                let (left, centre, _) = values.select_nth_unstable(n / 2);
+                if n.is_multiple_of(2) {
+                    (f64::from(*centre) + f64::from(*left.iter().max().unwrap())) * 0.5
+                } else {
+                    f64::from(*centre)
+                }
+            };
+            for c in 0..3 {
+                let ratio = scale * median(&mut values[c]) / median(&mut refs[c]);
+                assert!((ratio - 1.0).abs() < 0.01, "curtain channel {c}: {ratio}");
+            }
         }
     }
+}
+
+fn raw_dng(path: &Path) -> (Vec<u16>, f64) {
+    use tiff::decoder::{ifd::Value, Decoder};
+    use tiff::tags::Tag;
+
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(&bytes[..2], b"II");
+    let mut decoder = Decoder::new(std::io::Cursor::new(&bytes)).unwrap();
+    let Value::SRational(numerator, denominator) = decoder.get_tag(Tag::Unknown(50730)).unwrap()
+    else {
+        panic!("expected signed rational BaselineExposure");
+    };
+    let pointer = decoder
+        .get_tag(Tag::SubIfd)
+        .unwrap()
+        .into_ifd_pointer()
+        .unwrap();
+    let directory = decoder.read_directory(pointer).unwrap();
+    let mut tags = decoder.read_directory_tags(&directory);
+    assert_eq!(tags.get_tag_u32(Tag::Compression).unwrap(), 1);
+    assert_eq!(tags.get_tag_u16_vec(Tag::BitsPerSample).unwrap(), [16; 3]);
+    let width = tags.get_tag_u32(Tag::ImageWidth).unwrap() as usize;
+    let height = tags.get_tag_u32(Tag::ImageLength).unwrap() as usize;
+    let offsets = tags.get_tag_u32_vec(Tag::StripOffsets).unwrap();
+    let counts = tags.get_tag_u32_vec(Tag::StripByteCounts).unwrap();
+    assert_eq!(offsets.len(), counts.len());
+    let mut pixels = Vec::with_capacity(width * height * 3);
+    for (offset, count) in offsets.into_iter().zip(counts) {
+        let strip = &bytes[offset as usize..offset as usize + count as usize];
+        assert!(strip.len().is_multiple_of(2));
+        pixels.extend(
+            strip
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&v| u16::from_le_bytes(v)),
+        );
+    }
+    assert_eq!(pixels.len(), width * height * 3);
+    (pixels, f64::from(numerator) / f64::from(denominator))
 }

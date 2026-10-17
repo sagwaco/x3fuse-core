@@ -7,6 +7,17 @@
 //! Noise uses r = (sample - raw_black) / (raw_white - raw_black).
 //! Validity and saturation roll-off use d = r / saturation[plane].
 //! A measured sensor ceiling below the CAMF white changes only d, not noise units.
+//! Samples near the physical ceiling can already have a compressed response.
+//! The default knee of 0.75 and width of 0.02 reduce their weight before the
+//! validity cut at 0.85. At the cut, the logistic weight is 0.006693.
+//! Even a 64-fold exposure weight gives only 0.4284 of the reference weight.
+//! The hard cut excludes the compressed pile near 0.94 to 0.97 of the ceiling.
+//! The sample tables in _local/STATUS-shoulder.md use this acceptance rule:
+//! raw agreement within 1 percent per bin, and for bins outside that tolerance
+//! a weighted-bias allowance of at most 0.2 percent. Sub-1-percent whole-frame
+//! offsets are exposure ratio errors for phase 2 ratio refinement.
+//! At d = 0.825, the +1 EV frame has at most 0.144 percent weighted bias.
+//! X3F_X3I_ROLLOFF=knee,width,margin overrides these research settings.
 //! A flat wall in an unsaturated frame can also pass the ceiling pile test.
 //! shortcut: no cross-frame ceiling check, phase 2 must require the second-longest
 //! frame's ceiling to agree within 2 percent before accepting the estimate.
@@ -40,11 +51,11 @@ use crate::{Error, Image, ImageLevels, ProcessOptions};
 pub struct MergeOptions {
     /// Processing settings for frame preparation and DNG output.
     pub process: ProcessOptions,
-    /// Normalised raw value at the saturation roll-off midpoint.
+    /// Fraction of the physical ceiling at the saturation roll-off midpoint.
     pub saturation_knee: f32,
-    /// Width of the logistic saturation roll-off.
+    /// Width of the logistic saturation roll-off, as a fraction of the ceiling.
     pub saturation_width: f32,
-    /// Reject raw samples at or above one minus this margin.
+    /// Reject samples at or above one minus this margin of the ceiling.
     pub validity_margin: f32,
     /// Physical ceilings in raw-range units. None uses one in all planes.
     pub saturation: Option<[f32; 3]>,
@@ -65,9 +76,9 @@ impl Default for MergeOptions {
     fn default() -> Self {
         Self {
             process: ProcessOptions::default(),
-            saturation_knee: 0.9,
-            saturation_width: 0.03,
-            validity_margin: 0.02,
+            saturation_knee: 0.75,
+            saturation_width: 0.02,
+            validity_margin: 0.15,
             saturation: None,
             noise_k: [4e-5; 3],
             noise_q: [0.0; 3],
@@ -85,6 +96,7 @@ impl MergeOptions {
             std::env::var("X3F_X3I_NOISE").ok().as_deref(),
             std::env::var("X3F_X3I_MAX_S").ok().as_deref(),
             std::env::var("X3F_X3I_SATURATION").ok().as_deref(),
+            std::env::var("X3F_X3I_ROLLOFF").ok().as_deref(),
         )
     }
 
@@ -137,6 +149,7 @@ impl MergeOptions {
         noise: Option<&str>,
         max_s: Option<&str>,
         saturation: Option<&str>,
+        rolloff: Option<&str>,
     ) -> Result<Self, Error> {
         let mut options = Self::default();
         let parse = |value: &str| {
@@ -169,16 +182,29 @@ impl MergeOptions {
             };
             options.saturation = Some([parse(b)?, parse(m)?, parse(t)?]);
         }
+        if let Some(rolloff) = rolloff {
+            let parts: Vec<_> = rolloff.split(',').collect();
+            let [knee, width, margin] = parts.as_slice() else {
+                return Err(Error::InvalidData(
+                    "X3F_X3I_ROLLOFF requires knee,width,margin".into(),
+                ));
+            };
+            options.saturation_knee = parse(knee)?;
+            options.saturation_width = parse(width)?;
+            options.validity_margin = parse(margin)?;
+        }
         options.validate()?;
         Ok(options)
     }
 
     fn validate(&self) -> Result<(), Error> {
         if !self.saturation_knee.is_finite()
+            || !(0.0 < self.saturation_knee && self.saturation_knee <= 1.0)
             || !self.saturation_width.is_finite()
             || self.saturation_width <= 0.0
             || !self.validity_margin.is_finite()
             || !(0.0..1.0).contains(&self.validity_margin)
+            || self.saturation_knee >= 1.0 - self.validity_margin
             || !self.w_min.is_finite()
             || self.w_min <= 0.0
             || self
@@ -983,6 +1009,70 @@ mod tests {
     }
 
     #[test]
+    fn soft_shoulder_samples_below_the_ceiling_do_not_pull_the_merge_down() {
+        // A sensor that compresses above 0.8 of its ceiling toward 0.96. The
+        // ceiling estimate is the top of the pile, so compressed samples sit
+        // at 0.9 to 0.96 and carry up to 64 times the reference weight.
+        let shoulder = |linear: f32| {
+            if linear <= 0.8 {
+                linear
+            } else {
+                0.8 + 0.16 * (1.0 - (-(linear - 0.8) / 0.2).exp())
+            }
+        };
+        let truth = 0.2375_f32;
+        let load = |i: usize| {
+            let exposure = [1000, 2000, 4000, 8000][i];
+            let mut f = frame(exposure, truth);
+            let value = shoulder(truth * exposure as f32 / 1000.0);
+            f.bmt.fill(value);
+            f.raw_top.fill((value * 10000.0).round() as u16);
+            f.raw_half.fill((value * 10000.0).round() as u16);
+            Ok(f)
+        };
+        let merged = merge(4, load, &MergeOptions::default(), Control::none()).unwrap();
+        assert!(merged.bmt.iter().all(|v| (*v - truth).abs() < 1e-5));
+        // The phase 1 defaults let the compressed long exposures pull the
+        // result down by more than one tenth.
+        let old_defaults = MergeOptions {
+            saturation_knee: 0.9,
+            saturation_width: 0.03,
+            validity_margin: 0.02,
+            ..Default::default()
+        };
+        let pulled = merge(4, load, &old_defaults, Control::none()).unwrap();
+        assert!(pulled.bmt.iter().all(|v| *v < 0.9 * truth));
+    }
+
+    #[test]
+    fn rolloff_override_parses_and_validates() {
+        let options = MergeOptions::parse_env(None, None, None, Some("0.75, 0.05, 0.15")).unwrap();
+        assert_eq!(options.saturation_knee, 0.75);
+        assert_eq!(options.saturation_width, 0.05);
+        assert_eq!(options.validity_margin, 0.15);
+        for value in [
+            "",
+            "0.8,0.03",
+            "0.8,0.03,0.1,0.2",
+            "0,0.03,0.1",
+            "-0.1,0.03,0.1",
+            "1.1,0.03,0.1",
+            "0.8,0,0.1",
+            "0.8,-0.03,0.1",
+            "0.8,0.03,-0.1",
+            "0.8,0.03,1",
+            "0.8,0.03,0.2",
+            "0.9,0.03,0.2",
+            "nan,0.03,0.1",
+            "0.8,inf,0.1",
+            "0.8,0.03,nan",
+            "x,0.03,0.1",
+        ] {
+            assert!(MergeOptions::parse_env(None, None, None, Some(value)).is_err());
+        }
+    }
+
+    #[test]
     fn masked_border_cannot_set_the_written_encoding_scale() {
         let mut scene = merge(
             1,
@@ -1331,25 +1421,25 @@ mod tests {
     #[test]
     fn noise_overrides_parse_without_mutating_the_environment() {
         let options =
-            MergeOptions::parse_env(Some("0.002, 0.0001, 0.01"), Some("8"), None).unwrap();
+            MergeOptions::parse_env(Some("0.002, 0.0001, 0.01"), Some("8"), None, None).unwrap();
         assert_eq!(options.noise_sigma, Some(0.002));
         assert_eq!(options.noise_k, [0.0001; 3]);
         assert_eq!(options.noise_q, [0.01; 3]);
-        let measured = MergeOptions::parse_env(Some(",0.0001,0"), None, None).unwrap();
+        let measured = MergeOptions::parse_env(Some(",0.0001,0"), None, None, None).unwrap();
         assert_eq!(measured.noise_sigma, None);
         assert_eq!(options.max_s, Some(8.0));
         for value in ["1,2", "1,2,3,4", "nan,0,0", "-1,0,0", "0,-1,0", "x,0,0"] {
-            assert!(MergeOptions::parse_env(Some(value), None, None).is_err());
+            assert!(MergeOptions::parse_env(Some(value), None, None, None).is_err());
         }
         for value in ["nan", "inf", "0.5", "x"] {
-            assert!(MergeOptions::parse_env(None, Some(value), None).is_err());
+            assert!(MergeOptions::parse_env(None, Some(value), None, None).is_err());
         }
     }
 
     #[test]
     fn saturation_override_requires_three_positive_finite_fractions() {
         assert_eq!(MergeOptions::default().saturation, None);
-        let options = MergeOptions::parse_env(None, None, Some("0.44, 0.43, 0.55")).unwrap();
+        let options = MergeOptions::parse_env(None, None, Some("0.44, 0.43, 0.55"), None).unwrap();
         assert_eq!(options.saturation, Some([0.44, 0.43, 0.55]));
         for value in [
             "",
@@ -1363,7 +1453,7 @@ mod tests {
             "x,1,1",
         ] {
             assert!(
-                MergeOptions::parse_env(None, None, Some(value)).is_err(),
+                MergeOptions::parse_env(None, None, Some(value), None).is_err(),
                 "{value}"
             );
         }
