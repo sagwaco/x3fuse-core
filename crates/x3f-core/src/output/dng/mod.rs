@@ -101,6 +101,7 @@ impl WriterInputs {
         control: x3f_sys::Control<'_>,
         warnings: &mut Vec<String>,
     ) -> Result<Self, Error> {
+        let control = reader.with_control(control);
         control.check()?;
 
         if opts.spp_denoise {
@@ -156,6 +157,7 @@ pub(crate) fn write_prepared(
     warnings: &mut Vec<String>,
     prebuilt: bool,
 ) -> Result<(), Error> {
+    let control = reader.with_control(control);
     let WriterInputs {
         opts,
         wb,
@@ -382,6 +384,16 @@ pub(crate) fn write_prepared(
         &mut ifd0,
         color_profiles.as_ref().map(|p| p.white_xy),
     );
+    if prebuilt {
+        // Add headroom to the serialized reference baseline without coarse EV rounding.
+        let reference = camera_baseline_exposure(reader, &calibration, 1.0).unwrap_or(0.0);
+        let reference = ((reference as f32 as f64) * 10_000.0).round() / 10_000.0;
+        let exposure = reference + highlight_scale.log2();
+        ifd0.add(
+            tags::BASELINE_EXPOSURE,
+            Value::SRational(vec![((exposure * 1_000_000.0).round() as i32, 1_000_000)]),
+        );
+    }
     if let Some(profiles) = &color_profiles {
         profiles.write_default(&mut ifd0);
     } else if write_default_profile(reader, &wb, &calibration, &mut ifd0).is_none() {

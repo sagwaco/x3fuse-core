@@ -4,6 +4,12 @@
 //! reads them. The snapshot uses the intermediate black and white levels.
 //! With the real producer, r is bounded below by minus the intermediate bias
 //! fraction, so zero sigma cannot produce a negative variance.
+//! Noise uses r = (sample - raw_black) / (raw_white - raw_black).
+//! Validity and saturation roll-off use d = r / saturation[plane].
+//! A measured sensor ceiling below the CAMF white changes only d, not noise units.
+//! A flat wall in an unsaturated frame can also pass the ceiling pile test.
+//! shortcut: no cross-frame ceiling check, phase 2 must require the second-longest
+//! frame's ceiling to agree within 2 percent before accepting the estimate.
 //! The intermediate encoding clamps at zero, so it truncates negative noise. Expansion
 //! also quantises and clamps BMT to u16, including Y = min(4T, 65535).
 //! The merge applies no signal-dependent dark weight. Unsigned DNG encoding
@@ -40,6 +46,8 @@ pub struct MergeOptions {
     pub saturation_width: f32,
     /// Reject raw samples at or above one minus this margin.
     pub validity_margin: f32,
+    /// Physical ceilings in raw-range units. None uses one in all planes.
+    pub saturation: Option<[f32; 3]>,
     /// Placeholder coefficients. Phase 2 will fit these values from frame pairs.
     pub noise_k: [f32; 3],
     /// Quadratic raw-noise coefficients per plane.
@@ -60,6 +68,7 @@ impl Default for MergeOptions {
             saturation_knee: 0.9,
             saturation_width: 0.03,
             validity_margin: 0.02,
+            saturation: None,
             noise_k: [4e-5; 3],
             noise_q: [0.0; 3],
             noise_sigma: None,
@@ -75,16 +84,65 @@ impl MergeOptions {
         Self::parse_env(
             std::env::var("X3F_X3I_NOISE").ok().as_deref(),
             std::env::var("X3F_X3I_MAX_S").ok().as_deref(),
+            std::env::var("X3F_X3I_SATURATION").ok().as_deref(),
         )
     }
 
-    fn parse_env(noise: Option<&str>, max_s: Option<&str>) -> Result<Self, Error> {
+    /// Use an override or estimate the raw ceilings from the longest exposure.
+    /// Preparation finishes before the merge allocates its accumulation planes.
+    pub fn saturation_for(
+        &self,
+        container: &crate::X3iContainer,
+        control: Control<'_>,
+    ) -> Result<[f32; 3], Error> {
+        self.saturation_for_with_warnings(container, control, &mut Vec::new())
+    }
+
+    /// Estimate container ceilings with the default processing control.
+    pub fn saturation_for_container(
+        &self,
+        container: &crate::X3iContainer,
+    ) -> Result<[f32; 3], Error> {
+        self.saturation_for(container, Control::none())
+    }
+
+    pub(crate) fn saturation_for_with_warnings(
+        &self,
+        container: &crate::X3iContainer,
+        control: Control<'_>,
+        warnings: &mut Vec<String>,
+    ) -> Result<[f32; 3], Error> {
+        control.check()?;
+        self.validate()?;
+        if let Some(saturation) = self.saturation {
+            return Ok(saturation);
+        }
+        let mut longest = (0, 0);
+        for i in 0..container.frames().len() {
+            control.check()?;
+            let exposure = container.frame_exposure_us(i)?;
+            if exposure > longest.1 {
+                longest = (i, exposure);
+            }
+        }
+        let mut options = self.process.clone();
+        options.denoise_intensity = 0;
+        let frame = container
+            .open_frame(longest.0)?
+            .merge_frame(&options, control)?;
+        estimate_saturation(&frame, longest.0, control, warnings)
+    }
+
+    fn parse_env(
+        noise: Option<&str>,
+        max_s: Option<&str>,
+        saturation: Option<&str>,
+    ) -> Result<Self, Error> {
         let mut options = Self::default();
         let parse = |value: &str| {
-            value
-                .trim()
-                .parse::<f32>()
-                .map_err(|_| Error::InvalidData("invalid X3I noise or scale override".into()))
+            value.trim().parse::<f32>().map_err(|_| {
+                Error::InvalidData("invalid X3I noise, scale or saturation override".into())
+            })
         };
         if let Some(noise) = noise {
             let parts: Vec<_> = noise.split(',').collect();
@@ -102,6 +160,15 @@ impl MergeOptions {
             options.noise_q = [parse(q)?; 3];
         }
         options.max_s = max_s.map(parse).transpose()?;
+        if let Some(saturation) = saturation {
+            let parts: Vec<_> = saturation.split(',').collect();
+            let [b, m, t] = parts.as_slice() else {
+                return Err(Error::InvalidData(
+                    "X3F_X3I_SATURATION requires b,m,t".into(),
+                ));
+            };
+            options.saturation = Some([parse(b)?, parse(m)?, parse(t)?]);
+        }
         options.validate()?;
         Ok(options)
     }
@@ -119,6 +186,11 @@ impl MergeOptions {
                 .iter()
                 .chain(&self.noise_q)
                 .any(|v| !v.is_finite() || *v < 0.0)
+            || self.saturation.is_some_and(|values| {
+                values
+                    .iter()
+                    .any(|v| !v.is_finite() || *v <= 0.0 || *v > 1.0)
+            })
             || self.noise_sigma.is_some_and(|v| !v.is_finite() || v < 0.0)
             || self.max_s.is_some_and(|v| !v.is_finite() || v < 1.0)
         {
@@ -133,11 +205,114 @@ impl MergeOptions {
     }
 }
 
+fn estimate_saturation(
+    frame: &MergeFrame,
+    index: usize,
+    control: Control<'_>,
+    warnings: &mut Vec<String>,
+) -> Result<[f32; 3], Error> {
+    let mut saturation = [1.0; 3];
+    for (c, value) in saturation.iter_mut().enumerate() {
+        let (ceiling, suspicious) = if c == 2 {
+            estimate_plane_saturation(
+                frame.raw_top.iter().copied(),
+                frame.raw_black[c],
+                frame.raw_white[c],
+                control,
+            )?
+        } else {
+            estimate_plane_saturation(
+                frame.raw_half.iter().skip(c).step_by(2).copied(),
+                frame.raw_black[c],
+                frame.raw_white[c],
+                control,
+            )?
+        };
+        *value = ceiling;
+        if suspicious {
+            warnings.push(format!(
+                "X3I saturation warning: frame={index} plane={} falls back to 1.0 despite a pile below 0.9 of the maximum; check X3F_X3I_SATURATION",
+                ["B", "M", "T"][c]
+            ));
+        }
+    }
+    Ok(saturation)
+}
+
+fn estimate_plane_saturation(
+    values: impl Iterator<Item = u16>,
+    black: f64,
+    white: f64,
+    control: Control<'_>,
+) -> Result<(f32, bool), Error> {
+    let mut histogram = vec![0usize; usize::from(u16::MAX) + 1];
+    let mut count = 0usize;
+    let mut maximum = 0u16;
+    for (i, value) in values.enumerate() {
+        if i % 65536 == 0 {
+            control.check()?;
+        }
+        histogram[usize::from(value)] += 1;
+        count += 1;
+        maximum = maximum.max(value);
+    }
+    let maximum = usize::from(maximum);
+    let mut tail = 0usize;
+    let support = count.div_ceil(10000).max(300);
+    let Some(mut candidate) = (0..=maximum).rev().find(|&value| {
+        tail += histogram[value];
+        tail >= support
+    }) else {
+        return Ok((1.0, false));
+    };
+    let lower = |upper: usize| {
+        (black + 0.99 * (upper as f64 - black))
+            .ceil()
+            .clamp(0.0, upper as f64) as usize
+    };
+    let enough = |pile: usize| pile >= 1000 && pile as f64 >= count as f64 * 0.0005;
+    // Keep the measured edge when the maximum already has a supported pile.
+    if enough(histogram[lower(maximum)..=maximum].iter().sum()) {
+        candidate = maximum;
+    }
+    let ceiling = (candidate as f64 - black) / (white - black);
+    if !ceiling.is_finite() || ceiling <= 0.0 {
+        return Ok((1.0, false));
+    }
+    if enough(histogram[lower(candidate)..=candidate].iter().sum()) {
+        return Ok((ceiling.clamp(0.3, 1.0) as f32, false));
+    }
+    // Prefix counts let the fallback diagnostic scan all lower piles once.
+    for i in 1..histogram.len() {
+        histogram[i] += histogram[i - 1];
+    }
+    let below = (black + 0.9 * (maximum as f64 - black))
+        .ceil()
+        .clamp(0.0, maximum as f64) as usize;
+    let suspicious = (0..below).any(|upper| {
+        if upper as f64 <= black {
+            return false;
+        }
+        let start = lower(upper);
+        let width = upper - start + 1;
+        let Some(previous_start) = start.checked_sub(width) else {
+            return false;
+        };
+        let pile = histogram[upper] - histogram[start - 1];
+        let previous =
+            histogram[start - 1] - previous_start.checked_sub(1).map_or(0, |i| histogram[i]);
+        enough(pile) && pile / 5 >= previous
+    });
+    Ok((1.0, suspicious))
+}
+
 /// Exposure scales and sample statistics from one merge.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MergeReport {
     /// Number of loaded and accumulated frames.
     pub frames_used: usize,
+    /// Physical raw ceilings used by validity and roll-off, in B, M, T order.
+    pub saturation: [f32; 3],
     /// Reference exposure divided by each frame exposure, in load order.
     pub scales: Vec<f64>,
     /// Source frame indices, in load order.
@@ -384,7 +559,10 @@ pub fn merge(
     let mut fallback = vec![[0.0f32; 3]; pixels];
     let mut best_snr = vec![[-1.0f32; 2]; pixels];
     let mut shortest_us = u32::MAX;
-    let mut report = MergeReport::default();
+    let mut report = MergeReport {
+        saturation: options.saturation.unwrap_or([1.0; 3]),
+        ..Default::default()
+    };
     let mut first = Some(reference);
     for i in 0..frame_count {
         control.check()?;
@@ -401,7 +579,9 @@ pub fn merge(
             ));
         }
         let scale = reference_us as f32 / frame.shutter_us as f32;
-        let d_max = saturation_max(&frame, factors, control)?;
+        let ceilings = options.saturation.unwrap_or([1.0; 3]);
+        let saturation_factors = std::array::from_fn(|c| factors[c] / f64::from(ceilings[c]));
+        let d_max = saturation_max(&frame, saturation_factors, control)?;
         let sigma = options.noise_sigma.map_or(frame.sigma, |s| [s; 3]);
         let shortest = i == 0 || frame.shutter_us < shortest_us;
         sum.par_chunks_mut(width as usize * 3)
@@ -531,6 +711,37 @@ pub fn merge(
     })
 }
 
+/// Exclude unwritten borders from the encoding range. Invalid crops use the full raster.
+pub(crate) fn mask_to_active_area(
+    scene: &mut MergedScene,
+    [top, left, bottom, right]: [u32; 4],
+    control: Control<'_>,
+) -> Result<(), Error> {
+    if bottom <= top || right <= left || bottom > scene.height || right > scene.width {
+        return Ok(());
+    }
+    let mut minimum = f32::INFINITY;
+    let mut maximum = f32::NEG_INFINITY;
+    for (y, row) in scene.bmt.chunks_mut(scene.width as usize * 3).enumerate() {
+        control.check()?;
+        if y < top as usize || y >= bottom as usize {
+            row.fill(0.0);
+        } else {
+            row[..left as usize * 3].fill(0.0);
+            row[right as usize * 3..].fill(0.0);
+        }
+        for &value in row.iter() {
+            minimum = minimum.min(value);
+            maximum = maximum.max(value);
+        }
+    }
+    scene.s = f64::from(maximum).max(1.0);
+    scene.report.s = scene.s;
+    scene.report.minimum = minimum;
+    scene.report.maximum = maximum;
+    Ok(())
+}
+
 /// Encode camera samples as unsigned linear DNG samples. Negative values become zero.
 pub fn to_image(scene: &MergedScene) -> Result<Image, Error> {
     let stride = scene.width.checked_mul(3);
@@ -596,6 +807,208 @@ mod tests {
             camera_to_rgb: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             ..MergeFrame::default()
         }
+    }
+
+    #[test]
+    fn ceiling_estimator_requires_a_pile_and_ignores_an_isolated_hot_pixel() {
+        let mut values: Vec<u16> = (0..10000).collect();
+        assert_eq!(
+            estimate_plane_saturation(values.iter().copied(), 100.0, 10100.0, Control::none())
+                .unwrap(),
+            (1.0, false)
+        );
+        let mut isolated = values.clone();
+        isolated.push(65535);
+        assert_eq!(
+            estimate_plane_saturation(isolated.into_iter(), 100.0, 10100.0, Control::none())
+                .unwrap(),
+            (1.0, false)
+        );
+        values.extend(std::iter::repeat_n(10000, 5000));
+        let (ceiling, suspicious) =
+            estimate_plane_saturation(values.iter().copied(), 100.0, 10100.0, Control::none())
+                .unwrap();
+        assert!((ceiling - 0.99).abs() < 1e-6);
+        assert!(!suspicious);
+        let pile = std::iter::repeat_n(4600, 5000);
+        assert!(
+            (estimate_plane_saturation(pile, 100.0, 10100.0, Control::none())
+                .unwrap()
+                .0
+                - 0.45)
+                .abs()
+                < 1e-6
+        );
+        let cancelled = AtomicBool::new(true);
+        assert!(matches!(
+            estimate_plane_saturation([1].into_iter(), 0.0, 10000.0, Control::new(&cancelled)),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn ceiling_estimator_keeps_a_plateau_below_an_outlier() {
+        let values = std::iter::repeat_n(4500, 5000).chain([9000]);
+        assert_eq!(
+            estimate_plane_saturation(values, 0.0, 10000.0, Control::none()).unwrap(),
+            (0.45, false)
+        );
+    }
+
+    #[test]
+    fn ceiling_estimator_clamps_accepted_low_ceilings_at_point_three() {
+        assert_eq!(
+            estimate_plane_saturation(
+                std::iter::repeat_n(2100, 5000),
+                100.0,
+                10100.0,
+                Control::none()
+            )
+            .unwrap(),
+            (0.3, false)
+        );
+    }
+
+    #[test]
+    fn ceiling_fallback_warns_for_a_cliff_but_not_a_smooth_histogram() {
+        let mut values: Vec<u16> = (0u16..10000)
+            .flat_map(|value| {
+                std::iter::repeat_n(value, usize::from(value.min(10000 - value)) / 50 + 1)
+            })
+            .collect();
+        assert_eq!(
+            estimate_plane_saturation(values.iter().copied(), 0.0, 10000.0, Control::none())
+                .unwrap(),
+            (1.0, false)
+        );
+        values.extend(std::iter::repeat_n(4500, 20000));
+        assert_eq!(
+            estimate_plane_saturation(values.into_iter(), 0.0, 10000.0, Control::none()).unwrap(),
+            (1.0, true)
+        );
+    }
+
+    #[test]
+    fn ceiling_fallback_warns_for_each_plane_with_a_hidden_pile() {
+        let values: Vec<u16> = std::iter::repeat_n(4500, 5000)
+            .chain(std::iter::repeat_n(9000, 400))
+            .collect();
+        let frame = MergeFrame {
+            raw_half: values.iter().flat_map(|&v| [v; 2]).collect(),
+            raw_top: values,
+            raw_black: [0.0; 3],
+            raw_white: [10000.0; 3],
+            ..Default::default()
+        };
+        let mut warnings = Vec::new();
+        assert_eq!(
+            estimate_saturation(&frame, 6, Control::none(), &mut warnings).unwrap(),
+            [1.0; 3]
+        );
+        assert_eq!(warnings.len(), 3);
+        for (warning, plane) in warnings.iter().zip(["B", "M", "T"]) {
+            assert!(warning.starts_with(&format!(
+                "X3I saturation warning: frame=6 plane={plane} falls back to 1.0"
+            )));
+            assert!(warning.contains("pile below 0.9 of the maximum"));
+            assert!(warning.contains("X3F_X3I_SATURATION"));
+        }
+    }
+
+    #[test]
+    fn corpus_sensor_ceilings_match_both_camera_families() {
+        let corpus = std::env::var_os("X3F_TEST_FILES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../x3f_test_files")
+            });
+        for name in ["DP0Q0002.X3I", "_DQH0978.X3I"] {
+            let path = corpus.join(name);
+            if !path.is_file() {
+                eprintln!("skip: missing {name}");
+                continue;
+            }
+            let container = crate::X3iContainer::open(path).unwrap();
+            let options = MergeOptions::default();
+            let ceilings = options.saturation_for_container(&container).unwrap();
+            eprintln!("{name}: saturation={ceilings:?}");
+            if name == "DP0Q0002.X3I" {
+                assert_eq!(ceilings, [1.0; 3]);
+            } else {
+                assert_eq!(ceilings, [0.44519424, 0.42977452, 0.5464723]);
+            }
+            let explicit = MergeOptions {
+                saturation: Some([0.4, 0.5, 0.6]),
+                ..options
+            };
+            assert_eq!(
+                explicit
+                    .saturation_for(&container, Control::none())
+                    .unwrap(),
+                [0.4, 0.5, 0.6]
+            );
+        }
+    }
+
+    #[test]
+    fn a_subwhite_sensor_plateau_does_not_suppress_bright_samples() {
+        let load = |i: usize| {
+            let mut f = frame([1000, 125, 8000][i], 0.3);
+            let value = (0.3 * f.shutter_us as f32 / 1000.0).min(0.45);
+            f.bmt.fill(value);
+            f.raw_top.fill((value * 10000.0).round() as u16);
+            f.raw_half.fill((value * 10000.0).round() as u16);
+            Ok(f)
+        };
+        let options = MergeOptions {
+            saturation: Some([0.45; 3]),
+            ..Default::default()
+        };
+        let fixed = merge(3, load, &options, Control::none()).unwrap();
+        assert!(fixed.bmt.iter().all(|v| (*v - 0.3).abs() < 1e-5));
+        let capped = merge(3, load, &MergeOptions::default(), Control::none()).unwrap();
+        assert!(capped.bmt.iter().all(|v| *v < 0.15));
+        // One is the old ceiling. It must preserve both signal and noise weighting.
+        let explicit_default = merge(
+            3,
+            load,
+            &MergeOptions {
+                saturation: Some([1.0; 3]),
+                ..Default::default()
+            },
+            Control::none(),
+        )
+        .unwrap();
+        assert_eq!(capped.bmt, explicit_default.bmt);
+    }
+
+    #[test]
+    fn masked_border_cannot_set_the_written_encoding_scale() {
+        let mut scene = merge(
+            1,
+            |_| Ok(frame(1000, 2.0)),
+            &MergeOptions::default(),
+            Control::none(),
+        )
+        .unwrap();
+        scene.bmt.fill(2.0);
+        scene.bmt[..16 * 3].fill(100.0);
+        scene.s = 100.0;
+        mask_to_active_area(&mut scene, [1, 2, 14, 13], Control::none()).unwrap();
+        assert_eq!(scene.s, 2.0);
+        assert_eq!(scene.report.s, 2.0);
+        assert_eq!(scene.report.maximum, 2.0);
+        let image = to_image(&scene).unwrap();
+        assert!(image.data[..16 * 3].iter().all(|&v| v == 0));
+        assert_eq!(image.data[(2 * 16 + 3) * 3], 65535);
+        let before = scene.bmt.clone();
+        mask_to_active_area(&mut scene, [0, 0, 17, 16], Control::none()).unwrap();
+        assert_eq!(scene.bmt, before);
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        assert!(matches!(
+            mask_to_active_area(&mut scene, [1, 2, 14, 13], Control::new(&cancel)),
+            Err(Error::Cancelled)
+        ));
     }
 
     #[test]
@@ -917,18 +1330,42 @@ mod tests {
 
     #[test]
     fn noise_overrides_parse_without_mutating_the_environment() {
-        let options = MergeOptions::parse_env(Some("0.002, 0.0001, 0.01"), Some("8")).unwrap();
+        let options =
+            MergeOptions::parse_env(Some("0.002, 0.0001, 0.01"), Some("8"), None).unwrap();
         assert_eq!(options.noise_sigma, Some(0.002));
         assert_eq!(options.noise_k, [0.0001; 3]);
         assert_eq!(options.noise_q, [0.01; 3]);
-        let measured = MergeOptions::parse_env(Some(",0.0001,0"), None).unwrap();
+        let measured = MergeOptions::parse_env(Some(",0.0001,0"), None, None).unwrap();
         assert_eq!(measured.noise_sigma, None);
         assert_eq!(options.max_s, Some(8.0));
         for value in ["1,2", "1,2,3,4", "nan,0,0", "-1,0,0", "0,-1,0", "x,0,0"] {
-            assert!(MergeOptions::parse_env(Some(value), None).is_err());
+            assert!(MergeOptions::parse_env(Some(value), None, None).is_err());
         }
         for value in ["nan", "inf", "0.5", "x"] {
-            assert!(MergeOptions::parse_env(None, Some(value)).is_err());
+            assert!(MergeOptions::parse_env(None, Some(value), None).is_err());
+        }
+    }
+
+    #[test]
+    fn saturation_override_requires_three_positive_finite_fractions() {
+        assert_eq!(MergeOptions::default().saturation, None);
+        let options = MergeOptions::parse_env(None, None, Some("0.44, 0.43, 0.55")).unwrap();
+        assert_eq!(options.saturation, Some([0.44, 0.43, 0.55]));
+        for value in [
+            "",
+            "0.4,0.5",
+            "0.4,0.5,0.6,0.7",
+            "0,1,1",
+            "-1,1,1",
+            "nan,1,1",
+            "inf,1,1",
+            "1.1,1,1",
+            "x,1,1",
+        ] {
+            assert!(
+                MergeOptions::parse_env(None, None, Some(value)).is_err(),
+                "{value}"
+            );
         }
     }
 
