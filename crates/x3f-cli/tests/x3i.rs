@@ -229,6 +229,11 @@ fn corpus_dng_merge_writes_seven_frame_report() {
             .collect();
         assert_eq!(statistics.len(), 7);
         assert_eq!(alignments.len(), 7);
+        for line in &alignments {
+            assert!(line.contains("retained_tiles="));
+            assert!(line.contains("max_tile_residual="));
+            assert!(line.contains("weak="));
+        }
         assert_eq!(
             report
                 .lines()
@@ -282,7 +287,7 @@ fn corpus_dng_merge_writes_seven_frame_report() {
             let expected = common::file_md5(&dng);
             // This float output hash was recorded on macOS aarch64.
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            assert_eq!(expected, "302684ec51a01cddbd4ae76cc3e2bc29");
+            assert_eq!(expected, "db749dee7d09a65817c2df39dcf235d7");
             let report_path = scratch.0.join(format!("{name}.x3i-report"));
             std::fs::remove_file(&report_path).unwrap();
             std::fs::create_dir(&report_path).unwrap();
@@ -557,16 +562,12 @@ fn quattro_h_merged_color_matches_reference_midtones() {
     check_merged_color("_DQH0978.X3I", false);
 }
 
-// Unaligned long exposures dominate the merge and move its image away from frame 0.
-// The dp0 building patch peaks at (-9, -16), at the search bound. Enable after phase 2.
 #[test]
-#[ignore = "phase 2 alignment is not integrated; dp0 building peak is (-9, -16) at the search bound"]
 fn dp0_merged_position_matches_reference() {
     check_merged_color("DP0Q0002.X3I", true);
 }
 
 #[test]
-#[ignore = "phase 2 alignment is not integrated; the unaligned merge moves away from frame 0"]
 fn quattro_h_merged_position_matches_reference() {
     check_merged_color("_DQH0978.X3I", true);
 }
