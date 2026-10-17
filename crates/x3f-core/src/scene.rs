@@ -167,6 +167,11 @@ pub fn prepare_scene_linear(
     } else {
         None
     };
+    let denoise_scale = if container.is_some() {
+        crate::x3i_output::read_denoise_scale(options.denoise_intensity, options.denoise_options)?
+    } else {
+        0.0
+    };
     let reader = if let Some(container) = &container {
         container.open_frame(0)?
     } else {
@@ -231,9 +236,9 @@ pub fn prepare_scene_linear(
             &mut on_stage,
             &mut Vec::new(),
         )?;
-        if options.denoise_intensity > 0 {
+        if denoise_scale > 0.0 {
             let mut image = crate::x3i_merge::to_image(&merged)?;
-            if crate::x3i_output::denoise(&mut image, &process, merge_control)? {
+            if crate::x3i_output::denoise(&mut image, &process, denoise_scale, merge_control)? {
                 crate::x3i_output::restore_denoised(&mut merged, &image, merge_control)?;
             }
         }

@@ -218,6 +218,8 @@ fn convert_x3i(
 ) -> Result<ConversionReport, Error> {
     use crate::{output::dng, x3i_output, X3iContainer};
 
+    let denoise_scale =
+        x3i_output::read_denoise_scale(options.denoise_intensity, options.denoise_options)?;
     let container = X3iContainer::open(input)?;
     let frame0 = container.open_frame(0)?;
     let mut report = ConversionReport::default();
@@ -289,8 +291,11 @@ fn convert_x3i(
     ));
     report.warnings.extend(scene.report.warnings());
     let mut image = crate::x3i_merge::to_image(&scene)?;
-    let denoised = x3i_output::denoise(&mut image, options, control)?;
-    if options.denoise_intensity > 0 && !denoised {
+    let denoised = x3i_output::denoise(&mut image, options, denoise_scale, control)?;
+    if options.denoise_intensity > 0
+        && (options.denoise_options.luminance || options.denoise_options.chroma)
+        && !denoised
+    {
         report.warnings.push("X3I denoise is off; set X3F_X3I_DENOISE_SCALE=0.3 to enable the experimental post-merge filter".into());
     }
     if let Some(rendering) = rendering {

@@ -49,7 +49,7 @@ pub(crate) fn merge_frames(
     Ok(scene)
 }
 
-fn denoise_scale(value: Option<&str>, intensity: u8, s: f64) -> Result<f32, Error> {
+fn denoise_scale(value: Option<&str>, intensity: u8) -> Result<f32, Error> {
     let scale: f32 = value
         .unwrap_or("0")
         .parse()
@@ -59,12 +59,26 @@ fn denoise_scale(value: Option<&str>, intensity: u8, s: f64) -> Result<f32, Erro
             "X3F_X3I_DENOISE_SCALE must be finite and nonnegative".into(),
         ));
     }
-    Ok((f64::from(scale) * f64::from(intensity.min(10)) / 10.0 / s) as f32)
+    Ok((f64::from(scale) * f64::from(intensity.min(10)) / 10.0) as f32)
+}
+
+pub(crate) fn read_denoise_scale(
+    intensity: u8,
+    options: sys::DenoiseOptions,
+) -> Result<f32, Error> {
+    if intensity == 0 || (!options.luminance && !options.chroma) {
+        return Ok(0.0);
+    }
+    denoise_scale(
+        std::env::var("X3F_X3I_DENOISE_SCALE").ok().as_deref(),
+        intensity,
+    )
 }
 
 pub(crate) fn denoise(
     image: &mut Image,
     options: &ProcessOptions,
+    scale: f32,
     control: Control<'_>,
 ) -> Result<bool, Error> {
     if options.denoise_intensity == 0
@@ -72,11 +86,7 @@ pub(crate) fn denoise(
     {
         return Ok(false);
     }
-    let scale = denoise_scale(
-        std::env::var("X3F_X3I_DENOISE_SCALE").ok().as_deref(),
-        options.denoise_intensity,
-        image.dng_highlight_scale,
-    )?;
+    let scale = (f64::from(scale) / image.dng_highlight_scale) as f32;
     if scale == 0.0 {
         return Ok(false);
     }
@@ -357,7 +367,7 @@ mod tests {
             ..Default::default()
         };
         let unchanged = image.data.clone();
-        assert!(!denoise(&mut image, &disabled, control).unwrap());
+        assert!(!denoise(&mut image, &disabled, 0.3, control).unwrap());
         assert_eq!(image.data, unchanged);
         let options = ProcessOptions {
             color_encoding: ColorEncoding::None,
@@ -379,12 +389,52 @@ mod tests {
     }
 
     #[test]
-    fn reduced_denoise_strength_tracks_encoding_scale() {
-        assert_eq!(denoise_scale(None, 10, 1.0).unwrap(), 0.0);
-        assert_eq!(denoise_scale(Some("0.3"), 5, 8.0).unwrap(), 0.3 * 0.5 / 8.0);
-        assert_eq!(denoise_scale(Some("0"), 10, 1.0).unwrap(), 0.0);
+    fn enabled_denoise_restores_reference_codes_and_preserves_black_margins() {
+        let mut scene = MergedScene {
+            bmt: vec![0.0; 8 * 8 * 3],
+            width: 8,
+            height: 8,
+            s: 3.0,
+            camera_to_rgb: [0.0; 9],
+            report: Default::default(),
+        };
+        for row in 1..7 {
+            for col in 0..8 {
+                let offset = (row * 8 + col) * 3;
+                scene.bmt[offset..offset + 3].copy_from_slice(&[
+                    0.3 + (col % 3) as f32 * 0.001,
+                    0.3 - (col % 2) as f32 * 0.001,
+                    0.3,
+                ]);
+            }
+        }
+        let mut image = x3i_merge::to_image(&scene).unwrap();
+        let options = ProcessOptions {
+            denoise_backend: sys::DenoiseBackend::Cpu,
+            ..Default::default()
+        };
+        assert!(denoise(
+            &mut image,
+            &options,
+            denoise_scale(Some("0.3"), 10).unwrap(),
+            Control::none()
+        )
+        .unwrap());
+        restore_denoised(&mut scene, &image, Control::none()).unwrap();
+        for (value, code) in scene.bmt.iter().zip(&image.data) {
+            assert!((f64::from(*value) * 65535.0 / scene.s - f64::from(*code)).abs() <= 1.0);
+        }
+        assert!(scene.bmt[..8 * 3].iter().all(|v| *v == 0.0));
+        assert!(scene.bmt[7 * 8 * 3..].iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn reduced_denoise_strength_tracks_intensity() {
+        assert_eq!(denoise_scale(None, 10).unwrap(), 0.0);
+        assert_eq!(denoise_scale(Some("0.3"), 5).unwrap(), 0.3 * 0.5);
+        assert_eq!(denoise_scale(Some("0"), 10).unwrap(), 0.0);
         for invalid in ["-1", "NaN", "inf", "bad"] {
-            assert!(denoise_scale(Some(invalid), 10, 1.0).is_err());
+            assert!(denoise_scale(Some(invalid), 10).is_err());
         }
     }
 }
