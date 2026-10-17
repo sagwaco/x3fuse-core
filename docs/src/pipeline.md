@@ -444,7 +444,8 @@ trend across clean bins exceeds 2 percent or the fitted scale differs by
 more than 0.3 EV.
 
 Fit each raw plane's shot coefficient `k` from flat 8x8 reference/+1 EV
-pairs, with integer-rounded alignment and separate read-noise terms. Fewer
+pairs, with nearest raw samples at inverse-transform coordinates and separate
+read-noise terms. Half-resolution pairs use the centres of their 2x2 blocks. Fewer
 than 50 blocks keeps the default or override. Fix the effective reference
 correction at one. Fit separate T and shared B/M corrections from flat pair
 residuals, using at least 50 blocks above ten read sigmas in both frames.

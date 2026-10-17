@@ -437,8 +437,13 @@ existing-output preservation. Scene tests check finite active-area RGB and
 extended highlight range. TIFF and PPM must use the merged raster.
 
 The phase 2 dp0 merged DNG has the intentional macOS aarch64 MD5 pin
-`c80db90d70032be445b0a0a0af81b876` with `-dng -no-denoise`. Clean-bin scalar
-refinement and anchored effective-variance calibration replace the aligned
+`48fde3f0f196c1f22e9ecd26d2955dc8` with `-dng -no-denoise`. Raw statistics now
+use the same inverse transform as image sampling, replacing
+`c80db90d70032be445b0a0a0af81b876`. Frames with a similarity transform pair
+different raw samples. On dp0 the +1 EV noise-fit frame is one of them, so
+`k_T` falls from 2.46e-5 to 2.24e-5 and the weights of all frames change.
+Clean-bin scalar refinement and anchored effective-variance calibration had
+replaced the aligned
 pin `db749dee7d09a65817c2df39dcf235d7`. That earlier aligned pin, at commit
 `38bbeef`, replaced phase 1 `494b455d3286dfdc1c5243ad60a31284`; at that commit,
 `X3F_X3I_NO_ALIGN=1` reproduces `302684ec51a01cddbd4ae76cc3e2bc29`.

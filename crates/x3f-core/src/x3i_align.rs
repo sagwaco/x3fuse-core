@@ -73,6 +73,21 @@ pub struct Alignment {
 }
 
 impl Alignment {
+    /// Map a full-resolution reference coordinate to the source frame.
+    /// Skipped alignments keep the original coordinate.
+    /// A singular transform gives non-finite coordinates; callers must reject them.
+    pub fn source_at(&self, x: f32, y: f32) -> [f32; 2] {
+        if self.skipped {
+            return [x, y];
+        }
+        let [a, b, tx, c, d, ty] = self
+            .similarity
+            .unwrap_or([1.0, 0.0, self.dx, 0.0, 1.0, self.dy]);
+        let det = a * d - b * c;
+        let (u, v) = (x - tx, y - ty);
+        [(d * u - b * v) / det, (a * v - c * u) / det]
+    }
+
     /// True when the transform leaves the frame unchanged.
     pub fn is_identity(&self) -> bool {
         match self.similarity {
@@ -701,10 +716,7 @@ pub fn warp(
         for y in band..(band + 300).min(h) {
             control.check()?;
             for x in 0..w {
-                let u = x as f32 - tx;
-                let v = y as f32 - ty;
-                let sx = (d * u - b * v) / det;
-                let sy = (a * v - c * u) / det;
+                let [sx, sy] = alignment.source_at(x as f32, y as f32);
                 let ix = sx.floor();
                 let iy = sy.floor();
                 if !sx.is_finite()
