@@ -337,6 +337,8 @@ fn tile_shift(
         let best = (0..9)
             .max_by(|&i, &j| scores[i].total_cmp(&scores[j]))
             .unwrap();
+        // Keep the phase shift when the masked window has no preference.
+        let best = if scores[best] > scores[4] { best } else { 4 };
         let mut offset = [(best % 3) as f32 - 1.0, (best / 3) as f32 - 1.0];
         if best == 4 {
             let xx = scores[3] - 2.0 * scores[4] + scores[5];
@@ -905,6 +907,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn masked_refinement_region_preserves_the_phase_estimate() {
+        let mut map = Luma {
+            width: 128,
+            height: 128,
+            data: vec![0.0; 128 * 128],
+            mask: vec![0; 128 * 128],
+            log: Vec::new(),
+        };
+        for y in 0..128 {
+            for x in 0..128 {
+                if !(30..100).contains(&x) || !(30..100).contains(&y) {
+                    map.mask[y * 128 + x] = 1;
+                    map.data[y * 128 + x] = ((37 * x + 71 * y) % 251) as f32 / 251.0;
+                }
+            }
+        }
+        let found = estimate(&map, &map, &AlignOptions::default(), Control::none()).unwrap();
+        assert!(!found.skipped && found.is_identity(), "{found:?}");
     }
 
     #[test]
