@@ -67,7 +67,9 @@ pub(crate) fn denoise(
     options: &ProcessOptions,
     control: Control<'_>,
 ) -> Result<bool, Error> {
-    if options.denoise_intensity == 0 {
+    if options.denoise_intensity == 0
+        || (!options.denoise_options.luminance && !options.denoise_options.chroma)
+    {
         return Ok(false);
     }
     let scale = denoise_scale(
@@ -339,13 +341,24 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        let image = rendering.render(&scene, &reader, false, control).unwrap();
+        let mut image = rendering.render(&scene, &reader, false, control).unwrap();
         let encode =
             |value: f64| ((1.055 * value.powf(1.0 / 2.4) - 0.055) * 65535.0).round() as u16;
         assert_eq!(
             image.data,
             [encode(0.5), encode(0.25), encode(0.5), 0, 65535, 65535]
         );
+        let disabled = ProcessOptions {
+            denoise_options: sys::DenoiseOptions {
+                luminance: false,
+                chroma: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let unchanged = image.data.clone();
+        assert!(!denoise(&mut image, &disabled, control).unwrap());
+        assert_eq!(image.data, unchanged);
         let options = ProcessOptions {
             color_encoding: ColorEncoding::None,
             ..Default::default()
