@@ -92,6 +92,25 @@ use the phase 1 merge and do not establish a useful default strength.
 
 The statistics pass aligns each frame to frame 0. A skipped alignment keeps
 that frame at its original position and reports possible misregistration.
+Global alignment uses one translation or bounded similarity transform.
+`X3F_X3I_ALIGN=local` adds a smooth displacement field from 256-pixel tiles
+at half resolution. The estimator rejects weak peaks and shifts that disagree
+with nearby tiles or the global transform. It fills missing tiles by neighbour
+regularisation. Bilinear interpolation evaluates the field between tile centres;
+Catmull-Rom still samples the image. All 16 source taps must be valid, and
+their maximum saturation value remains the roll-off input.
+The local field has a bounded gradient to prevent folds. A weak local estimate
+keeps the global transform and reports the reason. Global remains the default
+because local does not improve every frame on both tested samples.
+Reports keep the global `retained_tiles` and `max_tile_residual` fields and add
+local tile counts, field range, fit residual and post-warp global residual.
+`applied_residual` is the largest trusted post-warp shift on a grid offset
+by half a tile step from the fitting grid. It is absent with fewer than six
+trusted tiles. This maximum includes subject motion, not only camera motion.
+The local search covers eight full-resolution pixels around
+the global transform; the global search still covers 64 pixels.
+The field uses tile-sized storage. `warp_rows` can produce an output row range
+from a complete source frame; the merge still allocates full warped frames.
 A scalar exposure fit uses the median of clean, supported bin medians.
 An affine fit supplies a black-offset diagnostic only. Near-black bias is
 nonlinear, so using the affine slope would bias the scale. Short exposures
@@ -147,6 +166,7 @@ changing the merge model here.
 | `X3F_X3I_SATURATION=b,m,t` | Override the measured physical ceiling of each plane in normalized raw-range units. |
 | `X3F_X3I_ROLLOFF=knee,width,margin` | Set knee, width and validity margin relative to the ceiling. Defaults: `0.75,0.02,0.15`. |
 | `X3F_X3I_NO_ALIGN=1` | Disable frame alignment. Merge frames at their original positions. |
+| `X3F_X3I_ALIGN=global\|local` | Select the global transform or a smooth local correction. Default: `global`. `NO_ALIGN` takes precedence. |
 | `X3F_X3I_FIXED_RATIOS=1` | Keep nominal shutter ratios. Report fitted ratios without applying them. |
 | `X3F_X3I_NO_GHOST=1` | Disable ghost rejection and effective-variance calibration. |
 | `X3F_X3I_C_MIN=value` | Set the effective-variance calibration floor. Default: `0.5`; range: above zero through one. |

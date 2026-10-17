@@ -141,7 +141,7 @@ impl Default for MergeOptions {
 impl MergeOptions {
     /// Read research overrides once. The merge does not read environment variables.
     pub fn from_env() -> Result<Self, Error> {
-        Self::parse_env(
+        let mut options = Self::parse_env(
             std::env::var("X3F_X3I_NOISE").ok().as_deref(),
             std::env::var("X3F_X3I_MAX_S").ok().as_deref(),
             std::env::var("X3F_X3I_SATURATION").ok().as_deref(),
@@ -153,7 +153,11 @@ impl MergeOptions {
                 std::env::var("X3F_X3I_RATIO_TREND").ok().as_deref(),
                 std::env::var("X3F_X3I_C_MIN").ok().as_deref(),
             ],
-        )
+        )?;
+        if let Ok(mode) = std::env::var("X3F_X3I_ALIGN") {
+            options.align.mode = x3i_align::AlignMode::parse(&mode)?;
+        }
+        Ok(options)
     }
 
     /// Use an override or estimate the raw ceilings from the longest exposure.
@@ -501,6 +505,14 @@ impl MergeReport {
                 "X3I frame {}: alignment dx={:.6} dy={:.6} peak={:.6} tile_spread={:.6} similarity={:?} retained_tiles={} max_tile_residual={:.6} weak={} skipped={}",
                 self.frame_indices[i], a.dx, a.dy, a.peak, a.tile_spread, a.similarity, a.retained_tiles, a.max_tile_residual,
                 i != 0 && (a.retained_tiles <= 3 || a.max_tile_residual > 1.5), a.skipped
+            ));
+            lines.push(format!(
+                "X3I frame {}: alignment-field mode={} local_tiles={} field_range={:?} local_max_residual={:.6} fallback={:?} post_warp_residual={:?} applied_residual={:?} residual_tiles={}",
+                self.frame_indices[i],
+                if a.skipped { "skipped" } else if a.local.is_some() { "local" } else { "global" },
+                a.local_retained_tiles, a.local.as_ref().map(|field| field.range()),
+                a.local_max_tile_residual, a.local_fallback, a.post_warp_residual,
+                a.applied_residual, a.residual_tiles
             ));
         }
         lines
@@ -1379,7 +1391,7 @@ pub fn merge(
         let nominal = reference_us as f64 / frame.shutter_us as f64;
         let planes = materialise(&mut frame, nominal as f32, options, control)?;
         retain_top_gain(&mut frame);
-        let alignment = if let Some(reference_luma) = &reference_luma {
+        let mut alignment = if let Some(reference_luma) = &reference_luma {
             let luma = x3i_align::luma(&planes, 1.0 - options.validity_margin, control)?;
             x3i_align::estimate(reference_luma, &luma, &options.align, control)?
         } else {
@@ -1398,6 +1410,25 @@ pub fn merge(
         } else {
             planes
         };
+        if options.align.mode == x3i_align::AlignMode::Local {
+            if let Some(reference_luma) = &reference_luma {
+                let map = x3i_align::luma(&planes, 1.0 - options.validity_margin, control)?;
+                x3i_align::measure_applied(reference_luma, &map, &mut alignment, control)?;
+                let residual = x3i_align::estimate(
+                    reference_luma,
+                    &map,
+                    &AlignOptions {
+                        mode: x3i_align::AlignMode::Global,
+                        ..options.align.clone()
+                    },
+                    control,
+                )?;
+                if !residual.skipped {
+                    alignment.post_warp_residual =
+                        Some([residual.dx, residual.dy, residual.max_tile_residual]);
+                }
+            }
+        }
         let fit = refined_ratio(
             (&reference, &frame),
             &reference_planes,
@@ -2983,16 +3014,23 @@ mod tests {
         assert_eq!(scene.report.ghost_fractions[1], 1.0);
         assert_eq!(scene.report.fallback_zero, 0);
         let lines = scene.report.statistics();
-        assert_eq!(lines.len(), 61);
+        assert_eq!(lines.len(), 64);
         assert!(lines[0].contains("k_B="));
         assert!(lines[1].contains("nominal=1.000000000000 refined=1.000000000000"));
         assert!(lines[20].contains("dx=0.000000"));
         assert!(lines[20].contains("weak=false"));
+        assert!(lines[21].contains("alignment-field mode=global"));
         let mut report = scene.report;
         for (tiles, residual, weak) in [(3, 0.0, true), (4, 1.5, false), (4, 1.51, true)] {
             report.alignments[1].retained_tiles = tiles;
             report.alignments[1].max_tile_residual = residual;
-            assert!(report.statistics()[40].contains(&format!("weak={weak}")));
+            assert!(report
+                .statistics()
+                .iter()
+                .filter(|line| line.contains(": alignment "))
+                .nth(1)
+                .unwrap()
+                .contains(&format!("weak={weak}")));
         }
     }
 

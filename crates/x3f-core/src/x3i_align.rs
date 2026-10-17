@@ -4,11 +4,33 @@
 use crate::Error;
 use x3f_sys::Control;
 
+/// Spatial model used to register a frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AlignMode {
+    /// One translation or bounded similarity transform.
+    #[default]
+    Global,
+    /// A smooth local correction to the global transform.
+    Local,
+}
+
+impl AlignMode {
+    pub(crate) fn parse(value: &str) -> Result<Self, Error> {
+        match value {
+            "global" => Ok(Self::Global),
+            "local" => Ok(Self::Local),
+            _ => Err(invalid("X3F_X3I_ALIGN requires global or local")),
+        }
+    }
+}
+
 /// Alignment settings for one conversion.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AlignOptions {
     /// Estimate and apply a transform for every frame except the reference.
     pub enabled: bool,
+    /// Spatial model. Local estimates fall back to the global transform.
+    pub mode: AlignMode,
     /// Reject tiles with a correlation peak below this value.
     pub min_peak: f32,
     /// Largest shift the estimator searches, in full-resolution pixels.
@@ -25,6 +47,7 @@ impl Default for AlignOptions {
     fn default() -> Self {
         Self {
             enabled: true,
+            mode: AlignMode::Global,
             min_peak: 0.05,
             max_shift_px: 64,
             tile_grid: 3,
@@ -61,15 +84,32 @@ pub struct Alignment {
     pub peak: f32,
     /// Largest distance from the median shift among retained tiles, in pixels.
     pub tile_spread: f32,
-    /// Largest retained-tile residual of the selected transform, in pixels.
+    /// Largest retained-tile residual of the global transform, in pixels.
     pub max_tile_residual: f32,
-    /// Number of tiles retained for the selected transform.
+    /// Number of tiles retained for the global transform.
     pub retained_tiles: u32,
     /// Frame-to-reference transform `[a, b, tx, c, d, ty]` when tiles disagree.
     /// Maps `(x, y)` to `(a*x + b*y + tx, c*x + d*y + ty)`.
     pub similarity: Option<[f32; 6]>,
     /// True when alignment is not trusted. Merge this frame without a transform.
     pub skipped: bool,
+    /// Local source-coordinate corrections on the reference grid.
+    pub local: Option<DisplacementField>,
+    /// Number of trusted tiles in the local grid.
+    pub local_retained_tiles: u32,
+    /// Largest local tile residual after smoothing, in full-resolution pixels.
+    pub local_max_tile_residual: f32,
+    /// Reason that a requested local estimate kept the global transform.
+    pub local_fallback: Option<&'static str>,
+    /// Post-warp global estimate: dx, dy and maximum retained-tile residual.
+    /// None means that no trusted post-warp measurement is available.
+    pub post_warp_residual: Option<[f32; 3]>,
+    /// Largest trusted post-warp shift on a grid offset from the fitting grid.
+    /// The measurement includes subject motion.
+    /// None means that too few residual tiles were trusted.
+    pub applied_residual: Option<f32>,
+    /// Number of trusted tiles in the post-warp residual measurement.
+    pub residual_tiles: u32,
 }
 
 impl Alignment {
@@ -85,14 +125,92 @@ impl Alignment {
             .unwrap_or([1.0, 0.0, self.dx, 0.0, 1.0, self.dy]);
         let det = a * d - b * c;
         let (u, v) = (x - tx, y - ty);
-        [(d * u - b * v) / det, (a * v - c * u) / det]
+        let offset = self.local.as_ref().map_or([0.0; 2], |field| field.at(x, y));
+        [
+            (d * u - b * v) / det + offset[0],
+            (a * v - c * u) / det + offset[1],
+        ]
     }
 
     /// True when the transform leaves the frame unchanged.
     pub fn is_identity(&self) -> bool {
+        if self.local.is_some() {
+            return false;
+        }
         match self.similarity {
             Some(matrix) => matrix == [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
             None => self.dx == 0.0 && self.dy == 0.0,
+        }
+    }
+}
+
+/// Bilinear source-coordinate corrections at regularly spaced tile centres.
+/// The estimator bounds the gradient before it exposes the field.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisplacementField {
+    size: [usize; 2],
+    origin: [f32; 2],
+    step: [f32; 2],
+    offsets: Vec<[f32; 2]>,
+}
+
+impl DisplacementField {
+    /// Source-coordinate correction at a full-resolution reference coordinate.
+    pub fn at(&self, x: f32, y: f32) -> [f32; 2] {
+        let cell = |value: f32, axis: usize| {
+            let p = ((value - self.origin[axis]) / self.step[axis])
+                .clamp(0.0, (self.size[axis] - 1) as f32);
+            let i = (p as usize).min(self.size[axis] - 2);
+            (i, p - i as f32)
+        };
+        let (ix, fx) = cell(x, 0);
+        let (iy, fy) = cell(y, 1);
+        let mut result = [0.0; 2];
+        for (j, wy) in [1.0 - fy, fy].into_iter().enumerate() {
+            for (i, wx) in [1.0 - fx, fx].into_iter().enumerate() {
+                let offset = self.offsets[(iy + j) * self.size[0] + ix + i];
+                for axis in 0..2 {
+                    result[axis] += offset[axis] * wx * wy;
+                }
+            }
+        }
+        result
+    }
+
+    /// Minimum and maximum correction on each axis, in full-resolution pixels.
+    pub fn range(&self) -> [[f32; 2]; 2] {
+        let mut range = [[f32::INFINITY, f32::NEG_INFINITY]; 2];
+        for offset in &self.offsets {
+            for axis in 0..2 {
+                range[axis][0] = range[axis][0].min(offset[axis]);
+                range[axis][1] = range[axis][1].max(offset[axis]);
+            }
+        }
+        range
+    }
+
+    fn bound_gradient(&mut self, limit: f32) {
+        let mut slopes = [0.0f32; 2];
+        for y in 0..self.size[1] {
+            for x in 0..self.size[0] {
+                let p = y * self.size[0] + x;
+                for axis in 0..2 {
+                    if [x, y][axis] + 1 < self.size[axis] {
+                        let q = p + [1, self.size[0]][axis];
+                        let slope = (self.offsets[p][0] - self.offsets[q][0])
+                            .hypot(self.offsets[p][1] - self.offsets[q][1])
+                            / self.step[axis];
+                        slopes[axis] = slopes[axis].max(slope);
+                    }
+                }
+            }
+        }
+        // A Frobenius bound below the global map's minimum stretch prevents folds.
+        let factor = (limit / slopes[0].hypot(slopes[1]).max(limit)).min(1.0);
+        for offset in &mut self.offsets {
+            for value in offset {
+                *value *= factor;
+            }
         }
     }
 }
@@ -305,6 +423,17 @@ fn tile_shift(
     range: i32,
     control: Control<'_>,
 ) -> Result<Tile, Error> {
+    tile_shift_around(reference, frame, origin, n, ([0.0; 2], range), control)
+}
+
+fn tile_shift_around(
+    reference: &Luma,
+    frame: &Luma,
+    origin: [usize; 2],
+    n: usize,
+    (centre, range): ([f32; 2], i32),
+    control: Control<'_>,
+) -> Result<Tile, Error> {
     let w = reference.width as usize;
     let [ox, oy] = origin;
     let mut a = vec![[0.0; 2]; n * n];
@@ -350,8 +479,9 @@ fn tile_shift(
         a[y.rem_euclid(n as i32) as usize * n + x.rem_euclid(n as i32) as usize][0]
     };
     let (mut dx, mut dy, mut peak) = (0, 0, 0.0);
-    for y in -range..=range {
-        for x in -range..=range {
+    let [cx, cy] = centre.map(|v| v.round() as i32);
+    for y in cy - range..=cy + range {
+        for x in cx - range..=cx + range {
             if at(x, y) > peak {
                 (dx, dy, peak) = (x, y, at(x, y));
             }
@@ -384,7 +514,8 @@ fn tile_shift(
         }
         let offset = refinement_offset(scores);
         for axis in 0..2 {
-            shift[axis] = (shift[axis] + step * offset[axis]).clamp(-range as f32, range as f32);
+            shift[axis] = (shift[axis] + step * offset[axis])
+                .clamp(centre[axis] - range as f32, centre[axis] + range as f32);
         }
     }
     Ok(Tile {
@@ -541,6 +672,197 @@ pub fn estimate(
     options: &AlignOptions,
     control: Control<'_>,
 ) -> Result<Alignment, Error> {
+    let mut alignment = estimate_global(reference, frame, options, control)?;
+    if options.enabled && options.mode == AlignMode::Local {
+        alignment.local_fallback = Some("untrusted global transform");
+        if !alignment.skipped {
+            estimate_local(reference, frame, options, &mut alignment, control)?;
+        }
+    }
+    Ok(alignment)
+}
+
+fn estimate_local(
+    reference: &Luma,
+    frame: &Luma,
+    options: &AlignOptions,
+    alignment: &mut Alignment,
+    control: Control<'_>,
+) -> Result<(), Error> {
+    let n = 256;
+    let range = (options.max_shift_px as usize).div_ceil(2);
+    let dimensions = [reference.width as usize, reference.height as usize];
+    alignment.local_fallback = Some("insufficient local grid or search range");
+    if dimensions.iter().any(|&d| d < n * 2) || range + 4 >= n / 2 {
+        return Ok(());
+    }
+    let size = dimensions.map(|d| (d - n) / n + 1);
+    let step = [
+        (dimensions[0] - n) / (size[0] - 1),
+        (dimensions[1] - n) / (size[1] - 1),
+    ];
+    let mut field = DisplacementField {
+        size,
+        origin: [n as f32 - 0.5; 2],
+        step: step.map(|s| (s * 2) as f32),
+        offsets: vec![[0.0; 2]; size[0] * size[1]],
+    };
+    let mut tiles = Vec::with_capacity(field.offsets.len());
+    for y in 0..size[1] {
+        for x in 0..size[0] {
+            control.check()?;
+            let centre = [
+                field.origin[0] + x as f32 * field.step[0],
+                field.origin[1] + y as f32 * field.step[1],
+            ];
+            let source = alignment.source_at(centre[0], centre[1]);
+            let shift = [(centre[0] - source[0]) * 0.5, (centre[1] - source[1]) * 0.5];
+            let tile = tile_shift_around(
+                reference,
+                frame,
+                [x * step[0], y * step[1]],
+                n,
+                (shift, 4),
+                control,
+            )?;
+            let offset = [tile.x - tile.dx - source[0], tile.y - tile.dy - source[1]];
+            let trusted = tile.peak >= options.min_peak.max(0.05)
+                && offset[0].hypot(offset[1]) <= 8.0
+                && tile_score(
+                    reference,
+                    frame,
+                    [x * step[0], y * step[1]],
+                    n,
+                    [tile.dx * 0.5, tile.dy * 0.5],
+                ) > 0.8;
+            tiles.push((offset, trusted));
+        }
+    }
+    let mut retained = vec![false; tiles.len()];
+    for y in 0..size[1] {
+        for x in 0..size[0] {
+            let p = y * size[0] + x;
+            if !tiles[p].1 {
+                continue;
+            }
+            let mut neighbours = Vec::new();
+            for yy in y.saturating_sub(1)..=(y + 1).min(size[1] - 1) {
+                for xx in x.saturating_sub(1)..=(x + 1).min(size[0] - 1) {
+                    let q = yy * size[0] + xx;
+                    if q != p && tiles[q].1 {
+                        neighbours.push(tiles[q].0);
+                    }
+                }
+            }
+            if neighbours.len() >= 2 {
+                let centre =
+                    [0, 1].map(|axis| median(neighbours.iter().map(|v| v[axis]).collect()));
+                retained[p] = (tiles[p].0[0] - centre[0]).hypot(tiles[p].0[1] - centre[1]) <= 2.0;
+            }
+        }
+    }
+    let count = retained.iter().filter(|&&keep| keep).count();
+    alignment.local_retained_tiles = count as u32;
+    alignment.local_fallback = Some("too few consistent local tiles");
+    // shortcut: Coverage was tested on two captures; recheck it on a larger motion corpus.
+    if count < 6 || count * 4 < tiles.len() {
+        return Ok(());
+    }
+    // Solve a small grid with neighbour regularisation; missing tiles have no data term.
+    for _ in 0..80 {
+        control.check()?;
+        let previous = field.offsets.clone();
+        for y in 0..size[1] {
+            for x in 0..size[0] {
+                let p = y * size[0] + x;
+                let weight = if retained[p] { 1.0 } else { 0.0 };
+                let mut sum = tiles[p].0.map(|v| v * weight);
+                let mut total = weight;
+                for (xx, yy) in [
+                    (x.wrapping_sub(1), y),
+                    (x + 1, y),
+                    (x, y.wrapping_sub(1)),
+                    (x, y + 1),
+                ] {
+                    if xx < size[0] && yy < size[1] {
+                        for axis in 0..2 {
+                            sum[axis] += 0.1 * previous[yy * size[0] + xx][axis];
+                        }
+                        total += 0.1;
+                    }
+                }
+                field.offsets[p] = sum.map(|v| v / total);
+            }
+        }
+    }
+    let scale = alignment.similarity.map_or(1.0, |m| m[0].hypot(m[3]));
+    field.bound_gradient(0.25 / scale);
+    alignment.local_max_tile_residual = tiles
+        .iter()
+        .zip(&retained)
+        .zip(&field.offsets)
+        .filter(|((_, keep), _)| **keep)
+        .map(|((tile, _), value)| (tile.0[0] - value[0]).hypot(tile.0[1] - value[1]))
+        .fold(0.0, f32::max);
+    alignment.local_fallback = Some("local field disagrees after smoothing");
+    if alignment.local_max_tile_residual > 1.5 {
+        return Ok(());
+    }
+    alignment.local = Some(field);
+    alignment.local_fallback = None;
+    Ok(())
+}
+
+fn residual_tiles(
+    reference: &Luma,
+    frame: &Luma,
+    control: Control<'_>,
+) -> Result<Vec<Tile>, Error> {
+    let n = 256;
+    let dimensions = [reference.width as usize, reference.height as usize];
+    if dimensions.iter().any(|&d| d < 2 * n) {
+        return Ok(Vec::new());
+    }
+    let size = dimensions.map(|d| (d - n) / n + 1);
+    let step = [
+        (dimensions[0] - n) / (size[0] - 1),
+        (dimensions[1] - n) / (size[1] - 1),
+    ];
+    let mut tiles = Vec::new();
+    for y in 0..size[1] - 1 {
+        for x in 0..size[0] - 1 {
+            control.check()?;
+            let origin = [x * step[0] + step[0] / 2, y * step[1] + step[1] / 2];
+            let tile = tile_shift(reference, frame, origin, n, 4, control)?;
+            if tile.peak >= 0.05
+                && tile_score(reference, frame, origin, n, [tile.dx * 0.5, tile.dy * 0.5]) > 0.8
+            {
+                tiles.push(tile);
+            }
+        }
+    }
+    Ok(tiles)
+}
+
+pub(crate) fn measure_applied(
+    reference: &Luma,
+    warped: &Luma,
+    alignment: &mut Alignment,
+    control: Control<'_>,
+) -> Result<(), Error> {
+    let tiles = residual_tiles(reference, warped, control)?;
+    alignment.residual_tiles = tiles.len() as u32;
+    alignment.applied_residual =
+        (tiles.len() >= 6).then(|| tiles.iter().map(|t| t.dx.hypot(t.dy)).fold(0.0, f32::max));
+    Ok(())
+}
+
+fn estimate_global(
+    reference: &Luma,
+    frame: &Luma,
+    options: &AlignOptions,
+    control: Control<'_>,
+) -> Result<Alignment, Error> {
     control.check()?;
     if !options.enabled {
         return Ok(Alignment {
@@ -675,12 +997,12 @@ pub fn estimate(
             .fold(0.0f32, f32::max),
         similarity: transform,
         skipped: false,
+        ..Default::default()
     })
 }
 
 /// Resample with the inverse frame-to-reference transform.
 /// Allocate a full output plane set (25 bytes per pixel) while the input is live.
-/// The 300-row bands batch cancellation checks; they do not reduce this allocation.
 /// All 16 cubic taps must be inside the frame and valid. `d_max` takes their maximum.
 /// Identity and skipped alignments return the input allocations unchanged.
 pub fn warp(
@@ -689,10 +1011,41 @@ pub fn warp(
     control: Control<'_>,
 ) -> Result<FramePlanes, Error> {
     control.check()?;
-    let n = validate_planes(&planes)?;
+    validate_planes(&planes)?;
     if alignment.is_identity() || alignment.skipped {
         return Ok(planes);
     }
+    warp_rows(&planes, alignment, 0..planes.height, control)
+}
+
+/// Resample an output row range using the complete source frame.
+/// Returned planes start at `rows.start` and contain only the requested rows.
+/// Signal uses Catmull-Rom; validity and saturation use all 16 source taps.
+pub fn warp_rows(
+    planes: &FramePlanes,
+    alignment: &Alignment,
+    rows: std::ops::Range<u32>,
+    control: Control<'_>,
+) -> Result<FramePlanes, Error> {
+    control.check()?;
+    validate_planes(planes)?;
+    if rows.start > rows.end || rows.end > planes.height {
+        return Err(invalid("invalid output row range"));
+    }
+    let w = planes.width as usize;
+    let first = rows.start as usize * w;
+    let end = rows.end as usize * w;
+    if alignment.is_identity() || alignment.skipped {
+        return Ok(FramePlanes {
+            width: planes.width,
+            height: rows.end - rows.start,
+            x: planes.x[first * 3..end * 3].to_vec(),
+            var: planes.var[first * 2..end * 2].to_vec(),
+            d_max: planes.d_max[first..end].to_vec(),
+            valid: planes.valid[first..end].to_vec(),
+        });
+    }
+    let n = end - first;
     let [a, b, tx, c, d, ty] =
         alignment
             .similarity
@@ -705,58 +1058,55 @@ pub fn warp(
     let h = planes.height as usize;
     let mut out = FramePlanes {
         width: planes.width,
-        height: planes.height,
+        height: rows.end - rows.start,
         x: vec![0.0; n * 3],
         var: vec![0.0; n * 2],
         d_max: vec![f32::INFINITY; n],
         valid: vec![0; n],
     };
-    for band in (0..h).step_by(300) {
+    for y in rows.start as usize..rows.end as usize {
         control.check()?;
-        for y in band..(band + 300).min(h) {
-            control.check()?;
-            for x in 0..w {
-                let [sx, sy] = alignment.source_at(x as f32, y as f32);
-                let ix = sx.floor();
-                let iy = sy.floor();
-                if !sx.is_finite()
-                    || !sy.is_finite()
-                    || ix < 1.0
-                    || iy < 1.0
-                    || ix + 2.0 >= w as f32
-                    || iy + 2.0 >= h as f32
-                {
-                    continue;
-                }
-                let fx = sx - ix;
-                let fy = sy - iy;
-                let (ix, iy) = (ix as usize, iy as usize);
-                let wx = cubic(fx);
-                let wy = cubic(fy);
-                let p = y * w + x;
-                let mut valid = true;
-                let mut maximum = f32::NEG_INFINITY;
-                for (j, &wy) in wy.iter().enumerate() {
-                    for (i, &wx) in wx.iter().enumerate() {
-                        let q = (iy + j - 1) * w + ix + i - 1;
-                        valid &= planes.valid[q] != 0 && planes.d_max[q].is_finite();
-                        maximum = maximum.max(planes.d_max[q]);
-                        for channel in 0..3 {
-                            out.x[p * 3 + channel] += planes.x[q * 3 + channel] * wx * wy;
-                        }
-                    }
-                }
-                for (j, wy) in [1.0 - fy, fy].into_iter().enumerate() {
-                    for (i, wx) in [1.0 - fx, fx].into_iter().enumerate() {
-                        let q = (iy + j) * w + ix + i;
-                        for channel in 0..2 {
-                            out.var[p * 2 + channel] += planes.var[q * 2 + channel] * wx * wy;
-                        }
-                    }
-                }
-                out.d_max[p] = maximum;
-                out.valid[p] = u8::from(valid);
+        for x in 0..w {
+            let [sx, sy] = alignment.source_at(x as f32, y as f32);
+            let ix = sx.floor();
+            let iy = sy.floor();
+            if !sx.is_finite()
+                || !sy.is_finite()
+                || ix < 1.0
+                || iy < 1.0
+                || ix + 2.0 >= w as f32
+                || iy + 2.0 >= h as f32
+            {
+                continue;
             }
+            let fx = sx - ix;
+            let fy = sy - iy;
+            let (ix, iy) = (ix as usize, iy as usize);
+            let wx = cubic(fx);
+            let wy = cubic(fy);
+            let p = (y - rows.start as usize) * w + x;
+            let mut valid = true;
+            let mut maximum = f32::NEG_INFINITY;
+            for (j, &wy) in wy.iter().enumerate() {
+                for (i, &wx) in wx.iter().enumerate() {
+                    let q = (iy + j - 1) * w + ix + i - 1;
+                    valid &= planes.valid[q] != 0 && planes.d_max[q].is_finite();
+                    maximum = maximum.max(planes.d_max[q]);
+                    for channel in 0..3 {
+                        out.x[p * 3 + channel] += planes.x[q * 3 + channel] * wx * wy;
+                    }
+                }
+            }
+            for (j, wy) in [1.0 - fy, fy].into_iter().enumerate() {
+                for (i, wx) in [1.0 - fx, fx].into_iter().enumerate() {
+                    let q = (iy + j) * w + ix + i;
+                    for channel in 0..2 {
+                        out.var[p * 2 + channel] += planes.var[q * 2 + channel] * wx * wy;
+                    }
+                }
+            }
+            out.d_max[p] = maximum;
+            out.valid[p] = u8::from(valid);
         }
     }
     Ok(out)
@@ -798,6 +1148,206 @@ mod tests {
             d_max: vec![0.3; w * h],
             valid: vec![1; w * h],
         }
+    }
+
+    #[test]
+    fn local_mode_parser() {
+        assert_eq!(AlignMode::parse("global").unwrap(), AlignMode::Global);
+        assert_eq!(AlignMode::parse("local").unwrap(), AlignMode::Local);
+        for value in ["", "LOCAL", "translation", "0"] {
+            assert!(AlignMode::parse(value).is_err());
+        }
+    }
+
+    #[test]
+    fn local_field_recovers_translation_and_smooth_bulge() {
+        let size = 2048;
+        let reference = luma(
+            &synthetic(size, size, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            0.85,
+            Control::none(),
+        )
+        .unwrap();
+        for bulge in [false, true] {
+            let forward = |x: f32, y: f32| {
+                let local = if bulge {
+                    1.5 * (-((x - 1024.0).powi(2) + (y - 1024.0).powi(2)) / 700.0f32.powi(2)).exp()
+                } else {
+                    0.0
+                };
+                let angle = if bulge { 0.001 } else { 0.0 };
+                [
+                    x - angle * (y - 1024.0) + 12.4 + local,
+                    y + angle * (x - 1024.0) - 1.7 - local * 0.5,
+                ]
+            };
+            let mut frame = synthetic(size, size, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+            for y in 0..size {
+                for x in 0..size {
+                    let [u, v] = forward(x as f32, y as f32);
+                    frame.x[(y * size + x) * 3..(y * size + x) * 3 + 3].fill(texture(u, v));
+                }
+            }
+            let map = luma(&frame, 0.85, Control::none()).unwrap();
+            let found = estimate(
+                &reference,
+                &map,
+                &AlignOptions {
+                    mode: AlignMode::Local,
+                    ..Default::default()
+                },
+                Control::none(),
+            )
+            .unwrap();
+            let field = found
+                .local
+                .as_ref()
+                .expect("smooth synthetic field must be trusted");
+            let mut maximum = 0.0f32;
+            for y in 0..field.size[1] {
+                for x in 0..field.size[0] {
+                    let rx = field.origin[0] + x as f32 * field.step[0];
+                    let ry = field.origin[1] + y as f32 * field.step[1];
+                    let source = found.source_at(rx, ry);
+                    let actual = forward(source[0], source[1]);
+                    maximum = maximum.max((actual[0] - rx).hypot(actual[1] - ry));
+                }
+            }
+            eprintln!("bulge={bulge} maximum centre error={maximum} alignment={found:?}");
+            assert!(maximum < if bulge { 0.2 } else { 0.1 });
+        }
+    }
+
+    #[test]
+    fn held_out_estimator_noise_floor() {
+        let reference = synthetic(2048, 2048, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        let mut frame = reference.clone();
+        let mut seed = 17u32;
+        for rgb in frame.x.as_chunks_mut::<3>().0 {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let noise = ((seed >> 8) as f32 / 16777216.0 - 0.5) * 0.02;
+            for value in rgb {
+                *value += noise;
+            }
+        }
+        let reference = luma(&reference, 0.85, Control::none()).unwrap();
+        let frame = luma(&frame, 0.85, Control::none()).unwrap();
+        let tiles = residual_tiles(&reference, &frame, Control::none()).unwrap();
+        assert_eq!(tiles.len(), 9);
+        let norms: Vec<_> = tiles.iter().map(|t| t.dx.hypot(t.dy)).collect();
+        let maximum = norms.iter().copied().fold(0.0, f32::max);
+        eprintln!(
+            "held-out noise floor: count={} max={} median={}",
+            norms.len(),
+            maximum,
+            median(norms)
+        );
+        assert!(maximum < 0.1);
+    }
+
+    #[test]
+    fn local_small_grid_falls_back_and_disable_wins() {
+        let map = luma(
+            &synthetic(768, 768, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            0.85,
+            Control::none(),
+        )
+        .unwrap();
+        let options = AlignOptions {
+            mode: AlignMode::Local,
+            ..Default::default()
+        };
+        let found = estimate(&map, &map, &options, Control::none()).unwrap();
+        assert!(!found.skipped && found.local.is_none() && found.local_fallback.is_some());
+        let disabled = estimate(
+            &map,
+            &map,
+            &AlignOptions {
+                enabled: false,
+                ..options
+            },
+            Control::none(),
+        )
+        .unwrap();
+        assert!(
+            disabled.is_identity() && disabled.local.is_none() && disabled.local_fallback.is_none()
+        );
+    }
+
+    #[test]
+    fn local_gradient_bound_prevents_folds_and_tears() {
+        let mut field = DisplacementField {
+            size: [3, 3],
+            origin: [0.0; 2],
+            step: [10.0; 2],
+            offsets: (0..9)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        [80.0, -90.0]
+                    } else {
+                        [-90.0, 80.0]
+                    }
+                })
+                .collect(),
+        };
+        field.bound_gradient(0.25);
+        for y in -10..30 {
+            for x in -10..30 {
+                let p = field.at(x as f32, y as f32);
+                let right = field.at(x as f32 + 0.01, y as f32);
+                let down = field.at(x as f32, y as f32 + 0.01);
+                let dx = [(right[0] - p[0]) / 0.01, (right[1] - p[1]) / 0.01];
+                let dy = [(down[0] - p[0]) / 0.01, (down[1] - p[1]) / 0.01];
+                assert!((1.0 + dx[0]) * (1.0 + dy[1]) - dx[1] * dy[0] > 0.5);
+                assert!(dx[0].hypot(dx[1]).hypot(dy[0].hypot(dy[1])) < 0.251);
+            }
+        }
+    }
+
+    #[test]
+    fn local_warp_rows_preserve_masks_and_match_full_warp() {
+        let mut frame = synthetic(24, 20, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        for p in 0..480 {
+            frame.valid[p] = u8::from(p % 24 < 13);
+            frame.d_max[p] = p as f32 / 480.0;
+        }
+        let alignment = Alignment {
+            local: Some(DisplacementField {
+                size: [2, 2],
+                origin: [0.0; 2],
+                step: [24.0, 20.0],
+                offsets: vec![[0.3, -1.7], [0.6, 0.1], [-0.4, 0.2], [0.3, 0.5]],
+            }),
+            ..Default::default()
+        };
+        let whole = warp(frame.clone(), &alignment, Control::none()).unwrap();
+        for rows in [0..7, 7..20, 20..20] {
+            let band = warp_rows(&frame, &alignment, rows.clone(), Control::none()).unwrap();
+            let start = rows.start as usize * 24;
+            let end = rows.end as usize * 24;
+            assert_eq!(band.x, whole.x[start * 3..end * 3]);
+            assert_eq!(band.var, whole.var[start * 2..end * 2]);
+            assert_eq!(band.valid, whole.valid[start..end]);
+            assert_eq!(band.d_max, whole.d_max[start..end]);
+        }
+        for y in 0..20 {
+            for x in 0..24 {
+                let offset = alignment.local.as_ref().unwrap().at(x as f32, y as f32);
+                let ix = (x as f32 + offset[0]).floor() as i32;
+                let iy = (y as f32 + offset[1]).floor() as i32;
+                let inside = ix >= 1 && iy >= 1 && ix + 2 < 24 && iy + 2 < 20;
+                assert_eq!(whole.valid[y * 24 + x] != 0, inside && ix + 2 < 13);
+                if inside {
+                    assert_eq!(
+                        whole.d_max[y * 24 + x],
+                        frame.d_max[(iy as usize + 2) * 24 + ix as usize + 2]
+                    );
+                }
+            }
+        }
+        assert!(warp_rows(&frame, &alignment, 0..21, Control::none()).is_err());
+        let identity = warp_rows(&frame, &Alignment::default(), 3..9, Control::none()).unwrap();
+        assert_eq!(identity.x, frame.x[3 * 24 * 3..9 * 24 * 3]);
     }
 
     #[test]
@@ -1325,6 +1875,16 @@ mod tests {
 
     #[test]
     fn corpus_shifts_and_warped_residuals() {
+        corpus_residuals(AlignMode::Global);
+    }
+
+    #[test]
+    #[ignore = "local alignment corpus comparison; run in release mode"]
+    fn corpus_local_shifts_and_warped_residuals() {
+        corpus_residuals(AlignMode::Local);
+    }
+
+    fn corpus_residuals(mode: AlignMode) {
         let root = std::env::var_os("X3F_TEST_FILES")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
@@ -1351,8 +1911,16 @@ mod tests {
             for index in 1..container.frames().len() {
                 let p = corpus_planes(&container, index, ceiling);
                 let map = luma(&p, 0.85, Control::none()).unwrap();
-                let found =
-                    estimate(&reference, &map, &AlignOptions::default(), Control::none()).unwrap();
+                let found = estimate(
+                    &reference,
+                    &map,
+                    &AlignOptions {
+                        mode,
+                        ..Default::default()
+                    },
+                    Control::none(),
+                )
+                .unwrap();
                 eprintln!("{name} frame {index}: {found:?}");
                 assert!(!found.skipped, "{name} frame {index}");
                 assert!(found.dx.abs() < 64.0 && found.dy.abs() < 64.0);
@@ -1375,6 +1943,14 @@ mod tests {
                     drop(map);
                     let warped = warp(p, &found, Control::none()).unwrap();
                     let map = luma(&warped, 0.85, Control::none()).unwrap();
+                    let tiles = residual_tiles(&reference, &map, Control::none()).unwrap();
+                    for tile in &tiles {
+                        eprintln!("held-out {name} mode={mode:?} frame={index} x={} y={} dx={} dy={} peak={}", tile.x, tile.y, tile.dx, tile.dy, tile.peak);
+                    }
+                    if !tiles.is_empty() {
+                        let norms: Vec<_> = tiles.iter().map(|t| t.dx.hypot(t.dy)).collect();
+                        eprintln!("held-out-summary {name} mode={mode:?} frame={index} count={} max={} median={}", norms.len(), norms.iter().copied().fold(0.0, f32::max), median(norms));
+                    }
                     let residual =
                         estimate(&reference, &map, &AlignOptions::default(), Control::none())
                             .unwrap();
