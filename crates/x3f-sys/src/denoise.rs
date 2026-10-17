@@ -1228,10 +1228,17 @@ unsafe fn yuv_to_bmt(area: *mut Area16, dt: DType) {
 // process.rs and the two Quattro passes in quattro.rs).
 // ----------------------------------------------------------------------
 
-/// Denoise a Quattro BMT raster with the selected backend and options.
-/// Width and height use pixels. Row stride uses u16 samples.
-/// Zero scale leaves samples unchanged.
-/// Cancellation leaves the input unchanged.
+/// Denoise B, M and T channels with the Quattro profile. Other cameras are unsupported.
+/// Width and height use pixels. Row stride and slice length use u16 samples, not bytes.
+/// The slice length must equal height times row stride. Width times channels must
+/// not exceed row stride. Row padding is never changed.
+/// Scale multiplies `DenoiseOptions::strength`. Noise levels use 16-bit camera codes.
+/// Adjust scale for other code ranges. For X3I samples divided by S, divide scale by S.
+/// Zero scale or disabled luminance and chroma leaves the data unchanged.
+/// Cancellation returns `Error::Cancelled` and leaves the input unchanged.
+/// Zero dimensions, channels other than three, invalid stride or length, arithmetic
+/// overflow, invalid denoise options, or a negative or nonfinite scale returns
+/// `Error::InvalidData`. Backend errors are returned by the selected kernel.
 pub fn denoise_u16(
     data: &mut [u16],
     width: u32,
@@ -1426,6 +1433,22 @@ mod tests {
             ));
         }
         assert!(denoise_u16(&mut data, 8, 8, 3, 24, f32::NAN, control).is_err());
+        let mut padded = vec![60000; 8 * 30];
+        for (row, input) in padded.chunks_exact_mut(30).zip(source.chunks_exact(24)) {
+            row[..24].copy_from_slice(input);
+        }
+        denoise_u16(&mut padded, 8, 8, 3, 30, 0.3, control).unwrap();
+        for row in padded.chunks_exact(30) {
+            assert!(row[..24].iter().all(|&v| (1000..6000).contains(&v)));
+            assert_eq!(&row[24..], &[60000; 6]);
+        }
+        for (length, stride) in [(8 * 23, 23), (8 * 24 + 1, 24)] {
+            let mut invalid = vec![3000; length];
+            assert!(matches!(
+                denoise_u16(&mut invalid, 8, 8, 3, stride, 0.3, control),
+                Err(crate::Error::InvalidData(_))
+            ));
+        }
     }
 
     #[test]
