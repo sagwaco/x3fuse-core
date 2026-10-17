@@ -559,7 +559,7 @@ impl MergeReport {
 /// Research ghost weight image at the full merge resolution.
 /// 255 means weight one and 0 means fully rejected. 128 marks invalid pixels;
 /// valid weights that round to 128 use 127 so the marker stays distinct.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct GhostMap {
     /// Source frame index. The reference has no map.
     pub frame_index: usize,
