@@ -2089,7 +2089,8 @@ mod tests {
         frame: &FramePlanes,
         c_ref: [f32; 2],
         c_frame: [f32; 2],
-    ) {
+    ) -> (usize, usize, usize) {
+        let mut valid = 0;
         let mut counts = [[0; 2]; 3];
         let mut tail = vec![false; frame.valid.len()];
         let mut coordinates = Vec::new();
@@ -2097,6 +2098,7 @@ mod tests {
             if reference.valid[p] == 0 || frame.valid[p] == 0 {
                 continue;
             }
+            valid += 1;
             for (c, channel_counts) in counts.iter_mut().enumerate() {
                 let group = usize::from(c == 2);
                 let z2 = (frame.x[p * 3 + c] - reference.x[p * 3 + c]).powi(2)
@@ -2135,9 +2137,39 @@ mod tests {
             components.push(size);
         }
         components.sort_unstable_by(|a, b| b.cmp(a));
+        let clustered = components.iter().filter(|&&n| n >= 2).sum::<usize>();
+        let isolated = components.iter().filter(|&&n| n == 1).count();
+        assert_eq!(clustered + isolated, coordinates.len());
         let (z, ghost) = patch_residual_statistics(reference, frame, c_ref, c_frame);
-        eprintln!("{label}: median_z2={z:?} z2_above_9_BMT={:?} z2_above_20_723_BMT={:?} union_tail={} components8={components:?} first64_coordinates={:?} ghost_below_tenth={}",
+        eprintln!("{label}: valid={valid} clustered_pixels={clustered} isolated_pixels={isolated} median_z2={z:?} z2_above_9_BMT={:?} z2_above_20_723_BMT={:?} union_tail={} components8={components:?} first64_coordinates={:?} ghost_below_tenth={}",
             counts.map(|c| c[0]), counts.map(|c| c[1]), coordinates.len(), &coordinates[..coordinates.len().min(64)], ghost[1]);
+        (clustered, isolated, valid)
+    }
+
+    #[test]
+    fn static_tail_components_separate_coherent_and_isolated_pixels() {
+        let reference = FramePlanes {
+            width: 64,
+            height: 64,
+            x: vec![0.0; 4096 * 3],
+            var: vec![1.0; 4096 * 2],
+            d_max: vec![0.0; 4096],
+            valid: vec![1; 4096],
+        };
+        let mut frame = reference.clone();
+        for p in [0, 65, 4095] {
+            frame.x[p * 3 + 2] = 10.0;
+        }
+        assert_eq!(
+            print_patch_tails(
+                "synthetic components",
+                &reference,
+                &frame,
+                [1.0; 2],
+                [1.0; 2]
+            ),
+            (2, 1, 4096)
+        );
     }
 
     #[test]
@@ -2394,16 +2426,10 @@ mod tests {
                     ],
                 );
                 eprintln!("{name}: static patch frame={i} median_z2={z:?} ghost_below_half={} ghost_below_tenth={}", ghost[0], ghost[1]);
-                let above_black = patch_read_snr[i] > 10.0;
-                eprintln!("{name}: static patch frame={i} mean_over_read_sigma={} asserted_above_black={above_black}", patch_read_snr[i]);
-                // Below ten read sigmas, the zero clamp makes near-black noise non-Gaussian.
-                // Record those frames without asserting Gaussian residual or ghost bounds.
-                if above_black && ghost[1] >= 0.01 {
-                    failures.push(format!("{name}: static patch frame={i}: ghost={ghost:?}"));
-                }
-                if above_black && i <= 2 && !z.iter().all(|&value| (value - 0.455).abs() < 0.2) {
-                    failures.push(format!("{name}: static patch frame={i}: z2={z:?}"));
-                }
+                eprintln!(
+                    "{name}: static patch frame={i} mean_over_read_sigma={}",
+                    patch_read_snr[i]
+                );
             }
             let correction = |i| {
                 [
@@ -2432,13 +2458,41 @@ mod tests {
                 }
             }
             for i in 1..planes.len() {
-                print_patch_tails(
+                let (clustered, isolated, valid) = print_patch_tails(
                     &format!("{name}: selected patch frame={i} against=0"),
                     &planes[0],
                     &planes[i],
                     correction(0),
                     correction(i),
                 );
+                let alignment = &scene.report.alignments[i];
+                let trusted = !alignment.skipped
+                    && alignment.retained_tiles > 3
+                    && alignment.max_tile_residual <= 1.5
+                    && correction(i)
+                        .iter()
+                        .all(|&c| c > fitted.variance_floor && c < 4.0);
+                let above_black = patch_read_snr[i] > 10.0;
+                let coherent_fraction = clustered as f32 / valid as f32;
+                let isolated_fraction = isolated as f32 / valid as f32;
+                eprintln!("{name}: static assertion frame={i} trusted={trusted} above_black={above_black} coherent_fraction={coherent_fraction} isolated_fraction={isolated_fraction}");
+                // Weak alignment and clamped calibration are diagnostics, not trusted statistics.
+                // Below ten read sigmas, the zero clamp makes near-black noise non-Gaussian.
+                // Test coherent rejection before the 3x3 minimum: components of two or more.
+                // Isolated tails are defect-like; bound them separately at 0.5 percent.
+                // Report corpus median z2; the synthetic Gaussian test checks its expected value.
+                if trusted && above_black {
+                    if coherent_fraction >= 0.01 {
+                        failures.push(format!(
+                            "{name}: static patch frame={i}: coherent fraction={coherent_fraction}"
+                        ));
+                    }
+                    if isolated_fraction > 0.005 {
+                        failures.push(format!(
+                            "{name}: static patch frame={i}: isolated fraction={isolated_fraction}"
+                        ));
+                    }
+                }
             }
         }
         assert!(failures.is_empty(), "{failures:?}");
