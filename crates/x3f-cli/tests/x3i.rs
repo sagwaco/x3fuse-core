@@ -4,7 +4,11 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use x3f_core::X3iContainer;
+
+// Each full merge holds about 2.6 GB. Run corpus merges one at a time.
+static X3I_MERGE_LOCK: Mutex<()> = Mutex::new(());
 
 struct Scratch(PathBuf);
 impl Drop for Scratch {
@@ -161,6 +165,7 @@ fn missing_shutter_keeps_metadata_and_cli_errors_give_guidance() {
 
 #[test]
 fn corpus_dng_merge_writes_seven_frame_report() {
+    let _merge = X3I_MERGE_LOCK.lock().unwrap();
     for name in ["DP0Q0002.X3I", "_DQH0978.X3I"] {
         let Some(input) = common::find_input(name) else {
             eprintln!("skip: {name} is absent");
@@ -446,6 +451,7 @@ fn assert_zero_shift(reference: &[u16], actual: &[u16], width: usize, height: us
 }
 
 fn check_merged_color(name: &str, check_position: bool) {
+    let _merge = X3I_MERGE_LOCK.lock().unwrap();
     use std::sync::atomic::AtomicBool;
     use x3f_core::{prepare_scene_linear, SceneLinearOptions};
 
