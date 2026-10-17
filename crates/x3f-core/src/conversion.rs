@@ -216,7 +216,10 @@ fn convert_x3i(
             sys::load_data(x3f, property, frame0_control)?;
         }
         sys::load_data(x3f, sys::x3f_get_camf(x3f), frame0_control)?;
-        sys::load_data(x3f, sys::x3f_get_raw(x3f), frame0_control)?;
+        if options.color_mode.is_some() {
+            // Color Mode calibration needs the unprocessed RAW samples.
+            sys::load_data(x3f, sys::x3f_get_raw(x3f), frame0_control)?;
+        }
     }
     let inputs =
         dng::WriterInputs::resolve(&frame0, options, frame0_control, &mut report.warnings)?;
@@ -228,6 +231,7 @@ fn convert_x3i(
             .push("denoise is not applied to X3I merges yet".into());
     }
     merge_options.process.denoise_intensity = 0;
+    // The default path defers frame 0 RAW until the temporary estimation frame is dropped.
     merge_options.saturation = Some(merge_options.saturation_for(&container, control)?);
     let mut scene = x3i_merge::merge(
         container.frames().len(),
