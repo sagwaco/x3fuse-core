@@ -121,18 +121,20 @@ written only with `-x3i-report`.
 Every frame is prepared once in each pass, for `2n` merge-loader calls.
 Decode events occur in statistics and Process events in accumulation.
 Statistics rasters are released before accumulation. An aligned H conversion
-measured 46 seconds and 4.63 GB peak RSS before the anchored-calibration
-revision. The 1.4 GB target still needs row-band processing. See the
+measured 43 seconds and 4.39 GB peak RSS in the final uncontended run. The
+1.4 GB target still needs row-band processing. See the
 [pipeline description](./pipeline.md#x3i-merge-stage) for the model and fallbacks.
 
 Known dp0 limit: the frames are not mutually linear across the bracket.
-On a static region, short frames read 5 to 8 percent high at mid levels and
-6 to 10 percent low near the reference cut. Ghost rejection keeps the reference
-there, and short frames carry only the range above the reference cut; a
-hand-off step of a few percent is possible on this body. The likely cause is
-raw response linearisation that SPP applies as a CAMF LUT before composing
-and this pipeline does not apply; investigate it separately without changing
-the merge model here.
+On a static region, short frames read 2 to 8 percent high at mid levels,
+growing with the exposure difference, and 6 to 10 percent low near the
+reference cut. Ghost rejection keeps the reference there, and short frames
+carry only the range above the reference cut; a hand-off step of up to about
+10 percent is possible on this body. One
+hypothesis is that SPP uses a response-linearisation LUT from the CAMF
+`OECF_*` entries before composing; this has not been verified, and this
+pipeline does not apply such a LUT. Investigate it separately without
+changing the merge model here.
 
 ## Research overrides
 

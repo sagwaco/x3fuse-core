@@ -2937,16 +2937,23 @@ mod tests {
                     && alignment.max_tile_residual <= 1.5
                     && correction(i)
                         .iter()
-                        .all(|&c| c > fitted.variance_floor && c < 4.0);
+                        .all(|&c| c >= fitted.variance_floor && c < 4.0);
                 let above_black = patch_read_snr[i] > 10.0;
                 let coherent_fraction = clustered as f32 / valid as f32;
                 let isolated_fraction = isolated as f32 / valid as f32;
                 eprintln!("{name}: static assertion frame={i} trusted={trusted} above_black={above_black} coherent_fraction={coherent_fraction} isolated_fraction={isolated_fraction}");
-                // Weak alignment and clamped calibration are diagnostics, not trusted statistics.
+                // Weak alignment and upper-clamped calibration remain diagnostic only.
+                // Include the lower clamp because it gives conservative rejection.
                 // Below ten read sigmas, the zero clamp makes near-black noise non-Gaussian.
                 // Test coherent rejection before the 3x3 minimum: components of two or more.
                 // Isolated tails are defect-like; bound them separately at 0.5 percent.
                 // Report corpus median z2; the synthetic Gaussian test checks its expected value.
+                if name == "_DQH0978.X3I" {
+                    assert!(
+                        trusted && above_black,
+                        "H frame {i} must exercise the static bounds"
+                    );
+                }
                 if trusted && above_black {
                     if coherent_fraction >= 0.01 {
                         failures.push(format!(

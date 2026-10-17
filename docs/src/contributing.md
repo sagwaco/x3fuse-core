@@ -442,6 +442,8 @@ refinement and anchored effective-variance calibration replace the aligned
 pin `db749dee7d09a65817c2df39dcf235d7`. That earlier aligned pin, at commit
 `38bbeef`, replaced phase 1 `494b455d3286dfdc1c5243ad60a31284`; at that commit,
 `X3F_X3I_NO_ALIGN=1` reproduces `302684ec51a01cddbd4ae76cc3e2bc29`.
+The current `X3F_X3I_NO_ALIGN=1` digest is
+`beee26a4f91f97ccfd959ec4c6b5c62d`.
 These merge pins are separate from the unchanged single-frame baselines above.
 Floating-point merge bytes can differ on other platforms; structural and
 same-run checks still apply there. Record any intentional merge algorithm
