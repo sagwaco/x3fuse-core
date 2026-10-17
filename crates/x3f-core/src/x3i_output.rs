@@ -29,8 +29,9 @@ pub(crate) fn merge_frames(
                 if i != 0 {
                     on_stage(ConversionStage::Decode);
                 }
-                on_stage(ConversionStage::Process);
                 reported[i] = true;
+            } else {
+                on_stage(ConversionStage::Process);
             }
             control.check()?;
             // Preparation mutates RAW. Each pass needs a fresh reader, including frame 0.
