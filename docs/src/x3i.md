@@ -96,6 +96,11 @@ use the phase 1 merge and do not establish a useful default strength.
 | `X3F_X3I_MAX_S=value` | Cap the shared encoding scale. Unset keeps all finite headroom. Report clipped samples. |
 | `X3F_X3I_SATURATION=b,m,t` | Override the measured physical ceiling of each plane in normalized raw-range units. |
 | `X3F_X3I_ROLLOFF=knee,width,margin` | Set knee, width and validity margin relative to the ceiling. Defaults: `0.75,0.02,0.15`. |
+| `X3F_X3I_NO_ALIGN=1` | Disable frame alignment. Merge frames at their original positions. |
+| `X3F_X3I_FIXED_RATIOS=1` | Keep nominal shutter ratios. Report fitted ratios without applying them. |
+| `X3F_X3I_NO_GHOST=1` | Disable ghost rejection and effective-variance calibration. |
+| `X3F_X3I_C_MIN=value` | Set the effective-variance calibration floor. Default: `0.1`; range: above zero through one. |
+| `X3F_X3I_RATIO_TREND=value` | Set the maximum relative trend across supported ratio bins. Default: `0.02` (2 percent). Larger trends keep the nominal ratio. |
 | `X3F_X3I_DENOISE_SCALE=value` | Enable experimental post-merge denoise when positive. Unset or zero disables it. |
 
 See the [merge stage](./pipeline.md#x3i-merge-stage) for weighting, validity,
