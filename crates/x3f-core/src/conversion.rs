@@ -289,6 +289,7 @@ fn convert_x3i(
         scene.report.fallback_shortest, scene.report.fallback_zero, scene.report.clipped_samples,
         scene.report.minimum, scene.report.maximum,
     ));
+    report.warnings.extend(scene.report.statistics());
     report.warnings.extend(scene.report.warnings());
     let mut image = crate::x3i_merge::to_image(&scene)?;
     let denoised = x3i_output::denoise(&mut image, options, denoise_scale, control)?;

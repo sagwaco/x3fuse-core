@@ -21,22 +21,23 @@ pub(crate) fn merge_frames(
     merge_options.process.denoise_intensity = 0;
     merge_options.saturation =
         Some(merge_options.saturation_for_with_warnings(container, control, warnings)?);
+    let mut reported = vec![false; container.frames().len()];
     let mut scene = x3i_merge::merge(
         container.frames().len(),
         |i| {
-            if i > 0 {
-                on_stage(ConversionStage::Decode);
-                control.check()?;
-            }
-            on_stage(ConversionStage::Process);
-            control.check()?;
-            let mut frame = if i == 0 {
-                frame0.merge_frame(&merge_options.process, control)?
+            if !reported[i] {
+                if i != 0 {
+                    on_stage(ConversionStage::Decode);
+                }
+                reported[i] = true;
             } else {
-                container
-                    .open_frame(i)?
-                    .merge_frame(&merge_options.process, control)?
-            };
+                on_stage(ConversionStage::Process);
+            }
+            control.check()?;
+            // Preparation mutates RAW. Each pass needs a fresh reader, including frame 0.
+            let mut frame = container
+                .open_frame(i)?
+                .merge_frame(&merge_options.process, control)?;
             frame.frame_index = i;
             Ok(frame)
         },

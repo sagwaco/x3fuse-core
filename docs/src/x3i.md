@@ -88,6 +88,54 @@ All residual changes were multiples of four. Adobe DNG SDK 1.7.1 renders
 show stronger chroma variation in the denoised patches. These measurements
 use the phase 1 merge and do not establish a useful default strength.
 
+## Phase 2 statistics
+
+The statistics pass aligns each frame to frame 0. A skipped alignment keeps
+that frame at its original position and reports possible misregistration.
+A scalar exposure fit uses the median of clean, supported bin medians.
+An affine fit supplies a black-offset diagnostic only. Near-black bias is
+nonlinear, so using the affine slope would bias the scale. Short exposures
+use reference levels from 5 to 60 percent of the ceiling. Long exposures use 5 to 25 percent and must stay below 40 percent
+of their own ceiling. Frame T must exceed ten read sigmas. A bin needs at
+least 1000 pairs or 0.1 percent of pixels. A clean bin also needs a mean frame
+signal above thirty read sigmas, with reference samples below the roll-off
+knee. At least two clean bins must qualify. A trend above 2 percent across
+those bins, or a scale change above 0.3 EV, keeps the nominal shutter ratio.
+
+Raw reference/+1 EV frame pairs provide separate B, M and T shot-noise fits
+from flat 8x8 blocks. Each fit needs 50 blocks; otherwise its default or
+explicit override remains. Effective variance fixes `c_ref=1` and calibrates
+separate T and B/M corrections from at least 50 flat blocks above ten read
+sigmas in both frames. Corrections stay in `[0.5,4]`. A reference model term
+more than eight times the frame term marks the calibration as weak. Pixels
+below ten sigmas use the uncorrected model. This overestimates variance after
+the intermediate zero clamp and conservatively under-rejects dark noise.
+
+The accumulation pass compares each frame with the reference estimate.
+Ghost weights are `exp(-max_channel(z²)/9)`, followed by a 3x3 minimum.
+Reported ghost fractions count valid weights below 0.1. This threshold
+corresponds to a channel residual above 4.55 sigma before the minimum.
+Summary and alignment rows remain on stderr. Ratio and ghost bins are
+written only with `-x3i-report`.
+
+Every frame is prepared once in each pass, for `2n` merge-loader calls.
+Decode events occur in statistics and Process events in accumulation.
+Statistics rasters are released before accumulation. An aligned H conversion
+measured 43 seconds and 4.39 GB peak RSS in the final uncontended run. The
+1.4 GB target still needs row-band processing. See the
+[pipeline description](./pipeline.md#x3i-merge-stage) for the model and fallbacks.
+
+Known dp0 limit: the frames are not mutually linear across the bracket.
+On a static region, short frames read 2 to 8 percent high at mid levels,
+growing with the exposure difference, and 6 to 10 percent low near the
+reference cut. Ghost rejection keeps the reference there, and short frames
+carry only the range above the reference cut; a hand-off step of up to about
+10 percent is possible on this body. One
+hypothesis is that SPP uses a response-linearisation LUT from the CAMF
+`OECF_*` entries before composing; this has not been verified, and this
+pipeline does not apply such a LUT. Investigate it separately without
+changing the merge model here.
+
 ## Research overrides
 
 | Variable | Effect |
@@ -96,6 +144,11 @@ use the phase 1 merge and do not establish a useful default strength.
 | `X3F_X3I_MAX_S=value` | Cap the shared encoding scale. Unset keeps all finite headroom. Report clipped samples. |
 | `X3F_X3I_SATURATION=b,m,t` | Override the measured physical ceiling of each plane in normalized raw-range units. |
 | `X3F_X3I_ROLLOFF=knee,width,margin` | Set knee, width and validity margin relative to the ceiling. Defaults: `0.75,0.02,0.15`. |
+| `X3F_X3I_NO_ALIGN=1` | Disable frame alignment. Merge frames at their original positions. |
+| `X3F_X3I_FIXED_RATIOS=1` | Keep nominal shutter ratios. Report fitted ratios without applying them. |
+| `X3F_X3I_NO_GHOST=1` | Disable ghost rejection and effective-variance calibration. |
+| `X3F_X3I_C_MIN=value` | Set the effective-variance calibration floor. Default: `0.5`; range: above zero through one. |
+| `X3F_X3I_RATIO_TREND=value` | Set the maximum relative trend across clean supported ratio bins. Default: `0.02` (2 percent). Larger trends keep the nominal ratio. |
 | `X3F_X3I_DENOISE_SCALE=value` | Enable experimental post-merge denoise when positive. Unset or zero disables it. |
 
 See the [merge stage](./pipeline.md#x3i-merge-stage) for weighting, validity,

@@ -218,6 +218,59 @@ fn corpus_dng_merge_writes_seven_frame_report() {
                 assert!((0.0..=1.0).contains(&fraction.parse::<f64>().unwrap()));
             }
         }
+        assert!(report.contains("X3I noise: k_B="));
+        let statistics: Vec<_> = report
+            .lines()
+            .filter(|line| line.contains(": statistics nominal="))
+            .collect();
+        let alignments: Vec<_> = report
+            .lines()
+            .filter(|line| line.contains(": alignment dx="))
+            .collect();
+        assert_eq!(statistics.len(), 7);
+        assert_eq!(alignments.len(), 7);
+        for line in &alignments {
+            assert!(line.contains("retained_tiles="));
+            assert!(line.contains("max_tile_residual="));
+            assert!(line.contains("weak="));
+        }
+        assert_eq!(
+            report
+                .lines()
+                .filter(|line| line.contains(": aligned-ratio-bin "))
+                .count(),
+            56
+        );
+        assert_eq!(
+            report
+                .lines()
+                .filter(|line| line.contains(": ghost-bin "))
+                .count(),
+            70
+        );
+        for (i, line) in statistics.iter().enumerate() {
+            assert!(line.starts_with(&format!("X3I frame {i}:")));
+            let number = |key: &str| {
+                line.split_whitespace()
+                    .find_map(|v| v.strip_prefix(key))
+                    .unwrap()
+                    .parse::<f64>()
+                    .unwrap()
+            };
+            assert!((number("refined=") / number("nominal=")).log2().abs() <= 0.3);
+            for key in ["c=", "c_chroma="] {
+                if i == 0 || number("calibration_blocks=") >= 50.0 {
+                    assert!((0.5..=4.0).contains(&number(key)));
+                } else {
+                    assert!(line.split_whitespace().any(|v| v == format!("{key}-")));
+                }
+            }
+            assert!(line.contains("black_offset="));
+            assert!(line.contains("calibration_weak="));
+            assert!(line.contains("median_z2_flat="));
+            assert!(line.contains("ghost_threshold=0.1 ghost_status=preliminary"));
+            assert!((0.0..=1.0).contains(&number("ghost_fraction=")));
+        }
         assert!(report.contains("X3I merge: frames=7 s="));
         assert!(report.contains("saturation: B="));
         assert_eq!(
@@ -248,7 +301,7 @@ fn corpus_dng_merge_writes_seven_frame_report() {
             let expected = common::file_md5(&dng);
             // This float output hash was recorded on macOS aarch64.
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            assert_eq!(expected, "494b455d3286dfdc1c5243ad60a31284");
+            assert_eq!(expected, "c80db90d70032be445b0a0a0af81b876");
             let report_path = scratch.0.join(format!("{name}.x3i-report"));
             std::fs::remove_file(&report_path).unwrap();
             std::fs::create_dir(&report_path).unwrap();
@@ -523,16 +576,12 @@ fn quattro_h_merged_color_matches_reference_midtones() {
     check_merged_color("_DQH0978.X3I", false);
 }
 
-// Unaligned long exposures dominate the merge and move its image away from frame 0.
-// The dp0 building patch peaks at (-9, -16), at the search bound. Enable after phase 2.
 #[test]
-#[ignore = "phase 2 alignment is not integrated; dp0 building peak is (-9, -16) at the search bound"]
 fn dp0_merged_position_matches_reference() {
     check_merged_color("DP0Q0002.X3I", true);
 }
 
 #[test]
-#[ignore = "phase 2 alignment is not integrated; the unaligned merge moves away from frame 0"]
 fn quattro_h_merged_position_matches_reference() {
     check_merged_color("_DQH0978.X3I", true);
 }

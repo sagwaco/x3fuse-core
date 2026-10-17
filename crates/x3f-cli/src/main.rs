@@ -830,7 +830,8 @@ fn add_x3i_warnings(args: &Args, warnings: &mut Vec<String>) {
 }
 
 fn show_x3i_warning(args: &Args, warning: &str) -> bool {
-    args.verbosity != Some(Verbosity::Error) || !warning.starts_with("X3I frame ")
+    !warning.contains("-bin ")
+        && (args.verbosity != Some(Verbosity::Error) || !warning.starts_with("X3I frame "))
 }
 
 fn for_each_input(files: &[PathBuf], convert: impl Fn(&Path) + Sync) {
@@ -1040,6 +1041,14 @@ mod tests {
                 show_x3i_warning(&args, "X3I frame 0: shutter_us=7813 scale=1"),
                 show_frames
             );
+            assert!(!show_x3i_warning(
+                &args,
+                "X3I frame 1: aligned-ratio-bin lower=0.05"
+            ));
+            assert!(!show_x3i_warning(
+                &args,
+                "X3I frame 1: ghost-bin lower=0.05"
+            ));
             for line in [
                 "X3I merge: frames=7 s=1",
                 "X3I fallback samples: shortest exposure 1",
