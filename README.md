@@ -76,9 +76,9 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 | Flag         | Output                          |
 | ------------ | ------------------------------- |
 | `-dng`       | DNG `LinearRaw` (**default**). Merge all frames for X3I input. Process X3I inputs serially; keep X3F batch conversion parallel.   |
-| `-tiff`      | 3×16-bit TIFF                   |
-| `-ppm`       | 3×16-bit PPM/P6 (binary)        |
-| `-ppm-ascii` | 3×16-bit PPM/P3 (ASCII)         |
+| `-tiff`      | 3×16-bit TIFF, including merged X3I RGB |
+| `-ppm`       | 3×16-bit PPM/P6 (binary), including merged X3I RGB |
+| `-ppm-ascii` | 3×16-bit PPM/P3 (ASCII), including merged X3I RGB |
 | `-jpg`       | embedded JPEG preview           |
 | `-raw`       | RAW area, undecoded             |
 | `-meta`      | metadata dump                   |
@@ -116,6 +116,22 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 | `-matrixmax <M>`          | max matrix elements in metadata dump (default 100)                                 |
 
 A few `X3F_*` environment variables tune specific stages, e.g. `X3F_CINEON_SCALE` (Cineon log-curve scale; default 100) and `X3F_DNG_SHOULDER_KNEE` (highlight-recovery knee; default `0.85`).
+
+X3I merges support DNG, TIFF and PPM. DNG preserves extended highlight range.
+TIFF and PPM clip output above one and skip the RGB chroma LUT and single-frame
+highlight recovery. X3I post-merge denoise stays off unless
+`X3F_X3I_DENOISE_SCALE` is positive, even with the default CLI denoise intensity.
+Residual quantization can cause deep-shadow bands.
+See [X3I merge and outputs](docs/src/x3i.md) and the
+[denoise measurements](docs/src/x3i.md#experimental-denoise).
+
+| X3I environment override | Effect |
+| --- | --- |
+| `X3F_X3I_NOISE=sigma,k,q` | Set normalized read, linear and quadratic noise terms. |
+| `X3F_X3I_MAX_S=value` | Cap highlight encoding scale; report clipped samples. |
+| `X3F_X3I_SATURATION=b,m,t` | Override per-plane physical sensor ceilings. |
+| `X3F_X3I_ROLLOFF=knee,width,margin` | Set knee, width and validity margin relative to the ceiling. Defaults: `0.75,0.02,0.15`. |
+| `X3F_X3I_DENOISE_SCALE=value` | Positive enables experimental post-merge NLM or BM3D; unset or zero disables it. |
 
 ### Examples
 

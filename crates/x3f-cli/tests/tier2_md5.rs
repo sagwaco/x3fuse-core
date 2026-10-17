@@ -124,3 +124,41 @@ fn available_local_camera_jpegs_match_section_payloads() {
         }
     }
 }
+
+#[test]
+fn public_ppm_conversion_matches_cli_bytes() {
+    use std::sync::atomic::AtomicBool;
+    use x3f_core::{convert_file, ColorEncoding, OutputFormat, ProcessOptions};
+
+    let input = skip_if_missing!(MERRILL_INPUT);
+    let directory = std::env::temp_dir().join(format!("x3f-api-ppm-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let status = std::process::Command::new(common::X3F_EXTRACT)
+        .args(["-ppm", "-no-denoise", "-color", "none", "-no-crop", "-o"])
+        .arg(&directory)
+        .arg(&input)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let cli = directory.join(format!(
+        "{}.ppm",
+        input.file_name().unwrap().to_str().unwrap()
+    ));
+    let api = directory.join("api.ppm");
+    convert_file(
+        &input,
+        &api,
+        OutputFormat::Ppm,
+        &ProcessOptions {
+            denoise_intensity: 0,
+            color_encoding: ColorEncoding::None,
+            crop: false,
+            ..Default::default()
+        },
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .unwrap();
+    assert!(std::fs::read(&api).unwrap() == std::fs::read(&cli).unwrap());
+    std::fs::remove_dir_all(directory).unwrap();
+}

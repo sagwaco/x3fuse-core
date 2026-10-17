@@ -53,6 +53,7 @@ mod scene;
 mod x3i;
 pub mod x3i_align;
 pub mod x3i_merge;
+mod x3i_output;
 
 pub use conversion::{convert_file, ConversionReport, ConversionStage, OutputFormat};
 pub use globals::{
@@ -152,6 +153,7 @@ pub struct ProcessOptions {
     /// intermediate values linearly attenuate filter strength
     /// (`scale = intensity / 10`). Values above 10 are clamped. Backed by the
     /// selected NLM/BM3D algorithm with portable Rust and optional GPU backends.
+    /// X3I denoise also requires a positive `X3F_X3I_DENOISE_SCALE`.
     pub denoise_intensity: u8,
     /// Select GPU acceleration or portable CPU execution (default: Auto).
     /// Enable the `gpu` Cargo feature for native acceleration. Auto falls back
