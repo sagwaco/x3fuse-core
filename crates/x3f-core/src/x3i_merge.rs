@@ -7,6 +7,9 @@
 //! Noise uses r = (sample - raw_black) / (raw_white - raw_black).
 //! Validity and saturation roll-off use d = r / saturation[plane].
 //! A measured sensor ceiling below the CAMF white changes only d, not noise units.
+//! A flat wall in an unsaturated frame can also pass the ceiling pile test.
+//! shortcut: no cross-frame ceiling check, phase 2 must require the second-longest
+//! frame's ceiling to agree within 2 percent before accepting the estimate.
 //! The intermediate encoding clamps at zero, so it truncates negative noise. Expansion
 //! also quantises and clamps BMT to u16, including Y = min(4T, 65535).
 //! The merge applies no signal-dependent dark weight. Unsigned DNG encoding
@@ -92,6 +95,23 @@ impl MergeOptions {
         container: &crate::X3iContainer,
         control: Control<'_>,
     ) -> Result<[f32; 3], Error> {
+        self.saturation_for_with_warnings(container, control, &mut Vec::new())
+    }
+
+    /// Estimate container ceilings with the default processing control.
+    pub fn saturation_for_container(
+        &self,
+        container: &crate::X3iContainer,
+    ) -> Result<[f32; 3], Error> {
+        self.saturation_for(container, Control::none())
+    }
+
+    pub(crate) fn saturation_for_with_warnings(
+        &self,
+        container: &crate::X3iContainer,
+        control: Control<'_>,
+        warnings: &mut Vec<String>,
+    ) -> Result<[f32; 3], Error> {
         control.check()?;
         self.validate()?;
         if let Some(saturation) = self.saturation {
@@ -110,25 +130,7 @@ impl MergeOptions {
         let frame = container
             .open_frame(longest.0)?
             .merge_frame(&options, control)?;
-        let mut saturation = [1.0; 3];
-        for (c, value) in saturation.iter_mut().enumerate() {
-            *value = if c == 2 {
-                estimate_plane_saturation(
-                    frame.raw_top.iter().copied(),
-                    frame.raw_black[c],
-                    frame.raw_white[c],
-                    control,
-                )?
-            } else {
-                estimate_plane_saturation(
-                    frame.raw_half.iter().skip(c).step_by(2).copied(),
-                    frame.raw_black[c],
-                    frame.raw_white[c],
-                    control,
-                )?
-            };
-        }
-        Ok(saturation)
+        estimate_saturation(&frame, longest.0, control, warnings)
     }
 
     fn parse_env(
@@ -203,12 +205,46 @@ impl MergeOptions {
     }
 }
 
+fn estimate_saturation(
+    frame: &MergeFrame,
+    index: usize,
+    control: Control<'_>,
+    warnings: &mut Vec<String>,
+) -> Result<[f32; 3], Error> {
+    let mut saturation = [1.0; 3];
+    for (c, value) in saturation.iter_mut().enumerate() {
+        let (ceiling, suspicious) = if c == 2 {
+            estimate_plane_saturation(
+                frame.raw_top.iter().copied(),
+                frame.raw_black[c],
+                frame.raw_white[c],
+                control,
+            )?
+        } else {
+            estimate_plane_saturation(
+                frame.raw_half.iter().skip(c).step_by(2).copied(),
+                frame.raw_black[c],
+                frame.raw_white[c],
+                control,
+            )?
+        };
+        *value = ceiling;
+        if suspicious {
+            warnings.push(format!(
+                "X3I saturation warning: frame={index} plane={} falls back to 1.0 despite a pile below 0.9 of the maximum; check X3F_X3I_SATURATION",
+                ["B", "M", "T"][c]
+            ));
+        }
+    }
+    Ok(saturation)
+}
+
 fn estimate_plane_saturation(
     values: impl Iterator<Item = u16>,
     black: f64,
     white: f64,
     control: Control<'_>,
-) -> Result<f32, Error> {
+) -> Result<(f32, bool), Error> {
     let mut histogram = vec![0usize; usize::from(u16::MAX) + 1];
     let mut count = 0usize;
     let mut maximum = 0u16;
@@ -220,19 +256,45 @@ fn estimate_plane_saturation(
         count += 1;
         maximum = maximum.max(value);
     }
-    let ceiling = (f64::from(maximum) - black) / (white - black);
-    if !ceiling.is_finite() || ceiling <= 0.0 {
-        return Ok(1.0);
+    let maximum = usize::from(maximum);
+    let mut tail = 0usize;
+    let support = count.div_ceil(10000).max(300);
+    let Some(mut candidate) = (0..=maximum).rev().find(|&value| {
+        tail += histogram[value];
+        tail >= support
+    }) else {
+        return Ok((1.0, false));
+    };
+    let lower = |upper: usize| {
+        (black + 0.99 * (upper as f64 - black))
+            .ceil()
+            .clamp(0.0, upper as f64) as usize
+    };
+    let enough = |pile: usize| pile >= 1000 && pile as f64 >= count as f64 * 0.0005;
+    // Keep the measured edge when the maximum already has a supported pile.
+    if enough(histogram[lower(maximum)..=maximum].iter().sum()) {
+        candidate = maximum;
     }
-    let lower = (black + 0.99 * (f64::from(maximum) - black))
+    let ceiling = (candidate as f64 - black) / (white - black);
+    if !ceiling.is_finite() || ceiling <= 0.0 {
+        return Ok((1.0, false));
+    }
+    if enough(histogram[lower(candidate)..=candidate].iter().sum()) {
+        return Ok((ceiling.clamp(0.3, 1.0) as f32, false));
+    }
+    // Prefix counts let the fallback diagnostic scan all lower piles once.
+    for i in 1..histogram.len() {
+        histogram[i] += histogram[i - 1];
+    }
+    let below = (black + 0.9 * (maximum as f64 - black))
         .ceil()
-        .clamp(0.0, f64::from(maximum)) as usize;
-    let pile: usize = histogram[lower..=usize::from(maximum)].iter().sum();
-    Ok(if pile >= 1000 && pile as f64 >= count as f64 * 0.0005 {
-        ceiling.clamp(0.3, 1.0) as f32
-    } else {
-        1.0
-    })
+        .clamp(0.0, maximum as f64) as usize;
+    let suspicious = (0..below).any(|upper| {
+        let start = lower(upper);
+        upper as f64 > black
+            && enough(histogram[upper] - start.checked_sub(1).map_or(0, |i| histogram[i]))
+    });
+    Ok((1.0, suspicious))
 }
 
 /// Exposure scales and sample statistics from one merge.
@@ -740,28 +802,31 @@ mod tests {
 
     #[test]
     fn ceiling_estimator_requires_a_pile_and_ignores_an_isolated_hot_pixel() {
-        let mut values: Vec<u16> = (0..200000).map(|i| (i % 1000) as u16 + 100).collect();
-        values.extend(3000..10000);
+        let mut values: Vec<u16> = (0..10000).collect();
         assert_eq!(
             estimate_plane_saturation(values.iter().copied(), 100.0, 10100.0, Control::none())
                 .unwrap(),
-            1.0
+            (1.0, false)
         );
-        values.extend(std::iter::repeat_n(10000, 5000));
-        let ceiling =
-            estimate_plane_saturation(values.iter().copied(), 100.0, 10100.0, Control::none())
-                .unwrap();
-        assert!((ceiling - 0.99).abs() < 1e-6);
-        let mut isolated: Vec<u16> = (0..200000).map(|i| (i % 1000) as u16 + 100).collect();
+        let mut isolated = values.clone();
         isolated.push(65535);
         assert_eq!(
             estimate_plane_saturation(isolated.into_iter(), 100.0, 10100.0, Control::none())
                 .unwrap(),
-            1.0
+            (1.0, false)
         );
+        values.extend(std::iter::repeat_n(10000, 5000));
+        let (ceiling, suspicious) =
+            estimate_plane_saturation(values.iter().copied(), 100.0, 10100.0, Control::none())
+                .unwrap();
+        assert!((ceiling - 0.99).abs() < 1e-6);
+        assert!(!suspicious);
         let pile = std::iter::repeat_n(4600, 5000);
         assert!(
-            (estimate_plane_saturation(pile, 100.0, 10100.0, Control::none()).unwrap() - 0.45)
+            (estimate_plane_saturation(pile, 100.0, 10100.0, Control::none())
+                .unwrap()
+                .0
+                - 0.45)
                 .abs()
                 < 1e-6
         );
@@ -770,6 +835,56 @@ mod tests {
             estimate_plane_saturation([1].into_iter(), 0.0, 10000.0, Control::new(&cancelled)),
             Err(Error::Cancelled)
         ));
+    }
+
+    #[test]
+    fn ceiling_estimator_keeps_a_plateau_below_an_outlier() {
+        let values = std::iter::repeat_n(4500, 5000).chain([9000]);
+        assert_eq!(
+            estimate_plane_saturation(values, 0.0, 10000.0, Control::none()).unwrap(),
+            (0.45, false)
+        );
+    }
+
+    #[test]
+    fn ceiling_estimator_clamps_accepted_low_ceilings_at_point_three() {
+        assert_eq!(
+            estimate_plane_saturation(
+                std::iter::repeat_n(2100, 5000),
+                100.0,
+                10100.0,
+                Control::none()
+            )
+            .unwrap(),
+            (0.3, false)
+        );
+    }
+
+    #[test]
+    fn ceiling_fallback_warns_for_each_plane_with_a_hidden_pile() {
+        let values: Vec<u16> = std::iter::repeat_n(4500, 5000)
+            .chain(std::iter::repeat_n(9000, 400))
+            .collect();
+        let frame = MergeFrame {
+            raw_half: values.iter().flat_map(|&v| [v; 2]).collect(),
+            raw_top: values,
+            raw_black: [0.0; 3],
+            raw_white: [10000.0; 3],
+            ..Default::default()
+        };
+        let mut warnings = Vec::new();
+        assert_eq!(
+            estimate_saturation(&frame, 6, Control::none(), &mut warnings).unwrap(),
+            [1.0; 3]
+        );
+        assert_eq!(warnings.len(), 3);
+        for (warning, plane) in warnings.iter().zip(["B", "M", "T"]) {
+            assert!(warning.starts_with(&format!(
+                "X3I saturation warning: frame=6 plane={plane} falls back to 1.0"
+            )));
+            assert!(warning.contains("pile below 0.9 of the maximum"));
+            assert!(warning.contains("X3F_X3I_SATURATION"));
+        }
     }
 
     #[test]
@@ -787,14 +902,12 @@ mod tests {
             }
             let container = crate::X3iContainer::open(path).unwrap();
             let options = MergeOptions::default();
-            let ceilings = options.saturation_for(&container, Control::none()).unwrap();
+            let ceilings = options.saturation_for_container(&container).unwrap();
             eprintln!("{name}: saturation={ceilings:?}");
             if name == "DP0Q0002.X3I" {
                 assert_eq!(ceilings, [1.0; 3]);
             } else {
-                assert!((0.40..=0.50).contains(&ceilings[0]));
-                assert!((0.40..=0.50).contains(&ceilings[1]));
-                assert!((0.50..=0.60).contains(&ceilings[2]));
+                assert_eq!(ceilings, [0.44519424, 0.42977452, 0.5464723]);
             }
             let explicit = MergeOptions {
                 saturation: Some([0.4, 0.5, 0.6]),

@@ -241,6 +241,7 @@ fn corpus_dng_merge_writes_seven_frame_report() {
         if name == "DP0Q0002.X3I" {
             let dng = scratch.0.join(format!("{name}.dng"));
             let expected = common::file_md5(&dng);
+            assert_eq!(expected, "2a48ebc1cd41e937923e3e78d542c368");
             let report_path = scratch.0.join(format!("{name}.x3i-report"));
             std::fs::remove_file(&report_path).unwrap();
             std::fs::create_dir(&report_path).unwrap();

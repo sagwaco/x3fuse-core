@@ -95,7 +95,7 @@ pub(super) fn radiometry(
         x3f_core::x3i_merge::MergeOptions::from_env().map_err(|e| e.to_string())?;
     merge_options.process = options.clone();
     let saturation = merge_options
-        .saturation_for(container, Default::default())
+        .saturation_for_container(container)
         .map_err(|e| e.to_string())?;
     let margin = merge_options.validity_margin as f64;
     let load = |i| -> Result<MergeFrame, String> {

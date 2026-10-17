@@ -1027,6 +1027,7 @@ mod tests {
             for line in [
                 "X3I merge: frames=7 s=1",
                 "X3I fallback samples: shortest exposure 1",
+                "X3I saturation warning: frame=6 plane=B falls back to 1.0",
                 "denoise is not applied to X3I merges yet",
                 "-dng-highlight-mapping has no effect on X3I merges",
             ] {

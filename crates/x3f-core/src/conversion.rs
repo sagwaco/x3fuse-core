@@ -232,7 +232,11 @@ fn convert_x3i(
     }
     merge_options.process.denoise_intensity = 0;
     // The default path defers frame 0 RAW until the temporary estimation frame is dropped.
-    merge_options.saturation = Some(merge_options.saturation_for(&container, control)?);
+    merge_options.saturation = Some(merge_options.saturation_for_with_warnings(
+        &container,
+        control,
+        &mut report.warnings,
+    )?);
     let mut scene = x3i_merge::merge(
         container.frames().len(),
         |i| {
