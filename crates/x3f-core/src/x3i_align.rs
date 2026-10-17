@@ -367,26 +367,7 @@ fn tile_shift(
             shift = phase_shift;
             break;
         }
-        let best = (0..9)
-            .max_by(|&i, &j| scores[i].total_cmp(&scores[j]))
-            .unwrap();
-        // Keep the phase shift when the masked window has no preference.
-        let best = if scores[best] > scores[4] { best } else { 4 };
-        let mut offset = [(best % 3) as f32 - 1.0, (best / 3) as f32 - 1.0];
-        if best == 4 {
-            let xx = scores[3] - 2.0 * scores[4] + scores[5];
-            let yy = scores[1] - 2.0 * scores[4] + scores[7];
-            let xy = (scores[8] - scores[6] - scores[2] + scores[0]) * 0.25;
-            let gx = (scores[5] - scores[3]) * 0.5;
-            let gy = (scores[7] - scores[1]) * 0.5;
-            let det = xx * yy - xy * xy;
-            if xx < 0.0 && yy < 0.0 && det > 1e-12 {
-                offset = [
-                    ((xy * gy - yy * gx) / det).clamp(-0.5, 0.5),
-                    ((xy * gx - xx * gy) / det).clamp(-0.5, 0.5),
-                ];
-            }
-        }
+        let offset = refinement_offset(scores);
         for axis in 0..2 {
             shift[axis] = (shift[axis] + step * offset[axis]).clamp(-range as f32, range as f32);
         }
@@ -398,6 +379,30 @@ fn tile_shift(
         dy: shift[1] * 2.0,
         peak,
     })
+}
+
+fn refinement_offset(scores: [f32; 9]) -> [f32; 2] {
+    let best = (0..9)
+        .max_by(|&i, &j| scores[i].total_cmp(&scores[j]))
+        .unwrap();
+    // Keep the phase shift when the masked window has no preference.
+    let best = if scores[best] > scores[4] { best } else { 4 };
+    let mut offset = [(best % 3) as f32 - 1.0, (best / 3) as f32 - 1.0];
+    if best == 4 && scores.iter().all(|score| score.is_finite()) {
+        let xx = scores[3] - 2.0 * scores[4] + scores[5];
+        let yy = scores[1] - 2.0 * scores[4] + scores[7];
+        let xy = (scores[8] - scores[6] - scores[2] + scores[0]) * 0.25;
+        let gx = (scores[5] - scores[3]) * 0.5;
+        let gy = (scores[7] - scores[1]) * 0.5;
+        let det = xx * yy - xy * xy;
+        if xx < 0.0 && yy < 0.0 && det > 1e-12 {
+            offset = [
+                ((xy * gy - yy * gx) / det).clamp(-0.5, 0.5),
+                ((xy * gx - xx * gy) / det).clamp(-0.5, 0.5),
+            ];
+        }
+    }
+    offset
 }
 
 fn tile_score(
@@ -1050,6 +1055,24 @@ mod tests {
     }
 
     #[test]
+    fn nonfinite_neighbours_keep_the_refinement_centre() {
+        assert_eq!(
+            refinement_offset([
+                0.0,
+                f32::NEG_INFINITY,
+                0.0,
+                f32::NEG_INFINITY,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+            ]),
+            [0.0, 0.0]
+        );
+    }
+
+    #[test]
     fn masked_refinement_region_preserves_the_phase_estimate() {
         let mut map = Luma {
             width: 128,
@@ -1351,6 +1374,7 @@ mod tests {
                     // This checks self-consistency; known synthetic transforms check accuracy.
                     let gate = 0.5f32.max(3.0 * residual_uncertainty);
                     let norm = residual.dx.hypot(residual.dy);
+                    assert!(norm < 1.5, "{name} frame {index}: residual {norm} px");
                     eprintln!("{name} frame {index}: uncertainty={uncertainty} px residual_uncertainty={residual_uncertainty} px residual_norm={norm} px gate={gate} px");
                     residuals.push((index, residual.skipped, norm, gate));
                 }
