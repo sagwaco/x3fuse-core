@@ -214,6 +214,14 @@ fn corpus_dng_merge_writes_seven_frame_report() {
             }
         }
         assert!(report.contains("X3I merge: frames=7 s="));
+        assert!(report.contains("saturation: B="));
+        assert_eq!(
+            report
+                .lines()
+                .filter(|line| line.starts_with("ratio-bin "))
+                .count(),
+            56
+        );
         assert!(report.contains("have no effect on X3I merges"));
         #[cfg(unix)]
         {
