@@ -272,24 +272,37 @@ fn corpus_dng_merge_writes_seven_frame_report() {
                 &scratch.0,
                 &["-dng", "-no-denoise", "-x3i-frame", "0"],
             );
+            run(
+                &input,
+                &scratch.0,
+                &["-dng", "-no-denoise", "-x3i-frame", "3"],
+            );
             let (merged, exposure) = raw_dng(&scratch.0.join(format!("{name}.dng")));
             let (reference, reference_exposure) = raw_dng(&scratch.0.join(format!("{name}_0.dng")));
+            let (short, short_exposure) = raw_dng(&scratch.0.join(format!("{name}_3.dng")));
             assert_eq!(merged.len(), reference.len());
+            assert_eq!(merged.len(), short.len());
             let scale = (exposure - reference_exposure).exp2();
+            let short_scale = (short_exposure - reference_exposure).exp2()
+                * f64::from(container.frame_exposure_us(0).unwrap())
+                / f64::from(container.frame_exposure_us(3).unwrap());
             assert!(scale > 1.0);
             let mut values: [Vec<u16>; 3] = Default::default();
             let mut refs: [Vec<u16>; 3] = Default::default();
-            for (pixel, reference) in merged
+            let mut shorts: [Vec<u16>; 3] = Default::default();
+            for ((pixel, reference), short) in merged
                 .as_chunks::<3>()
                 .0
                 .iter()
                 .zip(reference.as_chunks::<3>().0)
+                .zip(short.as_chunks::<3>().0)
             {
                 // This band contains the curtain pixels affected by the soft shoulder.
                 if (0.08..=0.11).contains(&(f64::from(reference[0]) / 65535.0)) {
                     for c in 0..3 {
                         values[c].push(pixel[c]);
                         refs[c].push(reference[c]);
+                        shorts[c].push(short[c]);
                     }
                 }
             }
@@ -304,8 +317,15 @@ fn corpus_dng_merge_writes_seven_frame_report() {
                 }
             };
             for c in 0..3 {
-                let ratio = scale * median(&mut values[c]) / median(&mut refs[c]);
+                let merged = scale * median(&mut values[c]);
+                let ratio = merged / median(&mut refs[c]);
                 assert!((ratio - 1.0).abs() < 0.01, "curtain channel {c}: {ratio}");
+                let short_ratio = merged / (short_scale * median(&mut shorts[c]));
+                // The old defaults miss this limit by more than five times in every channel.
+                assert!(
+                    (short_ratio - 1.0).abs() < 0.003,
+                    "curtain channel {c} against -1 EV: {short_ratio}"
+                );
             }
         }
     }

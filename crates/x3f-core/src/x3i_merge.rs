@@ -12,11 +12,10 @@
 //! validity cut at 0.85. At the cut, the logistic weight is 0.006693.
 //! Even a 64-fold exposure weight gives only 0.4284 of the reference weight.
 //! The hard cut excludes the compressed pile near 0.94 to 0.97 of the ceiling.
-//! The sample tables in _local/STATUS-shoulder.md use this acceptance rule:
-//! raw agreement within 1 percent per bin, and for bins outside that tolerance
-//! a weighted-bias allowance of at most 0.2 percent. Sub-1-percent whole-frame
-//! offsets are exposure ratio errors for phase 2 ratio refinement.
-//! At d = 0.825, the +1 EV frame has at most 0.144 percent weighted bias.
+//! Accept raw agreement within 1 percent per bin.
+//! For bins outside that tolerance, allow estimated weighted bias up to 0.2 percent.
+//! Phase 2 ratio refinement handles whole-frame exposure offsets below 1 percent.
+//! At d = 0.825, the measured +1 EV frame has estimated weighted bias of 0.144 percent.
 //! X3F_X3I_ROLLOFF=knee,width,margin overrides these research settings.
 //! A flat wall in an unsaturated frame can also pass the ceiling pile test.
 //! shortcut: no cross-frame ceiling check, phase 2 must require the second-longest
@@ -1050,6 +1049,11 @@ mod tests {
         assert_eq!(options.saturation_knee, 0.75);
         assert_eq!(options.saturation_width, 0.05);
         assert_eq!(options.validity_margin, 0.15);
+        let defaults = MergeOptions::default();
+        assert_eq!(options.noise_sigma, defaults.noise_sigma);
+        assert_eq!(options.noise_k, defaults.noise_k);
+        assert_eq!(options.noise_q, defaults.noise_q);
+        assert_eq!(options.saturation, defaults.saturation);
         for value in [
             "",
             "0.8,0.03",
