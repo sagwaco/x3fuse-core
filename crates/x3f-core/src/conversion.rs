@@ -228,6 +228,7 @@ fn convert_x3i(
             .push("denoise is not applied to X3I merges yet".into());
     }
     merge_options.process.denoise_intensity = 0;
+    merge_options.saturation = Some(merge_options.saturation_for(&container, control)?);
     let mut scene = x3i_merge::merge(
         container.frames().len(),
         |i| {
@@ -261,6 +262,10 @@ fn convert_x3i(
             "X3I frame {index}: shutter_us={exposure} scale={scale:.12}"
         ));
     }
+    report.warnings.push(format!(
+        "X3I saturation: B={:.9} M={:.9} T={:.9}",
+        scene.report.saturation[0], scene.report.saturation[1], scene.report.saturation[2],
+    ));
     report.warnings.push(format!(
         "X3I merge: frames={} s={:.12} fallback_best_snr={} fallback_shortest={} fallback_zero={} clipped_samples={} minimum={:.17} maximum={:.17}",
         scene.report.frames_used, scene.s, scene.report.fallback_best_snr,

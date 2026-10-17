@@ -85,6 +85,52 @@ impl MergeOptions {
         )
     }
 
+    /// Use an override or estimate the raw ceilings from the longest exposure.
+    /// Preparation finishes before the merge allocates its accumulation planes.
+    pub fn saturation_for(
+        &self,
+        container: &crate::X3iContainer,
+        control: Control<'_>,
+    ) -> Result<[f32; 3], Error> {
+        control.check()?;
+        self.validate()?;
+        if let Some(saturation) = self.saturation {
+            return Ok(saturation);
+        }
+        let mut longest = (0, 0);
+        for i in 0..container.frames().len() {
+            control.check()?;
+            let exposure = container.frame_exposure_us(i)?;
+            if exposure > longest.1 {
+                longest = (i, exposure);
+            }
+        }
+        let mut options = self.process.clone();
+        options.denoise_intensity = 0;
+        let frame = container
+            .open_frame(longest.0)?
+            .merge_frame(&options, control)?;
+        let mut saturation = [1.0; 3];
+        for (c, value) in saturation.iter_mut().enumerate() {
+            *value = if c == 2 {
+                estimate_plane_saturation(
+                    frame.raw_top.iter().copied(),
+                    frame.raw_black[c],
+                    frame.raw_white[c],
+                    control,
+                )?
+            } else {
+                estimate_plane_saturation(
+                    frame.raw_half.iter().skip(c).step_by(2).copied(),
+                    frame.raw_black[c],
+                    frame.raw_white[c],
+                    control,
+                )?
+            };
+        }
+        Ok(saturation)
+    }
+
     fn parse_env(
         noise: Option<&str>,
         max_s: Option<&str>,
@@ -157,11 +203,45 @@ impl MergeOptions {
     }
 }
 
+fn estimate_plane_saturation(
+    values: impl Iterator<Item = u16>,
+    black: f64,
+    white: f64,
+    control: Control<'_>,
+) -> Result<f32, Error> {
+    let mut histogram = vec![0usize; usize::from(u16::MAX) + 1];
+    let mut count = 0usize;
+    let mut maximum = 0u16;
+    for (i, value) in values.enumerate() {
+        if i % 65536 == 0 {
+            control.check()?;
+        }
+        histogram[usize::from(value)] += 1;
+        count += 1;
+        maximum = maximum.max(value);
+    }
+    let ceiling = (f64::from(maximum) - black) / (white - black);
+    if !ceiling.is_finite() || ceiling <= 0.0 {
+        return Ok(1.0);
+    }
+    let lower = (black + 0.99 * (f64::from(maximum) - black))
+        .ceil()
+        .clamp(0.0, f64::from(maximum)) as usize;
+    let pile: usize = histogram[lower..=usize::from(maximum)].iter().sum();
+    Ok(if pile >= 1000 && pile as f64 >= count as f64 * 0.0005 {
+        ceiling.clamp(0.3, 1.0) as f32
+    } else {
+        1.0
+    })
+}
+
 /// Exposure scales and sample statistics from one merge.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MergeReport {
     /// Number of loaded and accumulated frames.
     pub frames_used: usize,
+    /// Physical raw ceilings used by validity and roll-off, in B, M, T order.
+    pub saturation: [f32; 3],
     /// Reference exposure divided by each frame exposure, in load order.
     pub scales: Vec<f64>,
     /// Source frame indices, in load order.
@@ -408,7 +488,10 @@ pub fn merge(
     let mut fallback = vec![[0.0f32; 3]; pixels];
     let mut best_snr = vec![[-1.0f32; 2]; pixels];
     let mut shortest_us = u32::MAX;
-    let mut report = MergeReport::default();
+    let mut report = MergeReport {
+        saturation: options.saturation.unwrap_or([1.0; 3]),
+        ..Default::default()
+    };
     let mut first = Some(reference);
     for i in 0..frame_count {
         control.check()?;
@@ -652,6 +735,77 @@ mod tests {
             sigma: [0.001; 3],
             camera_to_rgb: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             ..MergeFrame::default()
+        }
+    }
+
+    #[test]
+    fn ceiling_estimator_requires_a_pile_and_ignores_an_isolated_hot_pixel() {
+        let mut values: Vec<u16> = (0..200000).map(|i| (i % 1000) as u16 + 100).collect();
+        values.extend(3000..10000);
+        assert_eq!(
+            estimate_plane_saturation(values.iter().copied(), 100.0, 10100.0, Control::none())
+                .unwrap(),
+            1.0
+        );
+        values.extend(std::iter::repeat_n(10000, 5000));
+        let ceiling =
+            estimate_plane_saturation(values.iter().copied(), 100.0, 10100.0, Control::none())
+                .unwrap();
+        assert!((ceiling - 0.99).abs() < 1e-6);
+        let mut isolated: Vec<u16> = (0..200000).map(|i| (i % 1000) as u16 + 100).collect();
+        isolated.push(65535);
+        assert_eq!(
+            estimate_plane_saturation(isolated.into_iter(), 100.0, 10100.0, Control::none())
+                .unwrap(),
+            1.0
+        );
+        let pile = std::iter::repeat_n(4600, 5000);
+        assert!(
+            (estimate_plane_saturation(pile, 100.0, 10100.0, Control::none()).unwrap() - 0.45)
+                .abs()
+                < 1e-6
+        );
+        let cancelled = AtomicBool::new(true);
+        assert!(matches!(
+            estimate_plane_saturation([1].into_iter(), 0.0, 10000.0, Control::new(&cancelled)),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn corpus_sensor_ceilings_match_both_camera_families() {
+        let corpus = std::env::var_os("X3F_TEST_FILES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../x3f_test_files")
+            });
+        for name in ["DP0Q0002.X3I", "_DQH0978.X3I"] {
+            let path = corpus.join(name);
+            if !path.is_file() {
+                eprintln!("skip: missing {name}");
+                continue;
+            }
+            let container = crate::X3iContainer::open(path).unwrap();
+            let options = MergeOptions::default();
+            let ceilings = options.saturation_for(&container, Control::none()).unwrap();
+            eprintln!("{name}: saturation={ceilings:?}");
+            if name == "DP0Q0002.X3I" {
+                assert_eq!(ceilings, [1.0; 3]);
+            } else {
+                assert!((0.40..=0.50).contains(&ceilings[0]));
+                assert!((0.40..=0.50).contains(&ceilings[1]));
+                assert!((0.50..=0.60).contains(&ceilings[2]));
+            }
+            let explicit = MergeOptions {
+                saturation: Some([0.4, 0.5, 0.6]),
+                ..options
+            };
+            assert_eq!(
+                explicit
+                    .saturation_for(&container, Control::none())
+                    .unwrap(),
+                [0.4, 0.5, 0.6]
+            );
         }
     }
 
