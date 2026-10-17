@@ -213,6 +213,40 @@ fn corpus_dng_merge_writes_seven_frame_report() {
                 assert!((0.0..=1.0).contains(&fraction.parse::<f64>().unwrap()));
             }
         }
+        assert!(report.contains("X3I noise: k_B="));
+        let statistics: Vec<_> = report
+            .lines()
+            .filter(|line| line.contains(": statistics nominal="))
+            .collect();
+        let alignments: Vec<_> = report
+            .lines()
+            .filter(|line| line.contains(": alignment dx="))
+            .collect();
+        assert_eq!(statistics.len(), 7);
+        assert_eq!(alignments.len(), 7);
+        assert_eq!(
+            report
+                .lines()
+                .filter(|line| line.contains(": aligned-ratio-bin "))
+                .count(),
+            56
+        );
+        for (i, line) in statistics.iter().enumerate() {
+            assert!(line.starts_with(&format!("X3I frame {i}:")));
+            let number = |key: &str| {
+                line.split_whitespace()
+                    .find_map(|v| v.strip_prefix(key))
+                    .unwrap()
+                    .parse::<f64>()
+                    .unwrap()
+            };
+            assert!((number("refined=") / number("nominal=")).log2().abs() <= 0.3);
+            assert!((0.1..=4.0).contains(&number("c=")));
+            assert!((0.1..=4.0).contains(&number("c_chroma=")));
+            assert!(line.contains("median_z2_flat="));
+            assert!(line.contains("ghost_threshold=0.1 ghost_status=preliminary"));
+            assert!((0.0..=1.0).contains(&number("ghost_fraction=")));
+        }
         assert!(report.contains("X3I merge: frames=7 s="));
         assert!(report.contains("saturation: B="));
         assert_eq!(
@@ -243,7 +277,7 @@ fn corpus_dng_merge_writes_seven_frame_report() {
             let expected = common::file_md5(&dng);
             // This float output hash was recorded on macOS aarch64.
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            assert_eq!(expected, "494b455d3286dfdc1c5243ad60a31284");
+            assert_eq!(expected, "302684ec51a01cddbd4ae76cc3e2bc29");
             let report_path = scratch.0.join(format!("{name}.x3i-report"));
             std::fs::remove_file(&report_path).unwrap();
             std::fs::create_dir(&report_path).unwrap();

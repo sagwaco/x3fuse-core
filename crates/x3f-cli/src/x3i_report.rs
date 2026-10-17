@@ -1,4 +1,5 @@
-//! Raw-plane diagnostics for the phase 1 X3I merge.
+//! Raw-plane diagnostics for the X3I merge.
+//! MergeReport::statistics supplies the fitted values in the conversion report.
 
 use x3f_core::{MergeFrame, ProcessOptions, X3iContainer};
 
@@ -109,7 +110,7 @@ pub(super) fn radiometry(
         Ok(frame)
     };
     let reference = load(0)?;
-    let mut text = format!("X3I raw-plane report\nplanes: B M T; clipping threshold relative to ceiling={:.9}\nsaturation: B={:.9} M={:.9} T={:.9}\nratio fit: median x_ref/x_i; reference r/ceiling in [0.05,0.60], both valid; no refinement or alignment\nratio bins: 8 equal reference r/ceiling bins; final bin includes 0.60\nindex shutter_us scale sigma_B sigma_M sigma_T clip_B clip_M clip_T ratio_B ratio_M ratio_T\n", 1.0 - margin, saturation[0], saturation[1], saturation[2]);
+    let mut text = format!("X3I raw-plane report\nplanes: B M T; clipping threshold relative to ceiling={:.9}\nsaturation: B={:.9} M={:.9} T={:.9}\nraw ratio diagnostic: median x_ref/x_i; reference r/ceiling in [0.05,0.60], both valid; unaligned raw samples; merge statistics follow\nratio bins: 8 equal reference r/ceiling bins; final bin includes 0.60\nindex shutter_us scale sigma_B sigma_M sigma_T clip_B clip_M clip_T ratio_B ratio_M ratio_T\n", 1.0 - margin, saturation[0], saturation[1], saturation[2]);
     for i in 0..container.frames().len() {
         let owned;
         let frame = if i == 0 {
