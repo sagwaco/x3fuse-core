@@ -428,6 +428,41 @@ maximum `d` over the exact expansion footprint and its 3x3 neighbourhood.
 An invalid contributing sample rejects the expanded output. The default knee
 is 0.75, width 0.02 and validity margin 0.15, relative to that ceiling.
 
+Phase 2 loads every frame twice through a repeatable loader. The statistics
+pass emits Decode events. It aligns each frame to reference T and keeps a
+skipped alignment at the identity transform with a warning. Ratio refinement
+uses the median of clean, supported level-bin medians. An affine fit supplies
+a black-offset diagnostic only. Near-black bias is nonlinear, so its fitted
+slope must not set the scale. Reference levels are 5 to 60 percent
+of the ceiling for short exposures, or 5 to 25 percent for long exposures,
+whose own level must also stay below 40 percent. Frame T must exceed ten of
+its own read sigmas. Each supported bin needs at least 1000 pairs or 0.1
+percent of pixels, whichever is larger. A clean bin also needs a mean frame
+signal above thirty read sigmas, with reference samples below the roll-off
+knee. At least two clean bins are required. Keep the shutter ratio if the
+trend across clean bins exceeds 2 percent or the fitted scale differs by
+more than 0.3 EV.
+
+Fit each raw plane's shot coefficient `k` from flat 8x8 reference/+1 EV
+pairs, with integer-rounded alignment and separate read-noise terms. Fewer
+than 50 blocks keeps the default or override. Fix the effective reference
+correction at one. Fit separate T and shared B/M corrections from flat pair
+residuals, using at least 50 blocks above ten read sigmas in both frames.
+Clamp each correction to `[0.5,4]`. Flag a weak calibration when the median
+reference model term exceeds eight times the frame term. Below ten sigmas,
+keep the untruncated variance model. It conservatively under-rejects noise
+whose distribution was truncated by the intermediate zero clamp.
+
+Release all statistics rasters before the accumulation pass reloads frame 0.
+This pass emits Process events. A hash of each first raw T row detects common
+loader changes. Ghost weights use the maximum channel squared residual `z²`,
+`exp(-z²/9)`, and a 3x3 minimum. The estimate starts from the reference, or the
+shortest valid exposure outside reference coverage. Reports count valid ghost
+weights below 0.1. Bin diagnostics go only to the `-x3i-report` file.
+An aligned sd Quattro H conversion measured 46 seconds and 4.63 GB peak RSS
+before the anchored-calibration revision. The 1.4 GB target needs row-band
+processing, which this two-pass implementation does not provide.
+
 Weights use inverse variance with per-frame shield noise, linear and quadratic
 signal terms, exposure scaling squared and spatial gain squared. B and M
 share one chroma weight; T has a luma weight. The reference gets a minimum

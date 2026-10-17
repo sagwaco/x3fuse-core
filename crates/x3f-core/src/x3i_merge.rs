@@ -86,7 +86,7 @@ pub struct MergeOptions {
     pub align: AlignOptions,
     /// Keep shutter ratios without data refinement.
     pub fixed_ratios: bool,
-    /// Maximum relative spread of accepted ratio bins. The default is 0.02.
+    /// Maximum relative spread of clean ratio bins. The default is 0.02.
     pub ratio_trend_limit: f32,
     /// Estimate shot noise from the reference and the +1 EV frame.
     pub fit_noise: bool,
@@ -3097,7 +3097,7 @@ mod tests {
         )
         .unwrap();
         assert!(fit.pairs >= fit.minimum_pairs);
-        assert_eq!(fit.multiplier, None); // One supported bin cannot identify slope and offset.
+        assert_eq!(fit.multiplier, None); // One supported bin cannot establish a level trend.
     }
 
     #[test]
