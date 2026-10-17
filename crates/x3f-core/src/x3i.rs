@@ -155,12 +155,26 @@ impl X3iContainer {
 
     /// Open a frame on its own stream with all offsets relative to that frame.
     pub fn open_frame(&self, index: usize) -> Result<Reader, Error> {
+        self.open_frame_with_control(index, x3f_sys::Control::none())
+    }
+
+    pub(crate) fn open_frame_with_control(
+        &self,
+        index: usize,
+        control: x3f_sys::Control<'_>,
+    ) -> Result<Reader, Error> {
         let frame = self.frame(index)?;
-        Reader::open_window(
-            &self.path,
-            Some((frame.offset, frame.length)),
-            x3f_sys::Control::none(),
-        )
+        Reader::open_window(&self.path, Some((frame.offset, frame.length)), control)
+    }
+
+    /// Return the index of the middle exposure: the frame with the median
+    /// CaptureShutter. An even count takes the shorter of the two middle
+    /// exposures. Equal shutters keep file order.
+    pub fn middle_exposure_frame(&self) -> Result<usize, Error> {
+        let exposures = (0..self.frames.len())
+            .map(|index| self.frame_exposure_us(index))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(median_index(&exposures))
     }
 
     /// Load the frame's CaptureShutter value in microseconds.
@@ -205,10 +219,31 @@ impl X3iContainer {
     }
 }
 
+/// Index of the median value. A stable sort keeps file order for ties, and
+/// `(n - 1) / 2` takes the lower middle of an even count.
+fn median_index(exposures: &[u32]) -> usize {
+    let mut order: Vec<usize> = (0..exposures.len()).collect();
+    order.sort_by_key(|&index| exposures[index]);
+    order[(order.len() - 1) / 2]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn middle_exposure_is_the_lower_median_with_stable_ties() {
+        assert_eq!(median_index(&[500]), 0);
+        assert_eq!(median_index(&[100, 400, 1600]), 1);
+        assert_eq!(median_index(&[1600, 100, 400]), 2);
+        // Even count: the shorter of the two middle exposures.
+        assert_eq!(median_index(&[1600, 100, 400, 800]), 2);
+        // Ties keep file order.
+        assert_eq!(median_index(&[200, 200, 200]), 1);
+        assert_eq!(median_index(&[200, 200, 200, 200]), 1);
+        assert_eq!(median_index(&[300, 100, 100, 300]), 2);
+    }
 
     struct Scratch(PathBuf);
     impl Scratch {

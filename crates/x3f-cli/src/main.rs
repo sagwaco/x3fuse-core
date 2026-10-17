@@ -48,6 +48,7 @@ impl FileType {
 #[derive(Debug)]
 struct Args {
     x3i_frame: Option<usize>,
+    x3i_middle: bool,
     x3i_extract: bool,
     x3i_report: bool,
     output_explicit: bool,
@@ -91,6 +92,7 @@ impl Default for Args {
     fn default() -> Self {
         Self {
             x3i_frame: None,
+            x3i_middle: false,
             x3i_extract: false,
             x3i_report: false,
             output_explicit: false,
@@ -135,6 +137,7 @@ fn usage(progname: &str) -> ! {
          \x20  -q              Suppress all messages except errors\n\
          \x20  -x3i-report     Write X3I radiometry and peak RSS beside the DNG\n\
          \x20  -x3i-frame <n>  Convert X3I frame n (zero based)\n\
+         \x20  -x3i-middle     Convert only the middle exposure of an X3I\n\
          \x20  -x3i-extract    Copy all X3I frames to new X3F files\n\
          ONE OFF THE FORMAT SWITCHWES\n\
          \x20  -meta           Dump metadata\n\
@@ -269,6 +272,7 @@ fn parse_args(argv: &[String]) -> Args {
                         .unwrap_or_else(|| usage(progname)),
                 );
             }
+            "-x3i-middle" => args.x3i_middle = true,
             "-x3i-extract" => args.x3i_extract = true,
             "-x3i-report" => args.x3i_report = true,
             "-jpg" => {
@@ -483,19 +487,37 @@ fn normalize(args: &mut Args) {
 
 /// Reject unsupported flag combinations. Check X3I inputs by their magic.
 fn validate_args(args: &Args) -> Result<(), String> {
+    if args.x3i_middle && args.x3i_frame.is_some() {
+        return Err("-x3i-middle cannot combine with -x3i-frame".into());
+    }
     if args.x3i_report
-        && (args.file_type != FileType::Dng || args.x3i_frame.is_some() || args.x3i_extract)
+        && (args.file_type != FileType::Dng
+            || args.x3i_frame.is_some()
+            || args.x3i_middle
+            || args.x3i_extract)
     {
         return Err("-x3i-report requires an X3I merge with -dng".into());
     }
-    if args.x3i_extract && (args.output_explicit || args.x3i_frame.is_some()) {
-        return Err("-x3i-extract cannot combine with output flags or -x3i-frame".into());
+    if args.x3i_extract && (args.output_explicit || args.x3i_frame.is_some() || args.x3i_middle) {
+        return Err(
+            "-x3i-extract cannot combine with output flags, -x3i-frame or -x3i-middle".into(),
+        );
     }
-    if args.x3i_frame.is_some() || args.x3i_extract || args.x3i_report || args.spp_denoise {
+    if args.x3i_frame.is_some()
+        || args.x3i_middle
+        || args.x3i_extract
+        || args.x3i_report
+        || args.spp_denoise
+    {
         for path in &args.files {
             match is_x3i(path) {
                 Ok(x3i) => validate_x3i_input(args, x3i)?,
-                Err(error) if args.x3i_frame.is_some() || args.x3i_extract || args.x3i_report => {
+                Err(error)
+                    if args.x3i_frame.is_some()
+                        || args.x3i_middle
+                        || args.x3i_extract
+                        || args.x3i_report =>
+                {
                     return Err(format!("{}: {error}", path.display()));
                 }
                 // The conversion reports ordinary input errors as before.
@@ -565,8 +587,11 @@ fn validate_args(args: &Args) -> Result<(), String> {
 }
 
 fn validate_x3i_input(args: &Args, x3i: bool) -> Result<(), String> {
-    if !x3i && (args.x3i_frame.is_some() || args.x3i_extract || args.x3i_report) {
-        return Err("-x3i-frame, -x3i-extract and -x3i-report require an X3I input".into());
+    if !x3i && (args.x3i_frame.is_some() || args.x3i_middle || args.x3i_extract || args.x3i_report)
+    {
+        return Err(
+            "-x3i-frame, -x3i-middle, -x3i-extract and -x3i-report require an X3I input".into(),
+        );
     }
     if x3i && args.spp_denoise {
         return Err("-spp-pipeline does not support X3I input".into());
@@ -626,6 +651,7 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
         dng_highlight_recovery: args.dng_highlight_recovery,
         dng_highlight_mapping: args.dng_highlight_mapping,
         cineon: args.cineon,
+        x3i_source: x3f_core::X3iSource::Merge,
     };
 
     let container =
@@ -651,7 +677,16 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
         }
         return Ok(());
     }
-    if let (Some(container), None) = (&container, args.x3i_frame) {
+    // -x3i-middle is -x3i-frame with the median-exposure index.
+    let x3i_frame = match (&container, args.x3i_middle) {
+        (Some(container), true) => Some(
+            container
+                .middle_exposure_frame()
+                .map_err(|e| e.to_string())?,
+        ),
+        _ => args.x3i_frame,
+    };
+    if let (Some(container), None) = (&container, x3i_frame) {
         if matches!(
             args.file_type,
             FileType::Dng | FileType::Tiff | FileType::PpmP3 | FileType::PpmP6
@@ -713,7 +748,7 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
         }
     }
     let mut table = String::new();
-    let mut reader = match (&container, args.x3i_frame, args.file_type) {
+    let mut reader = match (&container, x3i_frame, args.file_type) {
         (Some(container), Some(index), _) => container.open_frame(index),
         (Some(container), None, FileType::Meta) => {
             table.push_str("X3I frames\nindex offset length exposure_us EV\n");
@@ -782,7 +817,7 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
         })?;
     }
 
-    let extension = match args.x3i_frame {
+    let extension = match x3i_frame {
         Some(index) => format!("_{index}{}", args.file_type.extension()),
         None => args.file_type.extension().to_string(),
     };
@@ -947,6 +982,19 @@ mod tests {
             assert!(validate_args(&parse(&flags)).is_ok());
         }
         assert!(validate_args(&parse(&["-x3i-frame", "0", "-x3i-extract", name])).is_err());
+        for format in ["-meta", "-jpg", "-tiff", "-dng", "-ppm", "-histogram"] {
+            let args = parse(&[format, "-x3i-middle", name]);
+            assert!(args.x3i_middle && validate_args(&args).is_ok(), "{format}");
+        }
+        for flags in [
+            vec!["-x3i-middle", "-x3i-frame", "0", name],
+            vec!["-x3i-middle", "-x3i-extract", name],
+            vec!["-x3i-middle", "-x3i-report", name],
+            vec!["-dng", "-x3i-middle", "-x3i-report", name],
+            vec!["-tiff", "-spp-pipeline", "-x3i-middle", name],
+        ] {
+            assert!(validate_args(&parse(&flags)).is_err(), "{flags:?}");
+        }
         assert!(validate_args(&parse(&["-tiff", "-spp-pipeline", name]))
             .unwrap_err()
             .contains("X3I"));
@@ -954,7 +1002,11 @@ mod tests {
             validate_args(&parse(&["-tiff", "-spp-pipeline", "-x3i-frame", "0", name])).is_err()
         );
         std::fs::write(&path, b"FOVb").unwrap();
-        for flags in [vec!["-x3i-frame", "0", name], vec!["-x3i-extract", name]] {
+        for flags in [
+            vec!["-x3i-frame", "0", name],
+            vec!["-x3i-middle", name],
+            vec!["-x3i-extract", name],
+        ] {
             assert!(validate_args(&parse(&flags)).unwrap_err().contains("X3I"));
         }
         std::fs::remove_file(path).unwrap();

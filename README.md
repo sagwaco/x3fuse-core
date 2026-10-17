@@ -83,6 +83,7 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 | `-raw`       | RAW area, undecoded             |
 | `-meta`      | metadata dump                   |
 | `-x3i-frame <n>` | Convert frame `n` of an X3I input (zero based). Append `_<n>` before the output extension. |
+| `-x3i-middle` | Convert only the middle exposure of an X3I input, as `-x3i-frame <n>` does for that frame. Append `_<n>` before the output extension. Excludes `-x3i-frame`, `-x3i-extract` and `-x3i-report`. |
 | `-x3i-report` | With X3I `-dng`, write estimated sensor ceilings, raw-plane ratios in eight reference-level bins, noise, clipping, merge counts and peak RSS to `<input>.x3i-report`. |
 | `-x3i-extract` | Copy all X3I frames to new `<stem>_<n>.X3F` files. Use `-o` to select a directory. Excludes output flags. |
 | `-histogram` | histogram CSV                   |

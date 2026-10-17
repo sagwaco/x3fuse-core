@@ -21,8 +21,12 @@ pub struct SceneLinearOptions {
     /// Algorithm and advanced sensor-space denoising controls.
     pub denoise_options: crate::DenoiseOptions,
     /// Reconstruct clipped sensor layers (default false).
-    /// X3I ignores this option. The merge keeps extended highlight values.
+    /// An X3I merge ignores this option and keeps extended highlight values.
     pub highlight_recovery: bool,
+    /// X3I input: merge all frames (default) or use only the middle exposure.
+    /// The middle exposure honours `highlight_recovery` and denoise as for X3F.
+    /// No effect on X3F input.
+    pub x3i_source: crate::X3iSource,
 }
 
 impl Default for SceneLinearOptions {
@@ -34,6 +38,7 @@ impl Default for SceneLinearOptions {
             denoise_backend: crate::DenoiseBackend::Auto,
             denoise_options: crate::DenoiseOptions::default(),
             highlight_recovery: false,
+            x3i_source: crate::X3iSource::default(),
         }
     }
 }
@@ -167,16 +172,24 @@ pub fn prepare_scene_linear(
     } else {
         None
     };
-    let denoise_scale = if container.is_some() {
+    let middle = match &container {
+        Some(container) if options.x3i_source == crate::X3iSource::MiddleExposure => {
+            Some(container.middle_exposure_frame()?)
+        }
+        _ => None,
+    };
+    let denoise_scale = if container.is_some() && middle.is_none() {
         crate::x3i_output::read_denoise_scale(options.denoise_intensity, options.denoise_options)?
     } else {
         0.0
     };
-    let reader = if let Some(container) = &container {
-        container.open_frame(0)?
-    } else {
-        Reader::open_with_control(input, control)?
+    let reader = match (&container, middle) {
+        (Some(container), Some(index)) => container.open_frame_with_control(index, control)?,
+        (Some(container), None) => container.open_frame(0)?,
+        _ => Reader::open_with_control(input, control)?,
     };
+    // A middle exposure takes the single-frame path below, as an X3F does.
+    let container = container.filter(|_| middle.is_none());
     let control = reader.with_control(control);
     on_stage(ConversionStage::Decode);
     control.check()?;

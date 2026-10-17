@@ -81,19 +81,33 @@ pub fn convert_file(
     let result = (|| {
         on_stage(ConversionStage::Read);
         control.check()?;
+        let mut middle = None;
         if crate::is_x3i(input)? {
-            if format == OutputFormat::Jpeg {
+            if options.x3i_source == crate::X3iSource::MiddleExposure {
+                let container = crate::X3iContainer::open(input)?;
+                let index = container.middle_exposure_frame()?;
+                middle = Some((index, container.frame_exposure_us(index)?, container));
+            } else if format == OutputFormat::Jpeg {
                 return Err(Error::InvalidData(
                     "X3I embedded JPEG output requires a selected frame".into(),
                 ));
+            } else {
+                return convert_x3i(input, output, format, options, control, &mut on_stage);
             }
-            return convert_x3i(input, output, format, options, control, &mut on_stage);
         }
-        let reader = Reader::open_with_control(input, control)?;
+        let reader = match &middle {
+            Some((index, _, container)) => container.open_frame_with_control(*index, control)?,
+            None => Reader::open_with_control(input, control)?,
+        };
         let control = reader.with_control(control);
         on_stage(ConversionStage::Decode);
         control.check()?;
         let mut report = ConversionReport::default();
+        if let Some((index, shutter_us, _)) = &middle {
+            report.warnings.push(format!(
+                "X3I middle exposure: frame {index} shutter_us={shutter_us}"
+            ));
+        }
 
         // SAFETY: the reader uniquely owns its parsed section directory for
         // this entire call. load_data checks ranges and frees failed allocations.

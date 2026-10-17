@@ -39,6 +39,35 @@ sd Quattro and sd Quattro H modes return the existing calibration error.
 X3I inputs run serially in a CLI batch to limit simultaneous raster storage.
 X3F inputs retain parallel batch processing.
 
+## Middle exposure only
+
+The middle exposure is the frame with the median `CaptureShutter`. With an
+even frame count, it is the shorter of the two middle exposures. Equal
+shutters keep file order. `X3iContainer::middle_exposure_frame` returns its
+index. It is frame 0 on both sample captures.
+
+```sh
+x3f_extract -dng -x3i-middle capture.X3I
+x3f_extract -jpg -x3i-middle capture.X3I
+```
+
+`-x3i-middle` is `-x3i-frame <n>` with that index, so the output has the same
+bytes and the same `_<n>` file name. It cannot combine with `-x3i-frame`,
+`-x3i-extract` or `-x3i-report`. `-meta` dumps the selected frame. Like
+`-x3i-frame`, it runs serially in a CLI batch.
+
+In the library, set `x3i_source: X3iSource::MiddleExposure` in
+`ProcessOptions` or `SceneLinearOptions`. The default is `X3iSource::Merge`.
+X3F input ignores the field.
+
+- `convert_file` converts the frame as a single X3F file. This includes
+  `OutputFormat::Jpeg` (the frame's embedded JPEG), color modes, SPP and
+  highlight recovery. It adds the report line
+  `X3I middle exposure: frame <n> shutter_us=<us>`.
+- `prepare_scene_linear` returns the frame's own scene. It honors
+  `highlight_recovery` and denoise as for an X3F. It has no merged range.
+- `read_as_shot_crop` always reads frame 0.
+
 ## Editor source
 
 `prepare_scene_linear` detects `FOVi` and returns the merged active area as
