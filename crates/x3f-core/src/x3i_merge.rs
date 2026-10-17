@@ -18,8 +18,12 @@
 //! The zero clamp raises the mean near black. Short frames can then show a level
 //! trend without a response-curve change. Ratio fits and their bins require the
 //! integer-paired raw T sample above ten times that frame's read noise.
-//! At least one bin must have enough pairs. The 2 percent supported-bin trend
-//! gate still rejects an inconsistent scalar.
+//! Use the median of supported bin medians whose mean frame signal exceeds
+//! thirty read sigmas and whose reference is below the roll-off knee. Require
+//! two clean bins and apply the 2 percent trend gate only to these bins.
+//! Near-black bias is nonlinear, so an affine fit can bend the slope. Keep
+//! its offset only as a diagnostic. It does not change the scale or pixels.
+//! Keep the nominal scale when clean support is too small.
 //! At d = 0.825, the measured +1 EV frame has estimated weighted bias of 0.144 percent.
 //! X3F_X3I_ROLLOFF=knee,width,margin overrides these research settings.
 //! A flat wall in an unsaturated frame can also pass the ceiling pile test.
@@ -28,7 +32,12 @@
 //! The intermediate encoding clamps at zero, so it truncates negative noise. Expansion
 //! also quantises and clamps BMT to u16, including Y = min(4T, 65535).
 //! Clamping near black truncates noise. Its variance can be below the shield
-//! estimate, so effective-variance corrections use a lower bound of 0.1.
+//! estimate. Fix c_ref at one and fit each c_i from at least 50 flat blocks
+//! with both raw T samples above ten read sigmas. Clamp c_i to [0.5, 4].
+//! Below ten sigmas, use the untruncated model without correction. It overestimates
+//! near-black variance and conservatively under-rejects these samples.
+//! Flag calibration when the median reference model term exceeds eight times
+//! the frame term. Such a small frame term poorly determines c_i.
 //! The raw model used for merge weights stays unchanged.
 //! The merge applies no signal-dependent dark weight. Unsigned DNG encoding
 //! clamps negative merged samples to zero.
@@ -54,7 +63,7 @@
 //! minimum. This corresponds to |z| above 4.55 before the minimum.
 //! Ghost diagnostics are preliminary when alignment is weak or skipped.
 //! Validity adds N per frame; ghost weights add 4N. Alignment can also hold
-//! an input and output frame.
+//! an input and output frame. Reference bins and the current noise mask add 2N bytes.
 //! Raw reference samples and T-only gain (4N bytes) remain during fitting.
 //! All statistics rasters are released before accumulation reloads frame zero.
 //! Reference variance and saturation planes are dropped after luma construction.
@@ -81,7 +90,7 @@ pub struct MergeOptions {
     pub ratio_trend_limit: f32,
     /// Estimate shot noise from the reference and the +1 EV frame.
     pub fit_noise: bool,
-    /// Lower effective-variance clamp. The default is 0.1 for truncated dark noise.
+    /// Lower effective-variance clamp. The default is 0.5.
     pub variance_floor: f32,
     /// Reject samples that disagree with the reference estimate.
     pub ghost_rejection: bool,
@@ -114,7 +123,7 @@ impl Default for MergeOptions {
             fixed_ratios: false,
             ratio_trend_limit: 0.02,
             fit_noise: true,
-            variance_floor: 0.1,
+            variance_floor: 0.5,
             ghost_rejection: true,
             saturation_knee: 0.75,
             saturation_width: 0.02,
@@ -421,6 +430,12 @@ pub struct MergeReport {
     pub median_z_squared: Vec<[Option<f32>; 3]>,
     /// Number of accepted calibration blocks per frame.
     pub calibration_blocks: Vec<usize>,
+    /// True when the median reference model term exceeds eight times the frame term.
+    pub weak_calibration: Vec<bool>,
+    /// Ghost fractions in eight bins from 0.05 to 0.60 and two from 0.60 to 0.85.
+    pub ghost_bins: Vec<[Option<f32>; 10]>,
+    /// Valid pixel counts for the ghost bins.
+    pub ghost_bin_pixels: Vec<[usize; 10]>,
     /// Fraction of valid pixels with ghost weight below 0.1 after the 3x3 minimum.
     pub ghost_fractions: Vec<f32>,
     /// Transforms in source order. Frame zero and disabled alignment use identity.
@@ -455,10 +470,17 @@ impl MergeReport {
             self.noise_k[0], self.noise_k[1], self.noise_k[2], self.noise_blocks[0], self.noise_blocks[1], self.noise_blocks[2]
         )];
         for i in 0..self.scales.len() {
+            let correction = |values: &[f32]| {
+                if i == 0 || self.calibration_blocks[i] >= 50 {
+                    format!("{:.6}", values[i])
+                } else {
+                    "-".into()
+                }
+            };
             lines.push(format!(
-                "X3I frame {}: statistics nominal={:.12} refined={:.12} raw_plane_scales={:?} c={:.6} c_chroma={:.6} median_z2_flat={:?} calibration_blocks={} ghost_fraction={:.9} ghost_threshold=0.1 ghost_status=preliminary",
+                "X3I frame {}: statistics nominal={:.12} refined={:.12} raw_plane_scales={:?} c={} c_chroma={} median_z2_flat={:?} calibration_blocks={} ghost_fraction={:.9} ghost_threshold=0.1 ghost_status=preliminary black_offset={:?} calibration_weak={}",
                 self.frame_indices[i], self.nominal_scales[i], self.scales[i], self.plane_scales[i],
-                self.effective_variance[i], self.chroma_variance[i], self.median_z_squared[i], self.calibration_blocks[i], self.ghost_fractions[i]
+                correction(&self.effective_variance), correction(&self.chroma_variance), self.median_z_squared[i], self.calibration_blocks[i], self.ghost_fractions[i], self.aligned_ratios[i].black_offset, self.weak_calibration[i]
             ));
             let fit = &self.aligned_ratios[i];
             for bin in 0..8 {
@@ -467,8 +489,12 @@ impl MergeReport {
                 let ratio = fit.bins[bin]
                     .map(|v| format!("{:.9}", f64::from(v) * self.nominal_scales[i]))
                     .unwrap_or_else(|| "-".into());
-                lines.push(format!("X3I frame {}: aligned-ratio-bin lower={lower:.5} upper={upper:.5} ratio={ratio} pairs={} accepted={} level_trend={:?}",
-                    self.frame_indices[i], fit.bin_pairs[bin], fit.bin_pairs[bin] >= fit.minimum_pairs && fit.minimum_pairs != 0, fit.level_trend));
+                lines.push(format!("X3I frame {}: aligned-ratio-bin lower={lower:.5} upper={upper:.5} ratio={ratio} pairs={} accepted={} clean={} frame_mean_read_sigma={:?} level_trend={:?}",
+                    self.frame_indices[i], fit.bin_pairs[bin], fit.bin_pairs[bin] >= fit.minimum_pairs && fit.minimum_pairs != 0, fit.clean_bins[bin], fit.bin_read_snr[bin], fit.level_trend));
+            }
+            for bin in 0..10 {
+                let (lower, upper) = ghost_bin_bounds(bin);
+                lines.push(format!("X3I frame {}: ghost-bin lower={lower:.5} upper={upper:.5} fraction={:?} pixels={} threshold=0.1", self.frame_indices[i], self.ghost_bins[i][bin], self.ghost_bin_pixels[i][bin]));
             }
             let a = &self.alignments[i];
             lines.push(format!(
@@ -756,6 +782,8 @@ fn ratio_fit(
 pub struct RatioFit {
     /// Scale multiplier, present only when enough pairs qualify.
     pub multiplier: Option<f32>,
+    /// Fitted black offset in reference camera units. It does not change pixels.
+    pub black_offset: Option<f32>,
     /// Number of sampled pairs used by the scalar fit.
     pub pairs: usize,
     /// Required count for a scalar fit or an accepted bin.
@@ -764,7 +792,11 @@ pub struct RatioFit {
     pub bins: [Option<f32>; 8],
     /// Sampled pair counts in each bin after the scalar fit cuts.
     pub bin_pairs: [usize; 8],
-    /// Largest relative difference between accepted bin medians.
+    /// Mean raw frame signal divided by its own read noise in each bin.
+    pub bin_read_snr: [Option<f32>; 8],
+    /// Supported bins above thirty read sigmas, used by the scalar estimate.
+    pub clean_bins: [bool; 8],
+    /// Largest relative difference between clean bin medians.
     pub level_trend: Option<f32>,
 }
 
@@ -779,7 +811,11 @@ fn refined_ratio(
 ) -> Result<RatioFit, Error> {
     let ceiling = options.saturation.unwrap_or([1.0; 3])[2];
     let mut samples: [Vec<f32>; 8] = Default::default();
-    let minimum_frame = 10.0 * options.noise_sigma.unwrap_or(frame.sigma[2]);
+    let mut reference_samples: [Vec<f32>; 8] = Default::default();
+    let mut frame_samples: [Vec<f32>; 8] = Default::default();
+    let read_noise = options.noise_sigma.unwrap_or(frame.sigma[2]);
+    let minimum_frame = 10.0 * read_noise;
+    let mut raw_sums = [0.0f64; 8];
     let upper = if nominal < 1.0 { 0.25 } else { 0.60 };
     // Sample one in three pixels to bound scratch. Keep one scale for all channels.
     for y in 0..a.height as usize {
@@ -800,6 +836,7 @@ fn refined_ratio(
                 && a.valid[p] != 0
                 && b.valid[p] != 0
                 && (0.05..=upper).contains(&level)
+                && level < options.saturation_knee
                 && (nominal >= 1.0 || b.d_max[p] < 0.40)
                 && a.x[p * 3 + 2] > 0.0
                 && b.x[p * 3 + 2] > 0.0
@@ -808,6 +845,9 @@ fn refined_ratio(
                 if ratio.is_finite() {
                     let bin = (((level - 0.05) / 0.55 * 8.0) as usize).min(7);
                     samples[bin].push(ratio);
+                    raw_sums[bin] += f64::from(raw(frame, 2, source));
+                    reference_samples[bin].push(a.x[p * 3 + 2]);
+                    frame_samples[bin].push(b.x[p * 3 + 2]);
                 }
             }
         }
@@ -818,21 +858,52 @@ fn refined_ratio(
         bins: std::array::from_fn(|i| median(&mut samples[i])),
         ..Default::default()
     };
-    let mut all: Vec<_> = samples.into_iter().flatten().collect();
-    fit.pairs = all.len();
-    if fit.pairs >= fit.minimum_pairs {
-        fit.multiplier = median(&mut all);
-    }
-    let accepted: Vec<_> = fit
-        .bins
-        .iter()
-        .zip(fit.bin_pairs)
-        .filter_map(|(&v, n)| if n >= fit.minimum_pairs { v } else { None })
+    fit.pairs = fit.bin_pairs.iter().sum();
+    fit.bin_read_snr = std::array::from_fn(|i| {
+        (fit.bin_pairs[i] > 0).then(|| {
+            (raw_sums[i] / fit.bin_pairs[i] as f64 / f64::from(read_noise.max(1e-12))) as f32
+        })
+    });
+    fit.clean_bins = std::array::from_fn(|i| {
+        fit.bin_pairs[i] >= fit.minimum_pairs && fit.bin_read_snr[i].is_some_and(|v| v > 30.0)
+    });
+    let mut clean: Vec<_> = (0..8)
+        .filter(|&i| fit.clean_bins[i])
+        .filter_map(|i| fit.bins[i])
         .collect();
-    if accepted.len() >= 2 {
-        let low = accepted.iter().copied().fold(f32::INFINITY, f32::min);
-        let high = accepted.iter().copied().fold(0.0f32, f32::max);
+    if clean.len() >= 2 {
+        let low = clean.iter().copied().fold(f32::INFINITY, f32::min);
+        let high = clean.iter().copied().fold(0.0f32, f32::max);
         fit.level_trend = Some(high / low - 1.0);
+        fit.multiplier = median(&mut clean);
+    }
+    let points: Vec<_> = (0..8)
+        .filter(|&i| fit.bin_pairs[i] >= fit.minimum_pairs)
+        .map(|i| {
+            (
+                median(&mut frame_samples[i]).unwrap(),
+                median(&mut reference_samples[i]).unwrap(),
+            )
+        })
+        .collect();
+    if points.len() >= 2 {
+        let mean_x = points.iter().map(|p| f64::from(p.0)).sum::<f64>() / points.len() as f64;
+        let mean_y = points.iter().map(|p| f64::from(p.1)).sum::<f64>() / points.len() as f64;
+        let xx = points
+            .iter()
+            .map(|p| (f64::from(p.0) - mean_x).powi(2))
+            .sum::<f64>();
+        let xy = points
+            .iter()
+            .map(|p| (f64::from(p.0) - mean_x) * (f64::from(p.1) - mean_y))
+            .sum::<f64>();
+        if xx > 1e-12 {
+            let slope = (xy / xx) as f32;
+            let offset = (mean_y - f64::from(slope) * mean_x) as f32;
+            if slope.is_finite() && slope > 0.0 && offset.is_finite() {
+                fit.black_offset = Some(offset);
+            }
+        }
     }
     Ok(fit)
 }
@@ -1076,7 +1147,12 @@ fn calibration_blocks(
                     valid = false;
                     break;
                 };
-                if reference.valid[p] == 0 || frame.valid[p] == 0 {
+                if reference.valid[p] == 0
+                    || frame.valid[p] == 0
+                    || raw(raw_ref, 2, p) <= 10.0 * options.noise_sigma.unwrap_or(raw_ref.sigma[2])
+                    || raw(raw_frame, 2, q)
+                        <= 10.0 * options.noise_sigma.unwrap_or(raw_frame.sigma[2])
+                {
                     valid = false;
                     break;
                 }
@@ -1144,23 +1220,17 @@ fn calibrate(blocks: &[Vec<CalibrationBlock>], k: f32, chroma: bool, floor: f32)
             .collect();
         median(&mut values).unwrap().clamp(floor, 4.0)
     };
-    let mut candidates: Vec<_> = blocks
-        .iter()
-        .skip(1)
-        .filter(|b| b.len() >= 50)
-        .map(|b| solve(b, 1.0))
-        .collect();
-    let reference = median(&mut candidates).unwrap_or(1.0).clamp(floor, 4.0);
-    std::iter::once(reference)
-        .chain(blocks.iter().skip(1).map(|b| solve(b, reference)))
+    std::iter::once(1.0)
+        .chain(blocks.iter().skip(1).map(|b| solve(b, 1.0)))
         .collect()
 }
 
-fn ghost_weights(
+fn ghost_weights_masked(
     frame: &FramePlanes,
     estimate: &[f32],
     estimate_var: &[[f32; 2]],
     correction: [f32; 2],
+    above_black: &[u8],
     control: Control<'_>,
 ) -> Result<Vec<f32>, Error> {
     let width = frame.width as usize;
@@ -1180,8 +1250,13 @@ fn ghost_weights(
                 let z_squared = (0..3)
                     .map(|c| {
                         let group = usize::from(c == 2);
+                        let factor = if above_black.is_empty() || above_black[p] != 0 {
+                            correction[group]
+                        } else {
+                            1.0
+                        };
                         (frame.x[p * 3 + c] - estimate[p * 3 + c]).powi(2)
-                            / (correction[group] * frame.var[p * 2 + 1] + estimate_var[p][group])
+                            / (factor * frame.var[p * 2 + 1] + estimate_var[p][group])
                     })
                     .fold(0.0f32, f32::max);
                 *weight = (-z_squared / 9.0).exp();
@@ -1210,6 +1285,31 @@ fn ghost_weights(
         }
     }
     Ok(weights)
+}
+
+fn ghost_bin_bounds(bin: usize) -> (f32, f32) {
+    if bin < 8 {
+        (
+            0.05 + 0.55 * bin as f32 / 8.0,
+            0.05 + 0.55 * (bin + 1) as f32 / 8.0,
+        )
+    } else {
+        (
+            0.60 + 0.125 * (bin - 8) as f32,
+            0.60 + 0.125 * (bin - 7) as f32,
+        )
+    }
+}
+
+#[cfg(test)]
+fn ghost_weights(
+    frame: &FramePlanes,
+    estimate: &[f32],
+    estimate_var: &[[f32; 2]],
+    correction: [f32; 2],
+    control: Control<'_>,
+) -> Result<Vec<f32>, Error> {
+    ghost_weights_masked(frame, estimate, estimate_var, correction, &[], control)
 }
 
 /// Load each frame once for statistics and once for accumulation (2n calls).
@@ -1328,7 +1428,7 @@ pub fn merge(
                 }
             } else {
                 report.fit_warnings.push(format!(
-                    "X3I ratio warning: frame={i} too few pairs ({}/{}); keep shutter ratio {nominal:.6}", fit.pairs, fit.minimum_pairs
+                    "X3I ratio warning: frame={i} fewer than two clean supported bins or too few pairs ({}/{}); keep shutter ratio {nominal:.6}", fit.pairs, fit.minimum_pairs
                 ));
             }
         }
@@ -1380,6 +1480,21 @@ pub fn merge(
     }
     drop(reference_luma);
     report.calibration_blocks = calibration.iter().map(Vec::len).collect();
+    report.weak_calibration = calibration
+        .iter()
+        .map(|blocks| {
+            let mut ratios: Vec<_> = blocks
+                .iter()
+                .map(|b| {
+                    (b.reference[0] + report.noise_k[2] * b.reference[1])
+                        / (b.frame[0] + report.noise_k[2] * b.frame[1]).max(1e-12)
+                })
+                .collect();
+            median(&mut ratios).is_some_and(|r| r > 8.0)
+        })
+        .collect();
+    report.ghost_bins = vec![[None; 10]; frame_count];
+    report.ghost_bin_pixels = vec![[0; 10]; frame_count];
     report.effective_variance = calibrate(
         &calibration,
         report.noise_k[2],
@@ -1436,6 +1551,7 @@ pub fn merge(
     let mut order: Vec<_> = (1..frame_count).collect();
     order.sort_by_key(|&i| report.exposure_us[i]);
     order.insert(0, 0);
+    let mut reference_bins = Vec::new();
     for i in order {
         control.check()?;
         let mut frame = load(i)?;
@@ -1446,6 +1562,44 @@ pub fn merge(
                 "X3I frame changed between statistics and accumulation".into(),
             ));
         }
+        if i == 0 {
+            let ceiling = options.saturation.unwrap_or([1.0; 3])[2];
+            reference_bins = (0..pixels)
+                .map(|p| {
+                    let level = raw(&frame, 2, p) / ceiling;
+                    (0..10)
+                        .find(|&b| {
+                            let (low, high) = ghost_bin_bounds(b);
+                            level >= low && level < high
+                        })
+                        .map_or(255, |b| b as u8)
+                })
+                .collect::<Vec<_>>();
+        }
+        let alignment = &report.alignments[i];
+        let dx = if alignment.skipped {
+            0
+        } else {
+            alignment.dx.round() as isize
+        };
+        let dy = if alignment.skipped {
+            0
+        } else {
+            alignment.dy.round() as isize
+        };
+        let cutoff = 10.0 * options.noise_sigma.unwrap_or(frame.sigma[2]);
+        let above_black: Vec<_> = if options.ghost_rejection {
+            (0..pixels)
+                .map(|p| {
+                    u8::from(
+                        paired(p, width as usize, height as usize, dx, dy)
+                            .is_some_and(|q| raw(&frame, 2, q) > cutoff),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let planes = materialise(&mut frame, report.scales[i] as f32, &fitted, control)?;
         drop(frame);
         let planes = if i != 0 && options.align.enabled && !report.alignments[i].skipped {
@@ -1463,12 +1617,20 @@ pub fn merge(
                     if i != 0 {
                         estimate[p * 3..p * 3 + 3].copy_from_slice(&planes.x[p * 3..p * 3 + 3]);
                     }
-                    estimate_var[p] = correction.map(|c| c * planes.var[p * 2 + 1]);
+                    estimate_var[p] = correction
+                        .map(|c| if above_black[p] != 0 { c } else { 1.0 } * planes.var[p * 2 + 1]);
                 }
             }
         }
         let ghost = if options.ghost_rejection && i != 0 {
-            ghost_weights(&planes, &estimate, &estimate_var, correction, control)?
+            ghost_weights_masked(
+                &planes,
+                &estimate,
+                &estimate_var,
+                correction,
+                &above_black,
+                control,
+            )?
         } else {
             vec![1.0; pixels]
         };
@@ -1483,6 +1645,18 @@ pub fn merge(
                 .count() as f32
                 / valid_count as f32
         };
+        let mut rejected = [0usize; 10];
+        for p in 0..pixels {
+            let bin = reference_bins[p] as usize;
+            if bin < 10 && planes.valid[p] != 0 {
+                report.ghost_bin_pixels[i][bin] += 1;
+                rejected[bin] += usize::from(ghost[p] < 0.1);
+            }
+        }
+        report.ghost_bins[i] = std::array::from_fn(|b| {
+            let count = report.ghost_bin_pixels[i][b];
+            (count > 0).then(|| rejected[b] as f32 / count as f32)
+        });
         let shortest = report.exposure_us[i] < shortest_us;
         sum.par_chunks_mut(width as usize * 3)
             .zip(weights.par_chunks_mut(width as usize))
@@ -1802,6 +1976,12 @@ mod tests {
             f.raw_top = vec![f.raw_top[0]; 128 * 128];
             f.raw_half = vec![f.raw_half[0]; 128 * 128 / 2];
             f.bmt = vec![f.bmt[0]; 128 * 128 * 3];
+            for p in 0..f.raw_top.len() {
+                let level = if p < f.raw_top.len() / 2 { 0.07 } else { 0.13 };
+                let value = level * if i == 0 { 1.0 } else { 2.0 };
+                f.raw_top[p] = (value * 10000.0) as u16;
+                f.bmt[p * 3..p * 3 + 3].fill(value);
+            }
             if i == 1 {
                 for value in &mut f.raw_top {
                     *value = (*value as f32 * response) as u16;
@@ -1910,7 +2090,35 @@ mod tests {
     }
 
     #[test]
-    fn calibration_can_represent_truncated_noise_below_half_variance() {
+    fn calibration_excludes_blocks_near_either_black_floor() {
+        let options = MergeOptions::default();
+        for dark_reference in [true, false] {
+            let mut a = noisy_frame(0, 1.0, [0.002; 3], [0.0; 3], 1.0, 0.0);
+            let mut b = noisy_frame(1, 1.0, [0.002; 3], [0.0; 3], 1.0, 0.0);
+            if dark_reference {
+                a.sigma[2] = 0.03;
+            } else {
+                b.sigma[2] = 0.03;
+            }
+            let ap = materialise(&mut a, 1.0, &options, Control::none()).unwrap();
+            let bp = materialise(&mut b, 1.0, &options, Control::none()).unwrap();
+            retain_top_gain(&mut a);
+            retain_top_gain(&mut b);
+            assert!(calibration_blocks(
+                (&a, &ap),
+                (&b, &bp),
+                &Alignment::default(),
+                1.0,
+                &options,
+                Control::none()
+            )
+            .unwrap()
+            .is_empty());
+        }
+    }
+
+    #[test]
+    fn calibration_keeps_reference_fixed_and_honours_floor_override() {
         let block = CalibrationBlock {
             residual: [0.4; 3],
             median_squared: [0.182; 3],
@@ -1919,9 +2127,8 @@ mod tests {
         };
         let blocks = [vec![], vec![block; 50]];
         let fit = calibrate(&blocks, 0.0, false, 0.1);
-        assert!((fit[0] + fit[1] - 0.4).abs() < 1e-6);
-        assert!(fit.iter().all(|&c| c < 0.5));
-        assert_eq!(calibrate(&blocks, 0.0, false, 0.5), [0.5, 0.5]);
+        assert_eq!(fit, [1.0, 0.1]);
+        assert_eq!(calibrate(&blocks, 0.0, false, 0.5), [1.0, 0.5]);
     }
 
     #[test]
@@ -2024,13 +2231,23 @@ mod tests {
     }
 
     fn crop_planes(f: &FramePlanes, x: usize, y: usize) -> FramePlanes {
+        crop_region(f, x, y, 64, 64)
+    }
+
+    fn crop_region(
+        f: &FramePlanes,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) -> FramePlanes {
         let mut patch = FramePlanes {
-            width: 64,
-            height: 64,
+            width: width as u32,
+            height: height as u32,
             ..Default::default()
         };
-        for yy in y..y + 64 {
-            for xx in x..x + 64 {
+        for yy in y..y + height {
+            for xx in x..x + width {
                 let p = yy * f.width as usize + xx;
                 patch.x.extend_from_slice(&f.x[p * 3..p * 3 + 3]);
                 patch.var.extend_from_slice(&f.var[p * 2..p * 2 + 2]);
@@ -2039,6 +2256,63 @@ mod tests {
             }
         }
         patch
+    }
+
+    fn print_building_bins(
+        reference: &FramePlanes,
+        frame: &FramePlanes,
+        levels: &[f32],
+        read_snr: &[f32],
+        report: &MergeReport,
+        index: usize,
+    ) {
+        let above_black: Vec<_> = read_snr.iter().map(|&v| u8::from(v > 10.0)).collect();
+        let reference_var: Vec<_> = reference
+            .var
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|v| [v[1]; 2])
+            .collect();
+        let weights = ghost_weights_masked(
+            frame,
+            &reference.x,
+            &reference_var,
+            [
+                report.chroma_variance[index],
+                report.effective_variance[index],
+            ],
+            &above_black,
+            Control::none(),
+        )
+        .unwrap();
+        for bin in 0..10 {
+            let (low, high) = ghost_bin_bounds(bin);
+            let mut ratios = Vec::new();
+            let mut valid = 0;
+            let mut rejected = 0;
+            let mut snr = 0.0;
+            for p in 0..levels.len() {
+                if levels[p] < low
+                    || levels[p] >= high
+                    || reference.valid[p] == 0
+                    || frame.valid[p] == 0
+                {
+                    continue;
+                }
+                valid += 1;
+                rejected += usize::from(weights[p] < 0.1);
+                if read_snr[p] > 10.0 && frame.x[p * 3 + 2] > 0.0 {
+                    ratios.push(
+                        reference.x[p * 3 + 2] / frame.x[p * 3 + 2] * report.scales[index] as f32,
+                    );
+                    snr += read_snr[p];
+                }
+            }
+            let count = ratios.len();
+            let ratio = median(&mut ratios);
+            eprintln!("dp0 static building=(200,100,2400,800) frame={index} bin={} lower={low:.5} upper={high:.5} ratio={ratio:?} pairs={count} mean_read_sigma={} valid={valid} ghost_fraction={}", bin + 1, snr / count.max(1) as f32, rejected as f32 / valid.max(1) as f32);
+        }
     }
 
     fn patch_residual_statistics(
@@ -2173,6 +2447,87 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_static_rejection_is_small_at_both_calibration_clamps() {
+        let pixels = 256 * 256;
+        for correction in [0.5_f32, 4.0] {
+            let block = CalibrationBlock {
+                residual: [1.0 + correction; 3],
+                median_squared: [0.455 * (1.0 + correction); 3],
+                reference: [1.0, 0.0],
+                frame: [1.0, 0.0],
+            };
+            assert_eq!(
+                calibrate(&[vec![], vec![block; 50]], 0.0, false, 0.5),
+                [1.0, correction]
+            );
+            let mut seed = 41;
+            let reference: Vec<_> = (0..pixels * 3).map(|_| gaussian(&mut seed)).collect();
+            let frame = FramePlanes {
+                width: 256,
+                height: 256,
+                x: (0..pixels * 3)
+                    .map(|_| gaussian(&mut seed) * correction.sqrt())
+                    .collect(),
+                var: vec![1.0; pixels * 2],
+                d_max: vec![0.1; pixels],
+                valid: vec![1; pixels],
+            };
+            let ghost = ghost_weights(
+                &frame,
+                &reference,
+                &vec![[1.0; 2]; pixels],
+                [correction; 2],
+                Control::none(),
+            )
+            .unwrap();
+            let fraction = ghost.iter().filter(|&&g| g < 0.1).count() as f32 / pixels as f32;
+            assert!(fraction < 0.005, "c={correction} ghost={fraction}");
+            for c in 0..3 {
+                let mut z: Vec<_> = (0..pixels)
+                    .map(|p| {
+                        (frame.x[p * 3 + c] - reference[p * 3 + c]).powi(2) / (1.0 + correction)
+                    })
+                    .collect();
+                let z = median(&mut z).unwrap();
+                assert!(
+                    (z - 0.455).abs() < 0.025,
+                    "c={correction} channel={c} z2={z}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dark_pixels_keep_the_uncorrected_ghost_model() {
+        let frame = FramePlanes {
+            width: 4,
+            height: 4,
+            x: vec![3.0; 48],
+            var: vec![1.0; 32],
+            valid: vec![1; 16],
+            d_max: vec![0.0; 16],
+        };
+        let estimate = vec![0.0; 48];
+        let variance = vec![[1.0; 2]; 16];
+        let uncorrected =
+            ghost_weights(&frame, &estimate, &variance, [1.0; 2], Control::none()).unwrap();
+        for correction in [0.5, 4.0] {
+            assert_eq!(
+                ghost_weights_masked(
+                    &frame,
+                    &estimate,
+                    &variance,
+                    [correction; 2],
+                    &[0; 16],
+                    Control::none()
+                )
+                .unwrap(),
+                uncorrected
+            );
+        }
+    }
+
+    #[test]
     fn static_dark_noise_has_calibrated_residuals_and_near_zero_rejection() {
         let make = |i| {
             let mut f = noisy_frame(i, 1.0, [0.002; 3], [0.0; 3], 1.0, 0.0);
@@ -2226,6 +2581,54 @@ mod tests {
             fractions[0], fractions[1]
         );
         assert!(fractions[1] < 0.005);
+    }
+
+    fn detrended_variance(values: &[f32], width: usize) -> f32 {
+        let height = values.len() / width;
+        let mean = values.iter().map(|&v| f64::from(v)).sum::<f64>() / values.len() as f64;
+        let mut xx = 0.0;
+        let mut yy = 0.0;
+        let mut xv = 0.0;
+        let mut yv = 0.0;
+        for (p, &v) in values.iter().enumerate() {
+            let x = (p % width) as f64 - (width - 1) as f64 / 2.0;
+            let y = (p / width) as f64 - (height - 1) as f64 / 2.0;
+            xx += x * x;
+            yy += y * y;
+            xv += x * (f64::from(v) - mean);
+            yv += y * (f64::from(v) - mean);
+        }
+        let residual: Vec<_> = values
+            .iter()
+            .enumerate()
+            .map(|(p, &v)| {
+                (f64::from(v)
+                    - mean
+                    - xv / xx * ((p % width) as f64 - (width - 1) as f64 / 2.0)
+                    - yv / yy * ((p / width) as f64 - (height - 1) as f64 / 2.0))
+                    as f32
+            })
+            .collect();
+        variance(&residual)
+    }
+
+    #[test]
+    fn plane_detrending_preserves_noise_and_removes_gradient() {
+        let flat: Vec<_> = (0..4096)
+            .map(|p| {
+                if (p % 64 + p / 64) % 2 == 0 {
+                    0.01
+                } else {
+                    -0.01
+                }
+            })
+            .collect();
+        let tilted: Vec<_> = flat
+            .iter()
+            .enumerate()
+            .map(|(p, v)| v + (p % 64) as f32 * 0.3 + (p / 64) as f32 * 0.7)
+            .collect();
+        assert!((detrended_variance(&tilted, 64) / variance(&flat) - 1.0).abs() < 0.001);
     }
 
     #[test]
@@ -2321,6 +2724,22 @@ mod tests {
             for (scale, nominal) in scene.report.scales.iter().zip(&scene.report.nominal_scales) {
                 assert!((scale / nominal).log2().abs() <= 0.3);
             }
+            if name == "_DQH0978.X3I" {
+                for i in 1..=3 {
+                    let fit = &scene.report.aligned_ratios[i];
+                    for bin in 3..=5 {
+                        let clean =
+                            f64::from(fit.bins[bin].unwrap()) * scene.report.nominal_scales[i];
+                        if (scene.report.scales[i] / clean - 1.0).abs() >= 0.003 {
+                            failures.push(format!(
+                                "H frame {i} bin {} scale={} clean={clean}",
+                                bin + 1,
+                                scene.report.scales[i]
+                            ));
+                        }
+                    }
+                }
+            }
             for c in 0..3 {
                 let mut merged: Vec<_> = green.iter().map(|(p, _)| scene.bmt[p * 3 + c]).collect();
                 let mut reference: Vec<_> = green.iter().map(|(_, v)| v[c]).collect();
@@ -2337,7 +2756,14 @@ mod tests {
                 .map(|p| scene.bmt[p * 3 + 2])
                 .collect();
             let ratio = (variance(&merged) / variance(&reference)).sqrt();
-            eprintln!("{name}: dark_patch=({x},{y},64,64) T_stddev_ratio={ratio:.8}");
+            let detrended =
+                (detrended_variance(&merged, 64) / detrended_variance(&reference, 64)).sqrt();
+            eprintln!("{name}: dark_patch=({x},{y},64,64) T_stddev_ratio={ratio:.8} detrended_ratio={detrended:.8}");
+            // Remove the fitted illumination plane before comparing noise in the selected flat block.
+            assert!(
+                detrended < 0.8,
+                "{name}: selected patch detrended noise ratio {detrended}"
+            );
 
             let fitted = MergeOptions {
                 noise_k: scene.report.noise_k,
@@ -2349,6 +2775,8 @@ mod tests {
                 (5721, 960)
             };
             let mut old_planes = Vec::new();
+            let mut building_reference = None;
+            let mut building_levels = Vec::new();
             // Warp the full raster before cropping, so the patch uses the merge coordinates.
             let (planes, patch_read_snr): (Vec<_>, Vec<_>) = (0..container.frames().len())
                 .map(|i| {
@@ -2376,6 +2804,29 @@ mod tests {
                     }
                     let read_snr =
                         raw_sum / count as f32 / fitted.noise_sigma.unwrap_or(frame.sigma[2]);
+                    let building_snr: Vec<_> = if name == "DP0Q0002.X3I" && i <= 3 {
+                        (100..900)
+                            .flat_map(|yy| {
+                                (200..2600).map(move |xx| yy * scene.width as usize + xx)
+                            })
+                            .map(|p| {
+                                if i == 0 {
+                                    building_levels
+                                        .push(raw(&frame, 2, p) / fitted.saturation.unwrap()[2]);
+                                }
+                                paired(
+                                    p,
+                                    scene.width as usize,
+                                    scene.height as usize,
+                                    alignment.dx.round() as isize,
+                                    alignment.dy.round() as isize,
+                                )
+                                .map_or(0.0, |q| raw(&frame, 2, q) / frame.sigma[2])
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     let planes = materialise(
                         &mut frame,
                         scene.report.scales[i] as f32,
@@ -2387,6 +2838,21 @@ mod tests {
                     let planes =
                         x3i_align::warp(planes, &scene.report.alignments[i], Control::none())
                             .unwrap();
+                    if name == "DP0Q0002.X3I" && i <= 3 {
+                        let building = crop_region(&planes, 200, 100, 2400, 800);
+                        if i == 0 {
+                            building_reference = Some(building);
+                        } else {
+                            print_building_bins(
+                                building_reference.as_ref().unwrap(),
+                                &building,
+                                &building_levels,
+                                &building_snr,
+                                &scene.report,
+                                i,
+                            );
+                        }
+                    }
                     old_planes.push(crop_planes(&planes, old_patch.0, old_patch.1));
                     (crop_planes(&planes, x, y), read_snr)
                 })
@@ -2527,16 +2993,16 @@ mod tests {
         assert_eq!(scene.report.ghost_fractions[1], 1.0);
         assert_eq!(scene.report.fallback_zero, 0);
         let lines = scene.report.statistics();
-        assert_eq!(lines.len(), 31);
+        assert_eq!(lines.len(), 61);
         assert!(lines[0].contains("k_B="));
         assert!(lines[1].contains("nominal=1.000000000000 refined=1.000000000000"));
-        assert!(lines[10].contains("dx=0.000000"));
-        assert!(lines[10].contains("weak=false"));
+        assert!(lines[20].contains("dx=0.000000"));
+        assert!(lines[20].contains("weak=false"));
         let mut report = scene.report;
         for (tiles, residual, weak) in [(3, 0.0, true), (4, 1.5, false), (4, 1.51, true)] {
             report.alignments[1].retained_tiles = tiles;
             report.alignments[1].max_tile_residual = residual;
-            assert!(report.statistics()[20].contains(&format!("weak={weak}")));
+            assert!(report.statistics()[40].contains(&format!("weak={weak}")));
         }
     }
 
@@ -2631,7 +3097,56 @@ mod tests {
         )
         .unwrap();
         assert!(fit.pairs >= fit.minimum_pairs);
-        assert!((fit.multiplier.unwrap() - 1.0).abs() < 1e-6);
+        assert_eq!(fit.multiplier, None); // One supported bin cannot identify slope and offset.
+    }
+
+    #[test]
+    fn bin_fit_keeps_affine_offset_diagnostic_only() {
+        let options = MergeOptions::default();
+        let mut reference = noisy_frame(0, 1.0, [0.0; 3], [0.0; 3], 1.0, 0.0);
+        let mut frame = reference.clone();
+        for p in 0..reference.raw_top.len() {
+            let level = match p % 10 {
+                0..=6 => 0.08,
+                7 => 0.16,
+                8 => 0.30,
+                _ => 0.45,
+            };
+            let value = (level - 0.003) / 1.02;
+            reference.raw_top[p] = (5000.0 + level * 50000.0) as u16;
+            frame.raw_top[p] = (5000.0 + value * 50000.0) as u16;
+            reference.bmt[p * 3..p * 3 + 3].fill(level);
+            frame.bmt[p * 3..p * 3 + 3].fill(value);
+        }
+        let a = materialise(&mut reference, 1.0, &options, Control::none()).unwrap();
+        let b = materialise(&mut frame, 1.0, &options, Control::none()).unwrap();
+        let fit = refined_ratio(
+            (&reference, &frame),
+            &a,
+            &b,
+            &Alignment::default(),
+            1.0,
+            &options,
+            Control::none(),
+        )
+        .unwrap();
+        let mut clean: Vec<_> = fit.bins.iter().flatten().copied().collect();
+        assert_eq!(fit.multiplier, median(&mut clean));
+        assert!((fit.black_offset.unwrap() - 0.003).abs() < 1e-5);
+        assert!(fit.level_trend.unwrap() > 0.02);
+        frame.sigma[2] = 0.01;
+        let dark = refined_ratio(
+            (&reference, &frame),
+            &a,
+            &b,
+            &Alignment::default(),
+            1.0,
+            &options,
+            Control::none(),
+        )
+        .unwrap();
+        assert_eq!(dark.clean_bins.iter().filter(|&&v| v).count(), 1);
+        assert_eq!(dark.multiplier, None);
     }
 
     #[test]
@@ -2664,11 +3179,11 @@ mod tests {
                 0.0,
             );
             for p in 0..f.raw_top.len() {
-                let level = if p < f.raw_top.len() / 2 { 0.08 } else { 0.16 };
+                let level = [0.06, 0.13, 0.19][p * 3 / f.raw_top.len()];
                 let value = if i == 0 {
                     level
                 } else {
-                    level * 2.0 * if level > 0.1 { 0.98 } else { 1.0 }
+                    level * 2.0 * if level == 0.13 { 0.94 } else { 1.0 }
                 };
                 f.raw_top[p] = (5000.0 + value * 50000.0) as u16;
                 f.bmt[p * 3..p * 3 + 3].fill(value);
@@ -2690,7 +3205,7 @@ mod tests {
         )
         .unwrap();
         assert!(fit.bin_pairs[0] >= fit.minimum_pairs && fit.bin_pairs[1] >= fit.minimum_pairs);
-        assert!((fit.level_trend.unwrap() - (1.0 / 0.98 - 1.0)).abs() < 1e-5);
+        assert!(fit.level_trend.unwrap() > 0.02);
         let rejected = merge(2, |i| Ok(make(i)), &options, Control::none()).unwrap();
         assert_eq!(rejected.report.scales[1], 0.5);
         assert!(rejected
@@ -2702,7 +3217,7 @@ mod tests {
             2,
             |i| Ok(make(i)),
             &MergeOptions {
-                ratio_trend_limit: 0.03,
+                ratio_trend_limit: 0.20,
                 ..options
             },
             Control::none(),

@@ -436,12 +436,16 @@ container reporting, seven-frame DNG dispatch, cancellation cleanup and
 existing-output preservation. Scene tests check finite active-area RGB and
 extended highlight range. TIFF and PPM must use the merged raster.
 
-The phase 1 dp0 merged DNG has the intentional macOS aarch64 MD5 pin
-`494b455d3286dfdc1c5243ad60a31284` with `-dng -no-denoise`. This pin records the
-soft-shoulder fix. It is separate from the unchanged single-frame
-baselines above. Floating-point merge bytes can differ on other platforms;
-structural and same-run checks still apply there. Record any intentional merge
-algorithm change and its measured replacement pin in the same commit.
+The phase 2 dp0 merged DNG has the intentional macOS aarch64 MD5 pin
+`c80db90d70032be445b0a0a0af81b876` with `-dng -no-denoise`. Clean-bin scalar
+refinement and anchored effective-variance calibration replace the aligned
+pin `db749dee7d09a65817c2df39dcf235d7`. That earlier aligned pin, at commit
+`38bbeef`, replaced phase 1 `494b455d3286dfdc1c5243ad60a31284`; at that commit,
+`X3F_X3I_NO_ALIGN=1` reproduces `302684ec51a01cddbd4ae76cc3e2bc29`.
+These merge pins are separate from the unchanged single-frame baselines above.
+Floating-point merge bytes can differ on other platforms; structural and
+same-run checks still apply there. Record any intentional merge algorithm
+change and its measured replacement pin in the same commit.
 
 ```sh
 cargo test -p x3f-cli --release --test x3i -- --nocapture

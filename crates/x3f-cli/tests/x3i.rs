@@ -241,6 +241,13 @@ fn corpus_dng_merge_writes_seven_frame_report() {
                 .count(),
             56
         );
+        assert_eq!(
+            report
+                .lines()
+                .filter(|line| line.contains(": ghost-bin "))
+                .count(),
+            70
+        );
         for (i, line) in statistics.iter().enumerate() {
             assert!(line.starts_with(&format!("X3I frame {i}:")));
             let number = |key: &str| {
@@ -251,8 +258,15 @@ fn corpus_dng_merge_writes_seven_frame_report() {
                     .unwrap()
             };
             assert!((number("refined=") / number("nominal=")).log2().abs() <= 0.3);
-            assert!((0.1..=4.0).contains(&number("c=")));
-            assert!((0.1..=4.0).contains(&number("c_chroma=")));
+            for key in ["c=", "c_chroma="] {
+                if i == 0 || number("calibration_blocks=") >= 50.0 {
+                    assert!((0.5..=4.0).contains(&number(key)));
+                } else {
+                    assert!(line.split_whitespace().any(|v| v == format!("{key}-")));
+                }
+            }
+            assert!(line.contains("black_offset="));
+            assert!(line.contains("calibration_weak="));
             assert!(line.contains("median_z2_flat="));
             assert!(line.contains("ghost_threshold=0.1 ghost_status=preliminary"));
             assert!((0.0..=1.0).contains(&number("ghost_fraction=")));
@@ -287,7 +301,7 @@ fn corpus_dng_merge_writes_seven_frame_report() {
             let expected = common::file_md5(&dng);
             // This float output hash was recorded on macOS aarch64.
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            assert_eq!(expected, "db749dee7d09a65817c2df39dcf235d7");
+            assert_eq!(expected, "c80db90d70032be445b0a0a0af81b876");
             let report_path = scratch.0.join(format!("{name}.x3i-report"));
             std::fs::remove_file(&report_path).unwrap();
             std::fs::create_dir(&report_path).unwrap();
