@@ -426,3 +426,38 @@ calibrated color accuracy or identical JPEG appearance.
 The full behaviour spec for AI-assisted work in this repo is in
 [`AGENTS.md`](https://github.com/sagwaco/x3fuse-core/blob/master/AGENTS.md);
 human contributors are welcome to follow the same conventions.
+
+## X3I corpus checks
+
+Keep `DP0Q0002.X3I` and `_DQH0978.X3I` in the private corpus. Never commit
+these files. The X3I CLI tests compare frame 0 through its window with an
+extracted X3F for metadata and `-ppm -color none -no-denoise`. They also check
+container reporting, seven-frame DNG dispatch, cancellation cleanup and
+existing-output preservation. Scene tests check finite active-area RGB and
+extended highlight range. TIFF and PPM must use the merged raster.
+
+The phase 1 dp0 merged DNG has the intentional macOS aarch64 MD5 pin
+`2a48ebc1cd41e937923e3e78d542c368` with `-dng -no-denoise`. This pin records the
+physical-ceiling correction. It is separate from the unchanged single-frame
+baselines above. Floating-point merge bytes can differ on other platforms;
+structural and same-run checks still apply there. Record any intentional merge
+algorithm change and its measured replacement pin in the same commit.
+
+```sh
+cargo test -p x3f-cli --release --test x3i -- --nocapture
+cargo test -p x3f-core --release --test x3i_outputs -- --nocapture
+```
+
+For each sample, check DNG decoded codes times `S`, `BaselineExposure`, preview
+gain and fallback counts. Render with Adobe `dng_validate` and inspect fixed
+shadow and highlight crops. Check Lightroom, RawTherapee, Apple and Capture One
+separately. A valid file structure does not prove those readers restore the
+large encoding scale correctly. Record each reader and version actually tested.
+
+Post-merge denoise is disabled unless `X3F_X3I_DENOISE_SCALE` is positive.
+Before proposing a default, compare a fixed flat dark patch with the override
+unset and at `0.3`. Record noise in reference units, distinct-code spacing and
+rendered crops. The residual bridge changes codes in multiples of four and can
+cause bands at large `S`. Do not change the default from an assumed noise gain.
+The [X3I evidence archive](https://github.com/sagwaco/x3f-docs/tree/main/spp-rgb-trace/followup-x3i-sfd)
+contains container corrections and SPP compose observations.

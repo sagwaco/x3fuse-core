@@ -399,3 +399,51 @@ numerical tolerances, benchmarks, and the BM3D implementation.
 Legacy C headers and the two log/version shims are in
 [`crates/x3f-sys/csrc/`](../../crates/x3f-sys/csrc/). Bindgen consumes the
 headers for ABI types. The other C function bodies have been ported to Rust.
+
+## X3I merge stage
+
+`convert_file` and `prepare_scene_linear` detect `FOVi` before opening a normal
+X3F reader. `X3iContainer` validates each embedded frame. The output driver
+prepares one frame at a time with denoise and single-frame recovery disabled.
+The producer applies black correction, bad-pixel handling, selected spatial
+gain and Quattro expansion. It exports normalized camera BMT plus the
+intermediate raw-plane snapshot and shield-noise estimates. Integer
+preprocessing and expansion can already clamp samples; merging cannot undo
+that loss.
+
+The driver first prepares the longest exposure to estimate physical sensor
+ceilings. A candidate needs at least 1000 samples and 0.05 percent of its
+plane in the one-percent interval below the maximum. Accepted ceilings lie
+in `[0.3,1]`; unsupported estimates use one and can produce a warning when
+a strong lower cliff is present. This estimator can mistake a flat wall for
+a ceiling. A cross-frame ceiling agreement check is still required.
+
+Frame 0 defines reference units. The exposure multiplier is its CAMF
+`CaptureShutter` divided by the current frame's value. Noise uses normalized
+raw-range signal `r=(sample-black)/(white-black)`. The physical ceiling changes
+only clipping evidence: `d=r/ceiling`. Validity and logistic roll-off use the
+maximum `d` over the exact expansion footprint and its 3x3 neighbourhood.
+An invalid contributing sample rejects the expanded output. The default knee
+is 0.9, width 0.03 and validity margin 0.02, relative to that ceiling.
+
+Weights use inverse variance with per-frame shield noise, linear and quadratic
+signal terms, exposure scaling squared and spatial gain squared. B and M
+share one chroma weight; T has a luma weight. The reference gets a minimum
+weight where valid. No signal-dependent dark weight is applied. When the
+weight sum is too small, use the valid frame with the best expected SNR.
+If none is valid, use the shortest exposure; otherwise use zero. Reports
+count each fallback and list the exposure multipliers and physical ceilings.
+
+After accumulation, mask the non-active border and compute `S` from the active
+maximum, with a minimum of one. Store `round(merged/S*65535)` as unsigned
+camera samples. DNG declares black zero, white 65535 and linear response one.
+Its `BaselineExposure` is frame 0's baseline plus `log2(S)`. Metadata and
+preview use frame 0, and preview spatial gain is disabled because the merge
+already applied it. An explicit safety cap reports samples clipped at the cap.
+
+[Post-merge denoise](./x3i.md#experimental-denoise) is experimental and disabled
+by default. TIFF and PPM use frame 0's color transform, output transfer and
+optional active-area crop. They clip extended highlights at one. They do not
+run the RGB chroma LUT or single-frame highlight recovery. Scene preparation
+keeps extended-linear RGB for an editor. See [X3I merge and outputs](./x3i.md)
+for options, limits and evidence links.
