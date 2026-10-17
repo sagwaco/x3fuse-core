@@ -241,6 +241,8 @@ fn corpus_dng_merge_writes_seven_frame_report() {
         if name == "DP0Q0002.X3I" {
             let dng = scratch.0.join(format!("{name}.dng"));
             let expected = common::file_md5(&dng);
+            // This float output hash was recorded on macOS aarch64.
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             assert_eq!(expected, "2a48ebc1cd41e937923e3e78d542c368");
             let report_path = scratch.0.join(format!("{name}.x3i-report"));
             std::fs::remove_file(&report_path).unwrap();

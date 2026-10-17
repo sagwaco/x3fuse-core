@@ -290,9 +290,18 @@ fn estimate_plane_saturation(
         .ceil()
         .clamp(0.0, maximum as f64) as usize;
     let suspicious = (0..below).any(|upper| {
+        if upper as f64 <= black {
+            return false;
+        }
         let start = lower(upper);
-        upper as f64 > black
-            && enough(histogram[upper] - start.checked_sub(1).map_or(0, |i| histogram[i]))
+        let width = upper - start + 1;
+        let Some(previous_start) = start.checked_sub(width) else {
+            return false;
+        };
+        let pile = histogram[upper] - histogram[start - 1];
+        let previous =
+            histogram[start - 1] - previous_start.checked_sub(1).map_or(0, |i| histogram[i]);
+        enough(pile) && pile / 5 >= previous
     });
     Ok((1.0, suspicious))
 }
@@ -857,6 +866,25 @@ mod tests {
             )
             .unwrap(),
             (0.3, false)
+        );
+    }
+
+    #[test]
+    fn ceiling_fallback_warns_for_a_cliff_but_not_a_smooth_histogram() {
+        let mut values: Vec<u16> = (0u16..10000)
+            .flat_map(|value| {
+                std::iter::repeat_n(value, usize::from(value.min(10000 - value)) / 50 + 1)
+            })
+            .collect();
+        assert_eq!(
+            estimate_plane_saturation(values.iter().copied(), 0.0, 10000.0, Control::none())
+                .unwrap(),
+            (1.0, false)
+        );
+        values.extend(std::iter::repeat_n(4500, 20000));
+        assert_eq!(
+            estimate_plane_saturation(values.into_iter(), 0.0, 10000.0, Control::none()).unwrap(),
+            (1.0, true)
         );
     }
 
