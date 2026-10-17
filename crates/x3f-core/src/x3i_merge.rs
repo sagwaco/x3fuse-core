@@ -40,6 +40,8 @@ pub struct MergeOptions {
     pub saturation_width: f32,
     /// Reject raw samples at or above one minus this margin.
     pub validity_margin: f32,
+    /// Physical ceilings in raw-range units. None uses one in all planes.
+    pub saturation: Option<[f32; 3]>,
     /// Placeholder coefficients. Phase 2 will fit these values from frame pairs.
     pub noise_k: [f32; 3],
     /// Quadratic raw-noise coefficients per plane.
@@ -60,6 +62,7 @@ impl Default for MergeOptions {
             saturation_knee: 0.9,
             saturation_width: 0.03,
             validity_margin: 0.02,
+            saturation: None,
             noise_k: [4e-5; 3],
             noise_q: [0.0; 3],
             noise_sigma: None,
@@ -75,16 +78,20 @@ impl MergeOptions {
         Self::parse_env(
             std::env::var("X3F_X3I_NOISE").ok().as_deref(),
             std::env::var("X3F_X3I_MAX_S").ok().as_deref(),
+            std::env::var("X3F_X3I_SATURATION").ok().as_deref(),
         )
     }
 
-    fn parse_env(noise: Option<&str>, max_s: Option<&str>) -> Result<Self, Error> {
+    fn parse_env(
+        noise: Option<&str>,
+        max_s: Option<&str>,
+        saturation: Option<&str>,
+    ) -> Result<Self, Error> {
         let mut options = Self::default();
         let parse = |value: &str| {
-            value
-                .trim()
-                .parse::<f32>()
-                .map_err(|_| Error::InvalidData("invalid X3I noise or scale override".into()))
+            value.trim().parse::<f32>().map_err(|_| {
+                Error::InvalidData("invalid X3I noise, scale or saturation override".into())
+            })
         };
         if let Some(noise) = noise {
             let parts: Vec<_> = noise.split(',').collect();
@@ -102,6 +109,15 @@ impl MergeOptions {
             options.noise_q = [parse(q)?; 3];
         }
         options.max_s = max_s.map(parse).transpose()?;
+        if let Some(saturation) = saturation {
+            let parts: Vec<_> = saturation.split(',').collect();
+            let [b, m, t] = parts.as_slice() else {
+                return Err(Error::InvalidData(
+                    "X3F_X3I_SATURATION requires b,m,t".into(),
+                ));
+            };
+            options.saturation = Some([parse(b)?, parse(m)?, parse(t)?]);
+        }
         options.validate()?;
         Ok(options)
     }
@@ -119,6 +135,11 @@ impl MergeOptions {
                 .iter()
                 .chain(&self.noise_q)
                 .any(|v| !v.is_finite() || *v < 0.0)
+            || self.saturation.is_some_and(|values| {
+                values
+                    .iter()
+                    .any(|v| !v.is_finite() || *v <= 0.0 || *v > 1.0)
+            })
             || self.noise_sigma.is_some_and(|v| !v.is_finite() || v < 0.0)
             || self.max_s.is_some_and(|v| !v.is_finite() || v < 1.0)
         {
@@ -977,18 +998,42 @@ mod tests {
 
     #[test]
     fn noise_overrides_parse_without_mutating_the_environment() {
-        let options = MergeOptions::parse_env(Some("0.002, 0.0001, 0.01"), Some("8")).unwrap();
+        let options =
+            MergeOptions::parse_env(Some("0.002, 0.0001, 0.01"), Some("8"), None).unwrap();
         assert_eq!(options.noise_sigma, Some(0.002));
         assert_eq!(options.noise_k, [0.0001; 3]);
         assert_eq!(options.noise_q, [0.01; 3]);
-        let measured = MergeOptions::parse_env(Some(",0.0001,0"), None).unwrap();
+        let measured = MergeOptions::parse_env(Some(",0.0001,0"), None, None).unwrap();
         assert_eq!(measured.noise_sigma, None);
         assert_eq!(options.max_s, Some(8.0));
         for value in ["1,2", "1,2,3,4", "nan,0,0", "-1,0,0", "0,-1,0", "x,0,0"] {
-            assert!(MergeOptions::parse_env(Some(value), None).is_err());
+            assert!(MergeOptions::parse_env(Some(value), None, None).is_err());
         }
         for value in ["nan", "inf", "0.5", "x"] {
-            assert!(MergeOptions::parse_env(None, Some(value)).is_err());
+            assert!(MergeOptions::parse_env(None, Some(value), None).is_err());
+        }
+    }
+
+    #[test]
+    fn saturation_override_requires_three_positive_finite_fractions() {
+        assert_eq!(MergeOptions::default().saturation, None);
+        let options = MergeOptions::parse_env(None, None, Some("0.44, 0.43, 0.55")).unwrap();
+        assert_eq!(options.saturation, Some([0.44, 0.43, 0.55]));
+        for value in [
+            "",
+            "0.4,0.5",
+            "0.4,0.5,0.6,0.7",
+            "0,1,1",
+            "-1,1,1",
+            "nan,1,1",
+            "inf,1,1",
+            "1.1,1,1",
+            "x,1,1",
+        ] {
+            assert!(
+                MergeOptions::parse_env(None, None, Some(value)).is_err(),
+                "{value}"
+            );
         }
     }
 
