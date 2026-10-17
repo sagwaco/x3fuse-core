@@ -1234,6 +1234,10 @@ unsafe fn yuv_to_bmt(area: *mut Area16, dt: DType) {
 /// not exceed row stride. Row padding is never changed.
 /// Scale multiplies `DenoiseOptions::strength`. Noise levels use 16-bit camera codes.
 /// Adjust scale for other code ranges. For X3I samples divided by S, divide scale by S.
+/// The bridge compresses all channels by four before filtering to avoid YUV overflow.
+/// It adds the filtered residual to the original codes in steps of four.
+/// This can cause bands in deep shadows. At X3I S=11.4, one code is about
+/// 0.00017 reference units and can be close to one noise standard deviation.
 /// Zero scale or disabled luminance and chroma leaves the data unchanged.
 /// Cancellation returns `Error::Cancelled` and leaves the input unchanged.
 /// Zero dimensions, channels other than three, invalid stride or length, arithmetic
@@ -1265,8 +1269,12 @@ pub fn denoise_u16(
         .denoise_options
         .validate()
         .map_err(crate::Error::InvalidData)?;
+    if scale == 0.0 || (!control.denoise_options.luminance && !control.denoise_options.chroma) {
+        return Ok(());
+    }
+    let mut compressed: Vec<u16> = data.iter().map(|v| v / 4).collect();
     let mut area = Area16 {
-        data: data.as_mut_ptr(),
+        data: compressed.as_mut_ptr(),
         buf: std::ptr::null_mut(),
         rows: height,
         columns: width,
@@ -1274,7 +1282,18 @@ pub fn denoise_u16(
         row_stride,
     };
     // SAFETY: the checks above cover each row. The kernel does not free this buffer.
-    unsafe { denoise_area_controlled(&mut area, DENOISE_F23, scale, control) }
+    unsafe { denoise_area_controlled(&mut area, DENOISE_F23, scale / 4.0, control) }?;
+    control.check()?;
+    for (row, filtered) in data
+        .chunks_exact_mut(row_stride as usize)
+        .zip(compressed.chunks_exact(row_stride as usize))
+    {
+        for (original, filtered) in row[..logical.unwrap() as usize].iter_mut().zip(filtered) {
+            let residual = (i32::from(*filtered) - i32::from(*original / 4)) * 4;
+            *original = sat_u16_i32(i32::from(*original) + residual);
+        }
+    }
+    Ok(())
 }
 
 /// BMT→YUV, full `denoise_nlm`, YUV→BMT (was the OpenCV `x3f_denoise`).
@@ -1448,6 +1467,36 @@ mod tests {
                 denoise_u16(&mut invalid, 8, 8, 3, stride, 0.3, control),
                 Err(crate::Error::InvalidData(_))
             ));
+        }
+    }
+
+    #[test]
+    fn u16_bridge_preserves_full_range_and_smooth_shadows() {
+        let control = Control::none().with_denoise_backend(DenoiseBackend::Cpu);
+        for algorithm in [DenoiseAlgorithm::Nlm, DenoiseAlgorithm::Bm3d] {
+            let control = control
+                .with_denoise_options(DenoiseOptions {
+                    algorithm,
+                    ..Default::default()
+                })
+                .unwrap();
+            let mut bright = vec![60001; 8 * 8 * 3];
+            denoise_u16(&mut bright, 8, 8, 3, 24, 0.3, control).unwrap();
+            assert_eq!(bright, vec![60001; 8 * 8 * 3]);
+            let mut dark: Vec<u16> = (0..8)
+                .flat_map(|_| (0..32).flat_map(|x| [256 + x; 3]))
+                .collect();
+            let original = dark.clone();
+            denoise_u16(&mut dark, 32, 8, 3, 96, 0.0, control).unwrap();
+            assert_eq!(dark, original);
+            denoise_u16(&mut dark, 32, 8, 3, 96, 0.3, control).unwrap();
+            for row in dark.chunks_exact(96) {
+                for pair in row.chunks_exact(3).collect::<Vec<_>>().windows(2) {
+                    for c in 0..3 {
+                        assert!(pair[0][c].abs_diff(pair[1][c]) <= 4);
+                    }
+                }
+            }
         }
     }
 
