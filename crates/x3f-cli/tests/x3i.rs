@@ -142,13 +142,13 @@ fn missing_shutter_keeps_metadata_and_cli_errors_give_guidance() {
         "X3I frames\nindex offset length exposure_us EV\n0 1440 {length} - -\n\n"
     )));
     let output = Command::new(common::X3F_EXTRACT)
-        .arg("-ppm")
+        .arg("-jpg")
         .arg(&input)
         .output()
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("X3I input: use -dng, -x3i-frame <n>, -x3i-extract or -meta"));
+        .contains("X3I input: use -dng, -tiff, -ppm, -x3i-frame <n>, -x3i-extract or -meta"));
     let missing = scratch.0.join("missing.bin");
     let output = Command::new(common::X3F_EXTRACT)
         .arg(&missing)

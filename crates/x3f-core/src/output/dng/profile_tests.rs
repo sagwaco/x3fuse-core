@@ -2022,7 +2022,10 @@ fn x3i_corpus_dispatch_writes_scaled_linear_dng_and_preserves_contracts() {
         let container = X3iContainer::open(&input).unwrap();
         assert_eq!(container.frames().len(), 7);
         let output = destination.join(format!("{name}.dng"));
-        let options = ProcessOptions::default();
+        let options = ProcessOptions {
+            denoise_intensity: 0,
+            ..Default::default()
+        };
         let mut processed = 0;
         let report = convert_file(
             &input,
@@ -2036,10 +2039,6 @@ fn x3i_corpus_dispatch_writes_scaled_linear_dng_and_preserves_contracts() {
         )
         .unwrap();
         assert_eq!(processed, 7);
-        assert!(report
-            .warnings
-            .iter()
-            .any(|s| s == "denoise is not applied to X3I merges yet"));
         for i in 0..7 {
             let exposure = container.frame_exposure_us(i).unwrap();
             assert!(report

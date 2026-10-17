@@ -16,6 +16,16 @@ use crate::Image;
 
 /// Write `image` as a PPM file. `binary=true` selects P6, false selects P3.
 pub fn write(image: &Image, out: impl AsRef<Path>, binary: bool) -> io::Result<()> {
+    write_controlled(image, out.as_ref(), binary, x3f_sys::Control::none())
+}
+
+pub(crate) fn write_controlled(
+    image: &Image,
+    out: &Path,
+    binary: bool,
+    control: x3f_sys::Control<'_>,
+) -> io::Result<()> {
+    crate::conversion::check_io(control)?;
     if image.channels < 3 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -34,6 +44,7 @@ pub fn write(image: &Image, out: impl AsRef<Path>, binary: bool) -> io::Result<(
     let rows = image.rows as usize;
 
     for row in 0..rows {
+        crate::conversion::check_io(control)?;
         let row_off = row * stride;
         for col in 0..cols {
             let pix_off = row_off + col * chans;
