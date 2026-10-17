@@ -9,12 +9,16 @@ use x3f_sys::Control;
 pub struct AlignOptions {
     /// Estimate and apply a transform for every frame except the reference.
     pub enabled: bool,
-    /// Frames with a correlation peak below this value are skipped.
+    /// Reject tiles with a correlation peak below this value.
     pub min_peak: f32,
     /// Largest shift the estimator searches, in full-resolution pixels.
     pub max_shift_px: u32,
     /// Tiles per axis for the per-tile phase correlation.
     pub tile_grid: u32,
+    /// Largest absolute fitted rotation, in degrees.
+    pub max_rotation_deg: f32,
+    /// Largest absolute difference between fitted scale and one.
+    pub max_scale_deviation: f32,
 }
 
 impl Default for AlignOptions {
@@ -24,6 +28,8 @@ impl Default for AlignOptions {
             min_peak: 0.05,
             max_shift_px: 64,
             tile_grid: 3,
+            max_rotation_deg: 0.5,
+            max_scale_deviation: 0.005,
         }
     }
 }
@@ -40,7 +46,7 @@ pub struct Luma {
     pub data: Vec<f32>,
     /// One per pixel; nonzero where the pixel takes part in the estimate.
     pub mask: Vec<u8>,
-    /// Block-mean log luminance for subpixel refinement. Empty uses `data`.
+    /// Smoothed block-mean log luminance for refinement. Empty uses `data`.
     pub log: Vec<f32>,
 }
 
@@ -55,10 +61,14 @@ pub struct Alignment {
     pub peak: f32,
     /// Largest distance from the median shift among retained tiles, in pixels.
     pub tile_spread: f32,
+    /// Largest retained-tile residual of the selected transform, in pixels.
+    pub max_tile_residual: f32,
+    /// Number of tiles retained for the selected transform.
+    pub retained_tiles: u32,
     /// Frame-to-reference transform `[a, b, tx, c, d, ty]` when tiles disagree.
     /// Maps `(x, y)` to `(a*x + b*y + tx, c*x + d*y + ty)`.
     pub similarity: Option<[f32; 6]>,
-    /// True when the estimate is not trusted. The merge must skip this frame.
+    /// True when alignment is not trusted. Merge this frame without a transform.
     pub skipped: bool,
 }
 
@@ -105,6 +115,7 @@ fn validate_planes(p: &FramePlanes) -> Result<usize, Error> {
 }
 
 /// Build log luminance from reference-unit BMT, then halve it and take its gradient.
+/// Mask luminance at or below 0.001 in reference-white units.
 /// `cut` is the clipping limit for `d_max`, relative to the physical ceiling.
 pub fn luma(planes: &FramePlanes, cut: f32, control: Control<'_>) -> Result<Luma, Error> {
     control.check()?;
@@ -129,8 +140,8 @@ pub fn luma(planes: &FramePlanes, cut: f32, control: Control<'_>) -> Result<Luma
                         && planes.d_max[p].is_finite()
                         && planes.d_max[p] < cut
                         && value.is_finite()
-                        && value > 1e-5;
-                    sum += value.max(1e-5).ln();
+                        && value > 1e-3;
+                    sum += value.max(1e-3).ln();
                 }
             }
             log[y * w + x] = if valid { sum * 0.25 } else { 0.0 };
@@ -142,22 +153,39 @@ pub fn luma(planes: &FramePlanes, cut: f32, control: Control<'_>) -> Result<Luma
         height: h as u32,
         data: vec![0.0; w * h],
         mask: vec![0; w * h],
-        log: Vec::new(),
+        log: vec![0.0; w * h],
     };
     for y in 1..h.saturating_sub(1) {
         control.check()?;
         for x in 1..w.saturating_sub(1) {
             let p = y * w + x;
-            if [p, p - 1, p + 1, p - w, p + w]
-                .iter()
-                .all(|&i| mask[i] != 0)
+            if [
+                p,
+                p - 1,
+                p + 1,
+                p - w,
+                p + w,
+                p - w - 1,
+                p - w + 1,
+                p + w - 1,
+                p + w + 1,
+            ]
+            .iter()
+            .all(|&i| mask[i] != 0)
             {
                 output.data[p] = (log[p + 1] - log[p - 1]).hypot(log[p + w] - log[p - w]) * 0.5;
                 output.mask[p] = 1;
+                // Reduce interpolation bias from sensor noise in spatial refinement.
+                output.log[p] = (log[p] * 4.0
+                    + (log[p - 1] + log[p + 1] + log[p - w] + log[p + w]) * 2.0
+                    + log[p - w - 1]
+                    + log[p - w + 1]
+                    + log[p + w - 1]
+                    + log[p + w + 1])
+                    / 16.0;
             }
         }
     }
-    output.log = log;
     Ok(output)
 }
 
@@ -318,6 +346,7 @@ fn tile_shift(
         dx as f32 + parabola(at(dx - 1, dy), peak, at(dx + 1, dy)),
         dy as f32 + parabola(at(dx, dy - 1), peak, at(dx, dy + 1)),
     ];
+    let phase_shift = shift;
     // Refine on masked samples to remove the phase peak's fractional-pixel bias.
     for step in [0.5, 0.5, 0.25, 0.125, 0.0625] {
         control.check()?;
@@ -333,6 +362,10 @@ fn tile_shift(
                     shift[1] + (i / 3) as f32 * step - step,
                 ],
             );
+        }
+        if scores[4] == f32::NEG_INFINITY {
+            shift = phase_shift;
+            break;
         }
         let best = (0..9)
             .max_by(|&i, &j| scores[i].total_cmp(&scores[j]))
@@ -427,7 +460,9 @@ fn tile_score(
     let norm = ((aa * count - a * a) * (bb * count - b * b))
         .max(0.0)
         .sqrt();
-    if count < 64.0 || norm < 1e-12 {
+    if count < 64.0 {
+        f32::NEG_INFINITY
+    } else if norm < 1e-12 {
         0.0
     } else {
         ((ab * count - a * b) / norm) as f32
@@ -509,6 +544,10 @@ pub fn estimate(
         || options.tile_grid == 0
         || options.tile_grid > 16
         || options.max_shift_px > 4096
+        || !options.max_rotation_deg.is_finite()
+        || options.max_rotation_deg < 0.0
+        || !options.max_scale_deviation.is_finite()
+        || options.max_scale_deviation < 0.0
     {
         return Err(invalid("invalid maps or options"));
     }
@@ -547,7 +586,7 @@ pub fn estimate(
             }
         }
     }
-    if tiles.is_empty() {
+    if tiles.len() < 3 {
         return Ok(Alignment {
             peak: median(peaks),
             ..skipped
@@ -560,11 +599,11 @@ pub fn estimate(
         .map(|t| (t.dx - dx).hypot(t.dy - dy))
         .fold(0.0f32, f32::max);
     let mut transform = None;
-    if spread > 1.5 && tiles.len() >= 3 {
-        let residual = |fit: [f32; 6], t: &Tile| {
-            let (x, y) = (t.x - t.dx, t.y - t.dy);
-            (fit[0] * x + fit[1] * y + fit[2] - t.x).hypot(fit[3] * x + fit[4] * y + fit[5] - t.y)
-        };
+    let residual = |fit: [f32; 6], t: &Tile| {
+        let (x, y) = (t.x - t.dx, t.y - t.dy);
+        (fit[0] * x + fit[1] * y + fit[2] - t.x).hypot(fit[3] * x + fit[4] * y + fit[5] - t.y)
+    };
+    if spread > 1.5 {
         // A least-median seed prevents moving tiles from biasing the rejection pass.
         let mut best = None;
         let mut error = f32::INFINITY;
@@ -595,7 +634,12 @@ pub fn estimate(
                 .map(|t| (t.dx - dx).hypot(t.dy - dy))
                 .fold(0.0f32, f32::max);
             if spread > 1.5 {
-                transform = similarity(&tiles);
+                transform = similarity(&tiles).filter(|fit| {
+                    let angle = fit[3].atan2(fit[0]).to_degrees();
+                    let scale = fit[0].hypot(fit[3]);
+                    angle.abs() <= options.max_rotation_deg
+                        && (scale - 1.0).abs() <= options.max_scale_deviation
+                });
             }
         }
     }
@@ -604,14 +648,21 @@ pub fn estimate(
         dy,
         peak: median(tiles.iter().map(|t| t.peak).collect()),
         tile_spread: spread,
+        retained_tiles: tiles.len() as u32,
+        max_tile_residual: tiles
+            .iter()
+            .map(|t| residual(transform.unwrap_or([1.0, 0.0, dx, 0.0, 1.0, dy]), t))
+            .fold(0.0f32, f32::max),
         similarity: transform,
         skipped: false,
     })
 }
 
-/// Resample with the inverse frame-to-reference transform in 300-row bands.
+/// Resample with the inverse frame-to-reference transform.
+/// Allocate a full output plane set (25 bytes per pixel) while the input is live.
+/// The 300-row bands batch cancellation checks; they do not reduce this allocation.
 /// All 16 cubic taps must be inside the frame and valid. `d_max` takes their maximum.
-/// Identity returns the input allocations unchanged. The caller must omit skipped frames.
+/// Identity and skipped alignments return the input allocations unchanged.
 pub fn warp(
     planes: FramePlanes,
     alignment: &Alignment,
@@ -819,7 +870,8 @@ mod tests {
             Control::none(),
         )
         .unwrap();
-        let frame = luma(&synthetic(size, size, truth), 0.85, Control::none()).unwrap();
+        let planes = synthetic(size, size, truth);
+        let frame = luma(&planes, 0.85, Control::none()).unwrap();
         let found = estimate(
             &reference,
             &frame,
@@ -838,6 +890,94 @@ mod tests {
                 assert!(dx.hypot(dy) < 0.3, "corner ({x},{y}): {dx}, {dy}");
             }
         }
+        let warped = warp(planes, &found, Control::none()).unwrap();
+        let map = luma(&warped, 0.85, Control::none()).unwrap();
+        let residual =
+            estimate(&reference, &map, &AlignOptions::default(), Control::none()).unwrap();
+        assert!(
+            !residual.skipped && residual.dx.hypot(residual.dy) < 0.3,
+            "{residual:?}"
+        );
+        let rejected = estimate(
+            &reference,
+            &frame,
+            &AlignOptions {
+                max_rotation_deg: 0.1,
+                ..Default::default()
+            },
+            Control::none(),
+        )
+        .unwrap();
+        assert!(!rejected.skipped && rejected.similarity.is_none());
+    }
+
+    #[test]
+    fn noisy_fractional_shift_and_warp_remain_accurate() {
+        let mut reference = synthetic(1024, 768, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        let mut frame = synthetic(1024, 768, [1.0, 0.0, 0.3, 0.0, 1.0, -0.3]);
+        for (planes, mut seed) in [(&mut reference, 17u32), (&mut frame, 53u32)] {
+            for rgb in planes.x.as_chunks_mut::<3>().0 {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let noise = ((seed >> 8) as f32 / 16777216.0 - 0.5) * 0.02;
+                for value in rgb {
+                    *value += noise;
+                }
+            }
+        }
+        let reference = luma(&reference, 0.85, Control::none()).unwrap();
+        let map = luma(&frame, 0.85, Control::none()).unwrap();
+        let found = estimate(&reference, &map, &AlignOptions::default(), Control::none()).unwrap();
+        assert!(
+            !found.skipped && (found.dx - 0.3).abs() < 0.1 && (found.dy + 0.3).abs() < 0.1,
+            "{found:?}"
+        );
+        let warped = warp(frame, &found, Control::none()).unwrap();
+        let map = luma(&warped, 0.85, Control::none()).unwrap();
+        let residual =
+            estimate(&reference, &map, &AlignOptions::default(), Control::none()).unwrap();
+        assert!(
+            !residual.skipped && residual.dx.hypot(residual.dy) < 0.3,
+            "{residual:?}"
+        );
+    }
+
+    #[test]
+    fn excessive_scale_falls_back_to_translation() {
+        let size = 1536;
+        let reference = luma(
+            &synthetic(size, size, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            0.85,
+            Control::none(),
+        )
+        .unwrap();
+        let frame = luma(
+            &synthetic(size, size, [1.008, 0.0, -6.0, 0.0, 1.008, -6.0]),
+            0.85,
+            Control::none(),
+        )
+        .unwrap();
+        let found = estimate(
+            &reference,
+            &frame,
+            &AlignOptions::default(),
+            Control::none(),
+        )
+        .unwrap();
+        assert!(!found.skipped && found.similarity.is_none(), "{found:?}");
+        let allowed = estimate(
+            &reference,
+            &frame,
+            &AlignOptions {
+                max_scale_deviation: 0.01,
+                ..Default::default()
+            },
+            Control::none(),
+        )
+        .unwrap();
+        let matrix = allowed
+            .similarity
+            .expect("relaxed scale bound must allow the fit");
+        assert!((matrix[0].hypot(matrix[3]) - 1.008).abs() < 0.001);
     }
 
     #[test]
@@ -926,8 +1066,23 @@ mod tests {
                 }
             }
         }
+        assert_eq!(
+            tile_score(&map, &map, [0, 0], 128, [0.0, 0.0]),
+            f32::NEG_INFINITY
+        );
         let found = estimate(&map, &map, &AlignOptions::default(), Control::none()).unwrap();
         assert!(!found.skipped && found.is_identity(), "{found:?}");
+        let insufficient = estimate(
+            &map,
+            &map,
+            &AlignOptions {
+                tile_grid: 1,
+                ..Default::default()
+            },
+            Control::none(),
+        )
+        .unwrap();
+        assert!(insufficient.skipped && insufficient.peak > 0.05);
     }
 
     #[test]
@@ -938,7 +1093,7 @@ mod tests {
             for x in 0..192 {
                 let i = y * 192 + x;
                 if x < 32 {
-                    p.x[i * 3..i * 3 + 3].fill(0.0);
+                    p.x[i * 3..i * 3 + 3].fill(0.0009);
                 }
                 if x >= 160 {
                     p.d_max[i] = 0.9;
@@ -1156,6 +1311,8 @@ mod tests {
                 Control::none(),
             )
             .unwrap();
+            let mut previous_drift = 0.0;
+            let mut residuals = Vec::new();
             for index in 1..container.frames().len() {
                 let p = corpus_planes(&container, index, ceiling);
                 let map = luma(&p, 0.85, Control::none()).unwrap();
@@ -1164,16 +1321,46 @@ mod tests {
                 eprintln!("{name} frame {index}: {found:?}");
                 assert!(!found.skipped, "{name} frame {index}");
                 assert!(found.dx.abs() < 64.0 && found.dy.abs() < 64.0);
-                if index == 4 {
+                let drift = found.dx.hypot(found.dy);
+                assert!(
+                    drift > previous_drift,
+                    "{name} frame {index}: drift {drift} <= {previous_drift}"
+                );
+                previous_drift = drift;
+                let matrix = found
+                    .similarity
+                    .unwrap_or([1.0, 0.0, found.dx, 0.0, 1.0, found.dy]);
+                eprintln!(
+                    "{name} frame {index}: angle={} deg scale={} max_tile_residual={} px",
+                    matrix[3].atan2(matrix[0]).to_degrees(),
+                    matrix[0].hypot(matrix[3]),
+                    found.max_tile_residual
+                );
+                {
+                    drop(map);
                     let warped = warp(p, &found, Control::none()).unwrap();
                     let map = luma(&warped, 0.85, Control::none()).unwrap();
                     let residual =
                         estimate(&reference, &map, &AlignOptions::default(), Control::none())
                             .unwrap();
-                    eprintln!("{name} +1 EV residual: {residual:?}");
-                    assert!(!residual.skipped && residual.dx.hypot(residual.dy) < 0.5);
+                    eprintln!("{name} frame {index} residual: {residual:?}");
+                    let uncertainty = found.tile_spread / (found.retained_tiles as f32).sqrt();
+                    let residual_uncertainty =
+                        residual.tile_spread / (residual.retained_tiles as f32).sqrt();
+                    // Noisy tiles limit the check: use retained-tile spread / sqrt(count).
+                    // This checks self-consistency; known synthetic transforms check accuracy.
+                    let gate = 0.5f32.max(3.0 * residual_uncertainty);
+                    let norm = residual.dx.hypot(residual.dy);
+                    eprintln!("{name} frame {index}: uncertainty={uncertainty} px residual_uncertainty={residual_uncertainty} px residual_norm={norm} px gate={gate} px");
+                    residuals.push((index, residual.skipped, norm, gate));
                 }
             }
+            assert!(
+                residuals
+                    .iter()
+                    .all(|&(_, skipped, norm, gate)| !skipped && norm < gate),
+                "{name}: {residuals:?}"
+            );
         }
     }
 
