@@ -399,3 +399,89 @@ numerical tolerances, benchmarks, and the BM3D implementation.
 Legacy C headers and the two log/version shims are in
 [`crates/x3f-sys/csrc/`](../../crates/x3f-sys/csrc/). Bindgen consumes the
 headers for ABI types. The other C function bodies have been ported to Rust.
+
+## X3I merge stage
+
+`convert_file` and `prepare_scene_linear` detect `FOVi` before opening a normal
+X3F reader. `X3iContainer` validates each embedded frame. The output driver
+prepares one frame at a time with denoise and single-frame recovery disabled.
+The producer applies black correction, bad-pixel handling, selected spatial
+gain and Quattro expansion. It exports normalized camera BMT plus the
+intermediate raw-plane snapshot and shield-noise estimates. Integer
+preprocessing and expansion can already clamp samples; merging cannot undo
+that loss.
+
+The driver first prepares the longest exposure to estimate physical sensor
+ceilings. The candidate edge excludes a tail of at least 300 samples or 0.01 percent
+of the plane, whichever is larger. Keep the maximum instead if its lower
+one-percent interval has at least 1000 samples and 0.05 percent of the plane.
+The candidate needs the same support in its lower one-percent interval. Accepted ceilings lie
+in `[0.3,1]`; unsupported estimates use one and can produce a warning when
+a strong lower cliff is present. This estimator can mistake a flat wall for
+a ceiling. A cross-frame ceiling agreement check is still required.
+
+Frame 0 defines reference units. The exposure multiplier is its CAMF
+`CaptureShutter` divided by the current frame's value. Noise uses normalized
+raw-range signal `r=(sample-black)/(white-black)`. The physical ceiling changes
+only clipping evidence: `d=r/ceiling`. Validity and logistic roll-off use the
+maximum `d` over the exact expansion footprint and its 3x3 neighbourhood.
+An invalid contributing sample rejects the expanded output. The default knee
+is 0.75, width 0.02 and validity margin 0.15, relative to that ceiling.
+
+Phase 2 loads every frame twice through a repeatable loader. The statistics
+pass emits Decode events. It aligns each frame to reference T and keeps a
+skipped alignment at the identity transform with a warning. Ratio refinement
+uses the median of clean, supported level-bin medians. An affine fit supplies
+a black-offset diagnostic only. Near-black bias is nonlinear, so its fitted
+slope must not set the scale. Reference levels are 5 to 60 percent
+of the ceiling for short exposures, or 5 to 25 percent for long exposures,
+whose own level must also stay below 40 percent. Frame T must exceed ten of
+its own read sigmas. Each supported bin needs at least 1000 pairs or 0.1
+percent of pixels, whichever is larger. A clean bin also needs a mean frame
+signal above thirty read sigmas, with reference samples below the roll-off
+knee. At least two clean bins are required. Keep the shutter ratio if the
+trend across clean bins exceeds 2 percent or the fitted scale differs by
+more than 0.3 EV.
+
+Fit each raw plane's shot coefficient `k` from flat 8x8 reference/+1 EV
+pairs, with nearest raw samples at inverse-transform coordinates and separate
+read-noise terms. Half-resolution pairs use the centres of their 2x2 blocks. Fewer
+than 50 blocks keeps the default or override. Fix the effective reference
+correction at one. Fit separate T and shared B/M corrections from flat pair
+residuals, using at least 50 blocks above ten read sigmas in both frames.
+Clamp each correction to `[0.5,4]`. Flag a weak calibration when the median
+reference model term exceeds eight times the frame term. Below ten sigmas,
+keep the untruncated variance model. It conservatively under-rejects noise
+whose distribution was truncated by the intermediate zero clamp.
+
+Release all statistics rasters before the accumulation pass reloads frame 0.
+This pass emits Process events. A hash of each first raw T row detects common
+loader changes. Ghost weights use the maximum channel squared residual `z²`,
+`exp(-z²/9)`, and a 3x3 minimum. The estimate starts from the reference, or the
+shortest valid exposure outside reference coverage. Reports count valid ghost
+weights below 0.1. Bin diagnostics go only to the `-x3i-report` file.
+An aligned sd Quattro H conversion measured 46 seconds and 4.63 GB peak RSS
+before the anchored-calibration revision. The 1.4 GB target needs row-band
+processing, which this two-pass implementation does not provide.
+
+Weights use inverse variance with per-frame shield noise, linear and quadratic
+signal terms, exposure scaling squared and spatial gain squared. B and M
+share one chroma weight; T has a luma weight. The reference gets a minimum
+weight where valid. No signal-dependent dark weight is applied. When the
+weight sum is too small, use the valid frame with the best expected SNR.
+If none is valid, use the shortest exposure; otherwise use zero. Reports
+count each fallback and list the exposure multipliers and physical ceilings.
+
+After accumulation, mask the non-active border and compute `S` from the active
+maximum, with a minimum of one. Store `round(merged/S*65535)` as unsigned
+camera samples. DNG declares black zero, white 65535 and linear response one.
+Its `BaselineExposure` is frame 0's baseline plus `log2(S)`. Metadata and
+preview use frame 0, and preview spatial gain is disabled because the merge
+already applied it. An explicit safety cap reports samples clipped at the cap.
+
+[Post-merge denoise](./x3i.md#experimental-denoise) is experimental and disabled
+by default. TIFF and PPM use frame 0's color transform, output transfer and
+optional active-area crop. They clip extended highlights at one. They do not
+run the RGB chroma LUT or single-frame highlight recovery. Scene preparation
+keeps extended-linear RGB for an editor. See [X3I merge and outputs](./x3i.md)
+for options, limits and evidence links.

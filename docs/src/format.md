@@ -224,3 +224,48 @@ them.
   named-entry CAMF accessors.
 - [`src/x3f_io.h`](../../src/x3f_io.h) — the original C-side struct
   definitions, kept around because they're still consumed by bindgen.
+
+## X3I Super Fine Detail container
+
+X3I uses `FOVi` magic. Detect it from the bytes, not the filename extension.
+The two measured files use version `0x00010000`. They contain seven complete
+X3F frames and one adjustment block. All multibyte fields below are little-endian.
+
+| Offset | Content |
+| --- | --- |
+| `0x000` | `FOVi`, then a u32 version at `0x004` |
+| `0x008` | Three u32 words with camera-specific values |
+| `0x014` | Eight ASCII camera serial bytes |
+| `0x01c` | Eight identifier bytes |
+| `0x024` | u32 value 508 in both samples; meaning unknown |
+| `0x028` | u32 sensor width and height |
+| `0x030` | Four zero bytes |
+| `0x034` | `07 04 01 02 03 05 06 07`; count/order interpretation is unconfirmed |
+| `0x03c` | Eight zero bytes |
+| `0x044` | u32 count 68, then TIFF-style 12-byte adjustment entries |
+| `0x378..0x4a8` | Adjustment rational payloads |
+| `0x4a8..0x598` | Header tag `0x41`: 120 zero SSHORT values |
+| `0x598` | Eight zero bytes |
+| `0x5a0` | First frame in both measured files |
+| File tail | `SECf`, u32 version `0x100`, u32 count, directory entries |
+| Last four bytes | u32 absolute offset to `SECf` |
+
+Each directory entry stores u32 offset, u32 length and fourCC. Seven `FRAM`
+entries precede one `SPPA` entry. A `FRAM` contains a complete `FOVb` file,
+including its own `SECd` directory and footer. Inner offsets are relative to
+that frame. `Reader` carries a bounded input window through parsing and section
+loads. It does not copy the embedded file. Bounds, section ranges and each
+frame's own magic and directory must validate.
+
+The container serial matches its frames. Other header words and identifier
+bytes can differ. Do not compare those bytes to validate a frame. `SPPA` starts
+with `SECs` and `APD1` and contains 63 adjustment entries. Header-only tags
+include `0x40` through `0x43` and `0x57`. The tag `0x41` payload belongs to the
+header, not the `SPPA` block. These camera adjustment defaults do not control
+the merge.
+
+Frame 0 is the exposure reference. The samples store the remaining frames in
+-3, -2, -1, +1, +2, +3 EV order. The merge reads CAMF `CaptureShutter` for the
+exposure duration in microseconds on these Quattro files. `CaptureExpComp`
+and `ExpNet` are zero in all sd Quattro H frames, so they cannot supply the
+ratios. See [X3I outputs](./x3i.md) for the processing contract and evidence.

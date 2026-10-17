@@ -79,44 +79,91 @@ pub(crate) fn write_controlled(
     on_write: &mut dyn FnMut(),
     warnings: &mut Vec<String>,
 ) -> Result<(), Error> {
-    control.check()?;
-
-    if opts.spp_denoise {
-        return Err(x3f_sys::Error::InvalidData("SPP denoise does not support DNG output").into());
-    }
-
-    // Resolve white balance up front — used both for image processing and
-    // for the matrix tags.
-    let mut opts = opts.clone();
-    if opts.wb.is_none() {
-        opts.wb = Some(reader.dng_default_wb());
-    }
-    // x3f_get_image is called with NONE encoding and crop=0 for DNG. We
-    // always emit the full uncropped sensor frame and let Lightroom/etc.
-    // honour the embedded ActiveArea + DefaultUserCrop tags. This matches
-    // the legacy C path's hardcoded `x3f_get_image(..., NONE, 0, ...)`.
-    opts.color_encoding = crate::ColorEncoding::None;
-    opts.crop = false;
-    // `cineon` is a TIFF-only modifier. The CLI rejects `-cineon -dng`
-    // up front, but library callers can pass the same `ProcessOptions`
-    // to `dump_dng` and `dump_tiff`; force it off here so the DNG path
-    // never accidentally skips `apply_highlight_clip_dng` or applies a
-    // log curve to the DNG raw plane.
-    opts.cineon = false;
-    let wb = opts.wb.clone().unwrap_or_default();
-    let calibration =
-        ColorCalibration::new(reader, &wb).ok_or(Error::Library(crate::LibraryError::Argument))?;
-    let modes = opts
-        .color_mode
-        .map(|selection| {
-            profiles::PreparedColorModes::resolve(reader, &wb, selection, warnings, control)
-        })
-        .transpose()?;
-    // Creative selection belongs to profile metadata and preview, not sensor samples.
-    opts.color_mode = None;
-
-    let mut image = reader.get_image_with_control(&opts, control)?;
+    let control = reader.with_control(control);
+    let inputs = WriterInputs::resolve(reader, opts, control, warnings)?;
+    let image = reader.get_image_with_control(&inputs.opts, control)?;
     on_write();
+    write_prepared(reader, inputs, image, path, control, warnings, false)
+}
+
+/// Settings and camera calibration resolved before RAW processing.
+pub(crate) struct WriterInputs {
+    pub(crate) opts: ProcessOptions,
+    wb: String,
+    calibration: ColorCalibration,
+    modes: Option<profiles::PreparedColorModes>,
+}
+
+impl WriterInputs {
+    pub(crate) fn resolve(
+        reader: &Reader,
+        opts: &ProcessOptions,
+        control: x3f_sys::Control<'_>,
+        warnings: &mut Vec<String>,
+    ) -> Result<Self, Error> {
+        let control = reader.with_control(control);
+        control.check()?;
+
+        if opts.spp_denoise {
+            return Err(
+                x3f_sys::Error::InvalidData("SPP denoise does not support DNG output").into(),
+            );
+        }
+
+        // Resolve white balance for image processing and matrix tags.
+        let mut opts = opts.clone();
+        if opts.wb.is_none() {
+            opts.wb = Some(reader.dng_default_wb());
+        }
+        // x3f_get_image is called with NONE encoding and crop=0 for DNG. We
+        // always emit the full uncropped sensor frame and let Lightroom/etc.
+        // honour the embedded ActiveArea + DefaultUserCrop tags. This matches
+        // the legacy C path's hardcoded `x3f_get_image(..., NONE, 0, ...)`.
+        opts.color_encoding = crate::ColorEncoding::None;
+        opts.crop = false;
+        // `cineon` is a TIFF-only modifier. The CLI rejects `-cineon -dng`
+        // up front, but library callers can pass the same `ProcessOptions`
+        // to `dump_dng` and `dump_tiff`; force it off here so the DNG path
+        // never accidentally skips `apply_highlight_clip_dng` or applies a
+        // log curve to the DNG raw plane.
+        opts.cineon = false;
+        let wb = opts.wb.clone().unwrap_or_default();
+        let calibration = ColorCalibration::new(reader, &wb)
+            .ok_or(Error::Library(crate::LibraryError::Argument))?;
+        let modes = opts
+            .color_mode
+            .map(|selection| {
+                profiles::PreparedColorModes::resolve(reader, &wb, selection, warnings, control)
+            })
+            .transpose()?;
+        // Creative selection belongs to profile metadata and preview, not sensor samples.
+        opts.color_mode = None;
+
+        Ok(Self {
+            opts,
+            wb,
+            calibration,
+            modes,
+        })
+    }
+}
+
+pub(crate) fn write_prepared(
+    reader: &Reader,
+    inputs: WriterInputs,
+    mut image: Image,
+    path: &Path,
+    control: x3f_sys::Control<'_>,
+    warnings: &mut Vec<String>,
+    prebuilt: bool,
+) -> Result<(), Error> {
+    let control = reader.with_control(control);
+    let WriterInputs {
+        opts,
+        wb,
+        calibration,
+        modes,
+    } = inputs;
     control.check()?;
     if image.channels != 3 {
         return Err(Error::Library(crate::LibraryError::Argument));
@@ -166,8 +213,8 @@ pub(crate) fn write_controlled(
         .transpose()?;
 
     let mut preview_opts = opts.clone();
-    if opts.dng_highlight_recovery {
-        // Recovery has already baked the requested spatial gain into the
+    if prebuilt || opts.dng_highlight_recovery {
+        // Processing has already baked the requested spatial gain into the
         // raw samples. Preview rendering only restores the exposure scale.
         preview_opts.apply_sgain = Some(false);
     }
@@ -337,6 +384,16 @@ pub(crate) fn write_controlled(
         &mut ifd0,
         color_profiles.as_ref().map(|p| p.white_xy),
     );
+    if prebuilt {
+        // Add headroom to the serialized reference baseline without coarse EV rounding.
+        let reference = camera_baseline_exposure(reader, &calibration, 1.0).unwrap_or(0.0);
+        let reference = ((reference as f32 as f64) * 10_000.0).round() / 10_000.0;
+        let exposure = reference + highlight_scale.log2();
+        ifd0.add(
+            tags::BASELINE_EXPOSURE,
+            Value::SRational(vec![((exposure * 1_000_000.0).round() as i32, 1_000_000)]),
+        );
+    }
     if let Some(profiles) = &color_profiles {
         profiles.write_default(&mut ifd0);
     } else if write_default_profile(reader, &wb, &calibration, &mut ifd0).is_none() {
@@ -724,8 +781,14 @@ impl Reader {
         }
         // Loading is required for the dimensions to be populated.
         // SAFETY: de is non-null.
-        let r = unsafe { x3f_sys::x3f_load_data(self.x3f.as_ptr(), de) };
-        if r != x3f_sys::x3f_return_e_X3F_OK {
+        let r = unsafe {
+            x3f_sys::load_data(
+                self.x3f.as_ptr(),
+                de,
+                self.with_control(x3f_sys::Control::none()),
+            )
+        };
+        if r.is_err() {
             return None;
         }
         // SAFETY: de is non-null and now loaded.
@@ -747,8 +810,14 @@ impl Reader {
             return None;
         }
         // SAFETY: de is non-null.
-        let r = unsafe { x3f_sys::x3f_load_data(self.x3f.as_ptr(), de) };
-        if r != x3f_sys::x3f_return_e_X3F_OK {
+        let r = unsafe {
+            x3f_sys::load_data(
+                self.x3f.as_ptr(),
+                de,
+                self.with_control(x3f_sys::Control::none()),
+            )
+        };
+        if r.is_err() {
             return None;
         }
         // SAFETY: de is non-null and loaded; .image_data.data points at

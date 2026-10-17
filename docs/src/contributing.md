@@ -426,3 +426,48 @@ calibrated color accuracy or identical JPEG appearance.
 The full behaviour spec for AI-assisted work in this repo is in
 [`AGENTS.md`](https://github.com/sagwaco/x3fuse-core/blob/master/AGENTS.md);
 human contributors are welcome to follow the same conventions.
+
+## X3I corpus checks
+
+Keep `DP0Q0002.X3I` and `_DQH0978.X3I` in the private corpus. Never commit
+these files. The X3I CLI tests compare frame 0 through its window with an
+extracted X3F for metadata and `-ppm -color none -no-denoise`. They also check
+container reporting, seven-frame DNG dispatch, cancellation cleanup and
+existing-output preservation. Scene tests check finite active-area RGB and
+extended highlight range. TIFF and PPM must use the merged raster.
+
+The phase 2 dp0 merged DNG has the intentional macOS aarch64 MD5 pin
+`48fde3f0f196c1f22e9ecd26d2955dc8` with `-dng -no-denoise`. Raw statistics now
+use the same inverse transform as image sampling, replacing
+`c80db90d70032be445b0a0a0af81b876`. Frames with a similarity transform pair
+different raw samples. On dp0 the +1 EV noise-fit frame is one of them, so
+`k_T` falls from 2.46e-5 to 2.24e-5 and the weights of all frames change.
+Clean-bin scalar refinement and anchored effective-variance calibration had
+replaced the aligned
+pin `db749dee7d09a65817c2df39dcf235d7`. That earlier aligned pin, at commit
+`38bbeef`, replaced phase 1 `494b455d3286dfdc1c5243ad60a31284`; at that commit,
+`X3F_X3I_NO_ALIGN=1` reproduces `302684ec51a01cddbd4ae76cc3e2bc29`.
+The current `X3F_X3I_NO_ALIGN=1` digest is
+`beee26a4f91f97ccfd959ec4c6b5c62d`.
+These merge pins are separate from the unchanged single-frame baselines above.
+Floating-point merge bytes can differ on other platforms; structural and
+same-run checks still apply there. Record any intentional merge algorithm
+change and its measured replacement pin in the same commit.
+
+```sh
+cargo test -p x3f-cli --release --test x3i -- --nocapture
+cargo test -p x3f-core --release --test x3i_outputs -- --nocapture
+```
+
+For each sample, check DNG decoded codes times `S`, `BaselineExposure`, preview
+gain and fallback counts. Render with Adobe `dng_validate` and inspect fixed
+shadow and highlight crops. Check Lightroom, RawTherapee, Apple and Capture One
+separately. A valid file structure does not prove those readers restore the
+large encoding scale correctly. Record each reader and version actually tested.
+
+See the [experimental denoise measurements](./x3i.md#experimental-denoise).
+Before proposing a default, repeat the fixed dark-patch comparison. Record
+noise in reference units, distinct-code spacing and rendered crops. Do not
+change the default from an assumed noise gain.
+The [X3I evidence archive](https://github.com/sagwaco/x3f-docs/tree/main/spp-rgb-trace/followup-x3i-sfd)
+contains container corrections and SPP compose observations.
