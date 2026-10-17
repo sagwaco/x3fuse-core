@@ -412,8 +412,10 @@ preprocessing and expansion can already clamp samples; merging cannot undo
 that loss.
 
 The driver first prepares the longest exposure to estimate physical sensor
-ceilings. A candidate needs at least 1000 samples and 0.05 percent of its
-plane in the one-percent interval below the maximum. Accepted ceilings lie
+ceilings. The candidate edge excludes a tail of at least 300 samples or 0.01 percent
+of the plane, whichever is larger. Keep the maximum instead if its lower
+one-percent interval has at least 1000 samples and 0.05 percent of the plane.
+The candidate needs the same support in its lower one-percent interval. Accepted ceilings lie
 in `[0.3,1]`; unsupported estimates use one and can produce a warning when
 a strong lower cliff is present. This estimator can mistake a flat wall for
 a ceiling. A cross-frame ceiling agreement check is still required.
@@ -424,7 +426,7 @@ raw-range signal `r=(sample-black)/(white-black)`. The physical ceiling changes
 only clipping evidence: `d=r/ceiling`. Validity and logistic roll-off use the
 maximum `d` over the exact expansion footprint and its 3x3 neighbourhood.
 An invalid contributing sample rejects the expanded output. The default knee
-is 0.9, width 0.03 and validity margin 0.02, relative to that ceiling.
+is 0.75, width 0.02 and validity margin 0.15, relative to that ceiling.
 
 Weights use inverse variance with per-frame shield noise, linear and quadratic
 signal terms, exposure scaling squared and spatial gain squared. B and M

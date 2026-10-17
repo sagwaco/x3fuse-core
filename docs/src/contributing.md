@@ -437,8 +437,8 @@ existing-output preservation. Scene tests check finite active-area RGB and
 extended highlight range. TIFF and PPM must use the merged raster.
 
 The phase 1 dp0 merged DNG has the intentional macOS aarch64 MD5 pin
-`2a48ebc1cd41e937923e3e78d542c368` with `-dng -no-denoise`. This pin records the
-physical-ceiling correction. It is separate from the unchanged single-frame
+`494b455d3286dfdc1c5243ad60a31284` with `-dng -no-denoise`. This pin records the
+soft-shoulder fix. It is separate from the unchanged single-frame
 baselines above. Floating-point merge bytes can differ on other platforms;
 structural and same-run checks still apply there. Record any intentional merge
 algorithm change and its measured replacement pin in the same commit.
@@ -454,10 +454,9 @@ shadow and highlight crops. Check Lightroom, RawTherapee, Apple and Capture One
 separately. A valid file structure does not prove those readers restore the
 large encoding scale correctly. Record each reader and version actually tested.
 
-Post-merge denoise is disabled unless `X3F_X3I_DENOISE_SCALE` is positive.
-Before proposing a default, compare a fixed flat dark patch with the override
-unset and at `0.3`. Record noise in reference units, distinct-code spacing and
-rendered crops. The residual bridge changes codes in multiples of four and can
-cause bands at large `S`. Do not change the default from an assumed noise gain.
+See the [experimental denoise measurements](./x3i.md#experimental-denoise).
+Before proposing a default, repeat the fixed dark-patch comparison. Record
+noise in reference units, distinct-code spacing and rendered crops. Do not
+change the default from an assumed noise gain.
 The [X3I evidence archive](https://github.com/sagwaco/x3f-docs/tree/main/spp-rgb-trace/followup-x3i-sfd)
 contains container corrections and SPP compose observations.

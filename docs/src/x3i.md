@@ -79,8 +79,9 @@ Denoised scene preparation uses this unsigned quantized raster and loses
 negative camera samples. `-no-denoise` skips this pass and keeps the previous
 X3I DNG bytes. Keep the override unset for normal use.
 
-At research strength 0.3, the measured 64x64 dark dp0 patch at (5120,2240) increased B/M code noise from 1.095/1.241
-to 1.771/1.861. The sd Quattro H patch at (4928,3904) increased it from
+The research strength was 0.3. The dark dp0 patch was 64x64 pixels at
+(5120,2240). Its B/M code noise increased from 1.095/1.241 to 1.771/1.861.
+The sd Quattro H patch at (4928,3904) increased it from
 1.662/1.524 to 3.041/3.172. T was unchanged with default luma denoise off.
 These are detrended population standard deviations at S=11.3862 and S=2.7893.
 All residual changes were multiples of four. Adobe DNG SDK 1.7.1 renders
@@ -94,9 +95,8 @@ use the phase 1 merge and do not establish a useful default strength.
 | `X3F_X3I_NOISE=sigma,k,q` | Replace the read, linear and quadratic noise terms. An empty sigma keeps per-frame shield estimates. |
 | `X3F_X3I_MAX_S=value` | Cap the shared encoding scale. Unset keeps all finite headroom. Report clipped samples. |
 | `X3F_X3I_SATURATION=b,m,t` | Override the measured physical ceiling of each plane in normalized raw-range units. |
-| `X3F_X3I_ROLLOFF=knee,width` | Set the logistic saturation knee and width relative to the physical ceiling. |
+| `X3F_X3I_ROLLOFF=knee,width,margin` | Set knee, width and validity margin relative to the ceiling. Defaults: `0.75,0.02,0.15`. |
 | `X3F_X3I_DENOISE_SCALE=value` | Enable experimental post-merge denoise when positive. Unset or zero disables it. |
-| `X3F_X3I_NO_ALIGN=1` | Disable frame alignment estimation and warping for comparison. |
 
 See the [merge stage](./pipeline.md#x3i-merge-stage) for weighting, validity,
 fallbacks and the DNG scale. See the [corpus checks](./contributing.md#x3i-corpus-checks)

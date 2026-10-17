@@ -121,17 +121,17 @@ X3I merges support DNG, TIFF and PPM. DNG preserves extended highlight range.
 TIFF and PPM clip output above one and skip the RGB chroma LUT and single-frame
 highlight recovery. X3I post-merge denoise stays off unless
 `X3F_X3I_DENOISE_SCALE` is positive, even with the default CLI denoise intensity.
-The research value is `0.3`; residual quantization can cause deep-shadow bands.
-See [X3I merge and outputs](docs/src/x3i.md).
+Residual quantization can cause deep-shadow bands.
+See [X3I merge and outputs](docs/src/x3i.md) and the
+[denoise measurements](docs/src/x3i.md#experimental-denoise).
 
 | X3I environment override | Effect |
 | --- | --- |
 | `X3F_X3I_NOISE=sigma,k,q` | Set normalized read, linear and quadratic noise terms. |
 | `X3F_X3I_MAX_S=value` | Cap highlight encoding scale; report clipped samples. |
 | `X3F_X3I_SATURATION=b,m,t` | Override per-plane physical sensor ceilings. |
-| `X3F_X3I_ROLLOFF=knee,width` | Set saturation roll-off relative to the physical ceiling. |
+| `X3F_X3I_ROLLOFF=knee,width,margin` | Set knee, width and validity margin relative to the ceiling. Defaults: `0.75,0.02,0.15`. |
 | `X3F_X3I_DENOISE_SCALE=value` | Positive enables experimental post-merge NLM or BM3D; unset or zero disables it. |
-| `X3F_X3I_NO_ALIGN=1` | Disable frame alignment estimation and warping for comparison. |
 
 ### Examples
 

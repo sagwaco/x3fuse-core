@@ -21,6 +21,7 @@ pub struct SceneLinearOptions {
     /// Algorithm and advanced sensor-space denoising controls.
     pub denoise_options: crate::DenoiseOptions,
     /// Reconstruct clipped sensor layers (default false).
+    /// X3I ignores this option. The merge keeps extended highlight values.
     pub highlight_recovery: bool,
 }
 
