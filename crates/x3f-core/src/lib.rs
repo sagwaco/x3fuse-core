@@ -121,6 +121,22 @@ impl DngHighlightMapping {
     }
 }
 
+/// Which X3I data a conversion uses. X3F input ignores this choice.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
+pub enum X3iSource {
+    /// Merge all frames into one extended-range image.
+    #[default]
+    Merge,
+    /// Process only the middle exposure frame, as `-x3i-frame <n>` does.
+    /// See [`X3iContainer::middle_exposure_frame`].
+    MiddleExposure,
+}
+
 /// Per-conversion processing options. Mirrors the parameters of the legacy
 /// `x3f_dump_*` C entry points.
 #[derive(Debug, Clone)]
@@ -223,6 +239,10 @@ pub struct ProcessOptions {
     /// Cineon film-print, 50 ≈ moderate log; larger is flatter still at
     /// the cost of shadow noise).
     pub cineon: bool,
+    /// X3I input: merge all frames (default) or use only the middle exposure.
+    /// The middle exposure follows the single-frame rules for color modes,
+    /// SPP, highlight recovery and embedded JPEG output. No effect on X3F input.
+    pub x3i_source: X3iSource,
 }
 
 impl Default for ProcessOptions {
@@ -244,6 +264,7 @@ impl Default for ProcessOptions {
             dng_highlight_recovery: false,
             dng_highlight_mapping: DngHighlightMapping::default(),
             cineon: false,
+            x3i_source: X3iSource::default(),
         }
     }
 }
