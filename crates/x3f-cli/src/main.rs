@@ -51,6 +51,7 @@ struct Args {
     x3i_middle: bool,
     x3i_extract: bool,
     x3i_report: bool,
+    x3i_ghost_map: bool,
     output_explicit: bool,
     extract_jpg: bool,
     extract_raw: bool,
@@ -95,6 +96,7 @@ impl Default for Args {
             x3i_middle: false,
             x3i_extract: false,
             x3i_report: false,
+            x3i_ghost_map: false,
             output_explicit: false,
             extract_jpg: false,
             extract_raw: true,
@@ -135,6 +137,7 @@ fn usage(progname: &str) -> ! {
          \x20  -o <DIR>        Use <DIR> as output directory\n\
          \x20  -v              Verbose output for debugging\n\
          \x20  -q              Suppress all messages except errors\n\
+         \x20  -x3i-ghost-map  Write research ghost weights as per-frame PGM images\n\
          \x20  -x3i-report     Write X3I radiometry and peak RSS beside the DNG\n\
          \x20  -x3i-frame <n>  Convert X3I frame n (zero based)\n\
          \x20  -x3i-middle     Convert only the middle exposure of an X3I\n\
@@ -275,6 +278,7 @@ fn parse_args(argv: &[String]) -> Args {
             "-x3i-middle" => args.x3i_middle = true,
             "-x3i-extract" => args.x3i_extract = true,
             "-x3i-report" => args.x3i_report = true,
+            "-x3i-ghost-map" => args.x3i_ghost_map = true,
             "-jpg" => {
                 reset(&mut args);
                 args.extract_jpg = true;
@@ -490,6 +494,16 @@ fn validate_args(args: &Args) -> Result<(), String> {
     if args.x3i_middle && args.x3i_frame.is_some() {
         return Err("-x3i-middle cannot combine with -x3i-frame".into());
     }
+    if args.x3i_ghost_map
+        && (!matches!(
+            args.file_type,
+            FileType::Dng | FileType::Tiff | FileType::PpmP3 | FileType::PpmP6
+        ) || args.x3i_frame.is_some()
+            || args.x3i_middle
+            || args.x3i_extract)
+    {
+        return Err("-x3i-ghost-map requires an X3I merge with -dng, -tiff or -ppm".into());
+    }
     if args.x3i_report
         && (args.file_type != FileType::Dng
             || args.x3i_frame.is_some()
@@ -507,6 +521,7 @@ fn validate_args(args: &Args) -> Result<(), String> {
         || args.x3i_middle
         || args.x3i_extract
         || args.x3i_report
+        || args.x3i_ghost_map
         || args.spp_denoise
     {
         for path in &args.files {
@@ -516,7 +531,8 @@ fn validate_args(args: &Args) -> Result<(), String> {
                     if args.x3i_frame.is_some()
                         || args.x3i_middle
                         || args.x3i_extract
-                        || args.x3i_report =>
+                        || args.x3i_report
+                        || args.x3i_ghost_map =>
                 {
                     return Err(format!("{}: {error}", path.display()));
                 }
@@ -587,10 +603,16 @@ fn validate_args(args: &Args) -> Result<(), String> {
 }
 
 fn validate_x3i_input(args: &Args, x3i: bool) -> Result<(), String> {
-    if !x3i && (args.x3i_frame.is_some() || args.x3i_middle || args.x3i_extract || args.x3i_report)
+    if !x3i
+        && (args.x3i_frame.is_some()
+            || args.x3i_middle
+            || args.x3i_extract
+            || args.x3i_report
+            || args.x3i_ghost_map)
     {
         return Err(
-            "-x3i-frame, -x3i-middle, -x3i-extract and -x3i-report require an X3I input".into(),
+            "-x3i-frame, -x3i-middle, -x3i-extract, -x3i-report and -x3i-ghost-map require an X3I input"
+                .into(),
         );
     }
     if x3i && args.spp_denoise {
@@ -652,6 +674,7 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
         dng_highlight_mapping: args.dng_highlight_mapping,
         cineon: args.cineon,
         x3i_source: x3f_core::X3iSource::Merge,
+        x3i_ghost_maps: args.x3i_ghost_map,
     };
 
     let container =
@@ -717,6 +740,29 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
                 }
             }
             std::fs::rename(&tmpfile, &outfile).map_err(|e| e.to_string())?;
+            for map in &report.ghost_maps {
+                let (map_tmp, map_out) = make_paths(
+                    infile,
+                    args.outdir.as_deref(),
+                    &format!(".ghost{}.pgm", map.frame_index),
+                );
+                let _ = std::fs::remove_file(&map_tmp);
+                let result = (|| -> std::io::Result<()> {
+                    use std::io::Write;
+                    let mut file = std::fs::File::create(&map_tmp)?;
+                    write!(file, "P5\n{} {}\n255\n", map.width, map.height)?;
+                    file.write_all(&map.data)?;
+                    drop(file);
+                    std::fs::rename(&map_tmp, &map_out)
+                })();
+                if let Err(error) = result {
+                    let _ = std::fs::remove_file(&map_tmp);
+                    return Err(format!(
+                        "X3I ghost map failed: {error}; output saved to `{}`",
+                        outfile.display()
+                    ));
+                }
+            }
             if args.x3i_report {
                 let (report_tmp, report_out) =
                     make_paths(infile, args.outdir.as_deref(), ".x3i-report");
@@ -1009,6 +1055,36 @@ mod tests {
         ] {
             assert!(validate_args(&parse(&flags)).unwrap_err().contains("X3I"));
         }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn x3i_ghost_map_requires_whole_container_merge_output() {
+        let path = std::env::temp_dir().join(format!("x3i-ghost-flags-{}.bin", std::process::id()));
+        std::fs::write(&path, b"FOVi").unwrap();
+        let name = path.to_str().unwrap();
+        for format in ["-dng", "-tiff", "-ppm", "-ppm-ascii"] {
+            let args = parse(&[format, "-x3i-ghost-map", name]);
+            assert!(args.x3i_ghost_map);
+            assert!(validate_args(&args).is_ok());
+        }
+        assert!(validate_args(&parse(&["-x3i-ghost-map", name])).is_ok());
+        assert!(validate_args(&parse(&["-dng", "-x3i-report", "-x3i-ghost-map", name])).is_ok());
+        for format in ["-meta", "-jpg", "-raw", "-histogram"] {
+            assert!(
+                validate_args(&parse(&[format, "-x3i-ghost-map", name])).is_err(),
+                "{format}"
+            );
+        }
+        for flags in [
+            vec!["-x3i-frame", "0", "-x3i-ghost-map", name],
+            vec!["-x3i-extract", "-x3i-ghost-map", name],
+            vec!["-x3i-middle", "-x3i-ghost-map", name],
+        ] {
+            assert!(validate_args(&parse(&flags)).is_err());
+        }
+        std::fs::write(&path, b"FOVb").unwrap();
+        assert!(validate_args(&parse(&["-dng", "-x3i-ghost-map", name])).is_err());
         std::fs::remove_file(path).unwrap();
     }
 

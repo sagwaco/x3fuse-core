@@ -17,6 +17,7 @@ x3f_extract -tiff -color sRGB capture.X3I
 x3f_extract -ppm capture.X3I
 x3f_extract -meta capture.X3I
 x3f_extract -dng -x3i-report capture.X3I
+x3f_extract -dng -x3i-ghost-map -o output capture.X3I
 x3f_extract -ppm -color none -no-denoise -x3i-frame 0 capture.X3I
 x3f_extract -x3i-extract -o frames capture.X3I
 ```
@@ -39,6 +40,23 @@ sd Quattro and sd Quattro H modes return the existing calibration error.
 X3I inputs run serially in a CLI batch to limit simultaneous raster storage.
 X3F inputs retain parallel batch processing.
 
+`-x3i-ghost-map` writes one binary 8-bit PGM per non-reference frame next to
+the merge output, for example `capture.X3I.ghost5.pgm`. It supports DNG, TIFF
+and PPM merges and honours `-o`. Maps use the full merge resolution before
+output cropping. They store the final ghost weight after the 3x3 minimum:
+255 means weight one, 0 means fully rejected, and 128 marks invalid or
+uncovered pixels. Valid weights that round to 128 use 127. With ghost rejection
+disabled, every valid pixel is 255. These maps do not include saturation or
+inverse-variance weights.
+
+Library callers can set `MergeOptions::ghost_maps` and read
+`MergedScene::ghost_maps`. `convert_file` callers can set the research option
+`ProcessOptions::x3i_ghost_maps` and read `ConversionReport::ghost_maps`.
+Maps add one byte per pixel per non-reference frame. Disabled maps allocate
+no storage and do not change the merged samples. These research controls and
+results add public Rust struct fields. Complete struct literals must add the
+fields or use `..Default::default()` where available.
+
 ## Middle exposure only
 
 The middle exposure is the frame with the median `CaptureShutter`. With an
@@ -53,7 +71,7 @@ x3f_extract -jpg -x3i-middle capture.X3I
 
 `-x3i-middle` is `-x3i-frame <n>` with that index, so the output has the same
 bytes and the same `_<n>` file name. It cannot combine with `-x3i-frame`,
-`-x3i-extract` or `-x3i-report`. `-meta` dumps the selected frame. Like
+`-x3i-extract`, `-x3i-report` or `-x3i-ghost-map`. `-meta` dumps the selected frame. Like
 `-x3i-frame`, it runs serially in a CLI batch.
 
 In the library, set `x3i_source: X3iSource::MiddleExposure` in
@@ -137,15 +155,21 @@ the nearest source sample. Half-resolution pairs use the centres of their
 2x2 blocks. Each fit needs 50 blocks; otherwise its default or
 explicit override remains. Effective variance fixes `c_ref=1` and calibrates
 separate T and B/M corrections from at least 50 flat blocks above ten read
-sigmas in both frames. Corrections stay in `[0.5,4]`. A reference model term
+sigmas in both frames. Corrections stay in `[0.5,4]` by default. A frame is
+weak when its alignment was skipped, retained at most four tiles, or has a
+maximum retained-tile residual above 1.5 pixels. Disabled alignment keeps the
+ordinary threshold; it does not mark frames weak. A reference model term
 more than eight times the frame term marks the calibration as weak. Pixels
 below ten sigmas use the uncorrected model. This overestimates variance after
 the intermediate zero clamp and conservatively under-rejects dark noise.
 
 The accumulation pass compares each frame with the reference estimate.
-Ghost weights are `exp(-max_channel(z²)/9)`, followed by a 3x3 minimum.
-Reported ghost fractions count valid weights below 0.1. This threshold
-corresponds to a channel residual above 4.55 sigma before the minimum.
+Ghost weights are `exp(-max_channel(z²)/sigma²)`, followed by a 3x3 minimum.
+The default sigma is 3. The weak threshold defaults to the ordinary threshold.
+Weak frames use the smaller of the ordinary and weak sigma controls.
+Reported ghost fractions count valid weights below 0.1. At the default
+threshold, this corresponds to a channel residual above 4.55 sigma before
+the minimum.
 Summary and alignment rows remain on stderr. Ratio and ghost bins are
 written only with `-x3i-report`.
 
@@ -178,6 +202,9 @@ changing the merge model here.
 | `X3F_X3I_NO_ALIGN=1` | Disable frame alignment. Merge frames at their original positions. |
 | `X3F_X3I_FIXED_RATIOS=1` | Keep nominal shutter ratios. Report fitted ratios without applying them. |
 | `X3F_X3I_NO_GHOST=1` | Disable ghost rejection and effective-variance calibration. |
+| `X3F_X3I_GHOST_SIGMA=value` | Set the positive finite ghost threshold in sigma. Default: `3`. |
+| `X3F_X3I_WEAK_GHOST_SIGMA=value` | Set the positive finite weak-alignment threshold in sigma. Default: GHOST_SIGMA; bounded by GHOST_SIGMA. |
+| `X3F_X3I_C_MAX=value` | Set the effective-variance upper clamp. Default: `4`; must be finite and at least C_MIN. Caps of one or more have no effect on the two measured samples. |
 | `X3F_X3I_C_MIN=value` | Set the effective-variance calibration floor. Default: `0.5`; range: above zero through one. |
 | `X3F_X3I_RATIO_TREND=value` | Set the maximum relative trend across clean supported ratio bins. Default: `0.02` (2 percent). Larger trends keep the nominal ratio. |
 | `X3F_X3I_DENOISE_SCALE=value` | Enable experimental post-merge denoise when positive. Unset or zero disables it. |

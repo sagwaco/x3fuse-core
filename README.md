@@ -84,6 +84,7 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 | `-meta`      | metadata dump                   |
 | `-x3i-frame <n>` | Convert frame `n` of an X3I input (zero based). Append `_<n>` before the output extension. |
 | `-x3i-middle` | Convert only the middle exposure of an X3I input, as `-x3i-frame <n>` does for that frame. Append `_<n>` before the output extension. Excludes `-x3i-frame`, `-x3i-extract` and `-x3i-report`. |
+| `-x3i-ghost-map` | With an X3I DNG, TIFF or PPM merge, write each non-reference ghost-weight image as `<input>.ghost<n>.pgm`. Honour `-o`. |
 | `-x3i-report` | With X3I `-dng`, write estimated sensor ceilings, raw-plane ratios in eight reference-level bins, noise, clipping, merge counts and peak RSS to `<input>.x3i-report`. |
 | `-x3i-extract` | Copy all X3I frames to new `<stem>_<n>.X3F` files. Use `-o` to select a directory. Excludes output flags. |
 | `-histogram` | histogram CSV                   |
@@ -135,6 +136,9 @@ See [X3I merge and outputs](docs/src/x3i.md) and the
 | `X3F_X3I_NO_ALIGN=1` | Disable frame alignment. Merge frames at their original positions. |
 | `X3F_X3I_FIXED_RATIOS=1` | Keep nominal shutter ratios. Report fitted ratios without applying them. |
 | `X3F_X3I_NO_GHOST=1` | Disable ghost rejection and effective-variance calibration. |
+| `X3F_X3I_GHOST_SIGMA=value` | Set the positive ghost threshold in sigma. Default: `3`. |
+| `X3F_X3I_WEAK_GHOST_SIGMA=value` | Set the weak-alignment ghost threshold. Default: GHOST_SIGMA; see [controls](docs/src/x3i.md#research-overrides). |
+| `X3F_X3I_C_MAX=value` | Set the finite effective-variance upper clamp. Default: `4`; at least C_MIN. |
 | `X3F_X3I_C_MIN=value` | Set the effective-variance calibration floor. Default: `0.5`; range: above zero through one. |
 | `X3F_X3I_RATIO_TREND=value` | Set the maximum relative trend across clean supported ratio bins. Default: `0.02` (2 percent). Larger trends keep the nominal ratio. |
 | `X3F_X3I_DENOISE_SCALE=value` | Positive enables experimental post-merge NLM or BM3D; unset or zero disables it. |

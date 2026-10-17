@@ -181,6 +181,7 @@ fn corpus_dng_merge_writes_seven_frame_report() {
                 "-dng",
                 "-no-denoise",
                 "-x3i-report",
+                "-x3i-ghost-map",
                 "-q",
                 "-dng-highlight-recovery",
                 "-dng-highlight-mapping",
@@ -198,6 +199,29 @@ fn corpus_dng_merge_writes_seven_frame_report() {
             report.contains("sigma_B sigma_M sigma_T clip_B clip_M clip_T ratio_B ratio_M ratio_T")
         );
         let container = X3iContainer::open(&input).unwrap();
+        for frame in 1..container.frames().len() {
+            let map = std::fs::read(scratch.0.join(format!("{name}.ghost{frame}.pgm"))).unwrap();
+            let mut lines = map.splitn(4, |&v| v == b'\n');
+            assert_eq!(lines.next().unwrap(), b"P5");
+            let dimensions: Vec<usize> = std::str::from_utf8(lines.next().unwrap())
+                .unwrap()
+                .split_whitespace()
+                .map(|v| v.parse().unwrap())
+                .collect();
+            assert_eq!(dimensions.len(), 2);
+            let (width, height) = (dimensions[0], dimensions[1]);
+            let sensor = container.sensor_size();
+            assert!(width >= sensor.0 as usize && height >= sensor.1 as usize);
+            let header = format!("P5\n{width} {height}\n255\n");
+            assert!(map.starts_with(header.as_bytes()));
+            assert_eq!(map.len(), header.len() + width * height);
+            assert!(map[header.len()..].contains(&128));
+            assert!(!scratch
+                .0
+                .join(format!("{name}.ghost{frame}.pgm.tmp"))
+                .exists());
+        }
+        assert!(!scratch.0.join(format!("{name}.ghost0.pgm")).exists());
         let rows: Vec<_> = report
             .lines()
             .filter(|line| line.starts_with(|c: char| c.is_ascii_digit()))
@@ -259,11 +283,7 @@ fn corpus_dng_merge_writes_seven_frame_report() {
             };
             assert!((number("refined=") / number("nominal=")).log2().abs() <= 0.3);
             for key in ["c=", "c_chroma="] {
-                if i == 0 || number("calibration_blocks=") >= 50.0 {
-                    assert!((0.5..=4.0).contains(&number(key)));
-                } else {
-                    assert!(line.split_whitespace().any(|v| v == format!("{key}-")));
-                }
+                assert!((0.5..=4.0).contains(&number(key)));
             }
             assert!(line.contains("black_offset="));
             assert!(line.contains("calibration_weak="));

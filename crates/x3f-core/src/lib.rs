@@ -243,6 +243,8 @@ pub struct ProcessOptions {
     /// The middle exposure follows the single-frame rules for color modes,
     /// SPP, highlight recovery and embedded JPEG output. No effect on X3F input.
     pub x3i_source: X3iSource,
+    /// Return research X3I ghost maps in ConversionReport. The default is false.
+    pub x3i_ghost_maps: bool,
 }
 
 impl Default for ProcessOptions {
@@ -265,6 +267,7 @@ impl Default for ProcessOptions {
             dng_highlight_mapping: DngHighlightMapping::default(),
             cineon: false,
             x3i_source: X3iSource::default(),
+            x3i_ghost_maps: false,
         }
     }
 }

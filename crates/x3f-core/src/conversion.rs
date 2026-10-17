@@ -42,6 +42,8 @@ pub enum ConversionStage {
 pub struct ConversionReport {
     /// Human-readable warnings, for example a missing matching DNG opcode.
     pub warnings: Vec<String>,
+    /// Research X3I ghost maps. Empty unless ProcessOptions::x3i_ghost_maps is true.
+    pub ghost_maps: Vec<crate::x3i_merge::GhostMap>,
 }
 
 /// Convert one image into exactly `output`, which must not already exist.
@@ -303,6 +305,7 @@ fn convert_x3i(
         scene.report.fallback_shortest, scene.report.fallback_zero, scene.report.clipped_samples,
         scene.report.minimum, scene.report.maximum,
     ));
+    report.ghost_maps = std::mem::take(&mut scene.ghost_maps);
     report.warnings.extend(scene.report.statistics());
     report.warnings.extend(scene.report.warnings());
     let mut image = crate::x3i_merge::to_image(&scene)?;
