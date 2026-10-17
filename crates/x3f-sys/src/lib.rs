@@ -52,7 +52,7 @@ mod _wasm_c_shim_anchors {
 
 // Rust NLM and BM3D denoising, called directly by the pipeline on every target.
 mod denoise;
-pub use denoise::{DenoiseAlgorithm, DenoiseBackend, DenoiseOptions, NlmOptions};
+pub use denoise::{denoise_u16, DenoiseAlgorithm, DenoiseBackend, DenoiseOptions, NlmOptions};
 
 // Native Rust replacement for `x3f_expand_quattro`. The legacy C symbol of
 // the same name in `src/x3f_process.c` resolves to this `#[no_mangle] extern

@@ -1904,6 +1904,11 @@ mod tests {
     #[test]
     fn chroma_uses_its_own_effective_variance() {
         let options = MergeOptions {
+            // This fixture has independent noise but no registration texture.
+            align: AlignOptions {
+                enabled: false,
+                ..Default::default()
+            },
             fixed_ratios: true,
             fit_noise: false,
             noise_k: [0.0; 3],
@@ -2087,6 +2092,11 @@ mod tests {
             f
         };
         let options = MergeOptions {
+            // This fixture has independent noise but no registration texture.
+            align: AlignOptions {
+                enabled: false,
+                ..Default::default()
+            },
             fixed_ratios: true,
             fit_noise: false,
             noise_k: [0.0; 3],
@@ -2482,6 +2492,23 @@ mod tests {
             3,
             |i| {
                 let mut f = noisy_frame(i, [1.0, 0.5, 2.0][i], [0.001; 3], [0.0001; 3], 1.0, 0.0);
+                // Shared block texture gives alignment features and leaves flat fit blocks.
+                let scale = [1.0, 0.5, 2.0][i];
+                for y in 0..256 {
+                    for x in 0..256 {
+                        let delta = ((x / 32 * 7 + y / 32 * 11) % 5) as f32 * 0.025 / scale;
+                        for c in 0..3 {
+                            f.bmt[(y * 256 + x) * 3 + c] += delta;
+                        }
+                        f.raw_top[y * 256 + x] += (delta * 50000.0).round() as u16;
+                        if x % 2 == 0 && y % 2 == 0 {
+                            for c in 0..2 {
+                                f.raw_half[((y / 2) * 128 + x / 2) * 2 + c] +=
+                                    (delta * 50000.0).round() as u16;
+                            }
+                        }
+                    }
+                }
                 // All frames invalid here. Record the shortest-exposure fallback.
                 f.raw_top[..256 * 8].fill(55000);
                 Ok(f)

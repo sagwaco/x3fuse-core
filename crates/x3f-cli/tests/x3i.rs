@@ -4,7 +4,11 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use x3f_core::X3iContainer;
+
+// Each full merge holds about 2.6 GB. Run corpus merges one at a time.
+static X3I_MERGE_LOCK: Mutex<()> = Mutex::new(());
 
 struct Scratch(PathBuf);
 impl Drop for Scratch {
@@ -142,13 +146,13 @@ fn missing_shutter_keeps_metadata_and_cli_errors_give_guidance() {
         "X3I frames\nindex offset length exposure_us EV\n0 1440 {length} - -\n\n"
     )));
     let output = Command::new(common::X3F_EXTRACT)
-        .arg("-ppm")
+        .arg("-jpg")
         .arg(&input)
         .output()
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("X3I input: use -dng, -x3i-frame <n>, -x3i-extract or -meta"));
+        .contains("X3I input: use -dng, -tiff, -ppm, -x3i-frame <n>, -x3i-extract or -meta"));
     let missing = scratch.0.join("missing.bin");
     let output = Command::new(common::X3F_EXTRACT)
         .arg(&missing)
@@ -161,6 +165,7 @@ fn missing_shutter_keeps_metadata_and_cli_errors_give_guidance() {
 
 #[test]
 fn corpus_dng_merge_writes_seven_frame_report() {
+    let _merge = X3I_MERGE_LOCK.lock().unwrap();
     for name in ["DP0Q0002.X3I", "_DQH0978.X3I"] {
         let Some(input) = common::find_input(name) else {
             eprintln!("skip: {name} is absent");
@@ -404,4 +409,164 @@ fn raw_dng(path: &Path) -> (Vec<u16>, f64) {
     }
     assert_eq!(pixels.len(), width * height * 3);
     (pixels, f64::from(numerator) / f64::from(denominator))
+}
+
+fn read_rgb_tiff(path: &Path) -> ((u32, u32), Vec<u16>) {
+    let mut decoder = tiff::decoder::Decoder::new(std::fs::File::open(path).unwrap()).unwrap();
+    let dimensions = decoder.dimensions().unwrap();
+    let tiff::decoder::DecodingResult::U16(data) = decoder.read_image().unwrap() else {
+        panic!("expected 16-bit TIFF");
+    };
+    (dimensions, data)
+}
+
+fn assert_midtones(reference: &[u16], actual: impl Fn(usize) -> f64, label: &str) {
+    for channel in 0..3 {
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for i in (channel..reference.len()).step_by(3 * 16) {
+            let value = f64::from(reference[i]) / 65535.0;
+            if (0.05..=0.5).contains(&value) {
+                before.push(value);
+                after.push(actual(i));
+            }
+        }
+        assert!(before.len() > 1000, "{label}: insufficient midtones");
+        before.sort_unstable_by(f64::total_cmp);
+        after.sort_unstable_by(f64::total_cmp);
+        let expected = before[before.len() / 2];
+        let measured = after[after.len() / 2];
+        eprintln!("{label} channel {channel}: reference median={expected}, actual={measured}");
+        assert!(
+            (measured / expected - 1.0).abs() <= 0.02,
+            "{label}: channel {channel}"
+        );
+    }
+}
+
+fn assert_zero_shift(reference: &[u16], actual: &[u16], width: usize, height: usize) {
+    let luma = |data: &[u16], x, y| {
+        let i = (y * width + x) * 3;
+        0.2126 * f64::from(data[i])
+            + 0.7152 * f64::from(data[i + 1])
+            + 0.0722 * f64::from(data[i + 2])
+    };
+    let mut peak = (f64::NEG_INFINITY, 99, 99);
+    for dy in -2isize..=2 {
+        for dx in -2isize..=2 {
+            let (mut n, mut a, mut b, mut aa, mut bb, mut ab) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+            for y in (2..height - 2).step_by(16) {
+                for x in (2..width - 2).step_by(16) {
+                    let p = luma(reference, x, y);
+                    if !(0.05 * 65535.0..=0.5 * 65535.0).contains(&p) {
+                        continue;
+                    }
+                    let q = luma(
+                        actual,
+                        x.checked_add_signed(dx).unwrap(),
+                        y.checked_add_signed(dy).unwrap(),
+                    );
+                    n += 1.0;
+                    a += p;
+                    b += q;
+                    aa += p * p;
+                    bb += q * q;
+                    ab += p * q;
+                }
+            }
+            let correlation = (n * ab - a * b) / ((n * aa - a * a) * (n * bb - b * b)).sqrt();
+            if correlation > peak.0 {
+                peak = (correlation, dx, dy);
+            }
+        }
+    }
+    eprintln!("luma correlation peak: {peak:?}");
+    assert_eq!((peak.1, peak.2), (0, 0));
+}
+
+fn check_merged_color(name: &str, check_position: bool) {
+    let _merge = X3I_MERGE_LOCK.lock().unwrap();
+    use std::sync::atomic::AtomicBool;
+    use x3f_core::{prepare_scene_linear, SceneLinearOptions};
+
+    let Some(input) = common::find_input(name) else {
+        eprintln!("skip: {name} is absent");
+        return;
+    };
+    let scratch = Scratch(std::env::temp_dir().join(format!(
+        "x3i-color-{}-{name}-{check_position}",
+        std::process::id()
+    )));
+    std::fs::create_dir(&scratch.0).unwrap();
+    run(
+        &input,
+        &scratch.0,
+        &["-tiff", "-color", "sRGB", "-no-denoise", "-x3i-frame", "0"],
+    );
+    run(
+        &input,
+        &scratch.0,
+        &["-tiff", "-color", "sRGB", "-no-denoise"],
+    );
+    let (dimensions, reference) = read_rgb_tiff(&scratch.0.join(format!("{name}_0.tif")));
+    let (merged_dimensions, merged) = read_rgb_tiff(&scratch.0.join(format!("{name}.tif")));
+    assert_eq!(dimensions, merged_dimensions);
+    if check_position {
+        assert_zero_shift(
+            &reference,
+            &merged,
+            dimensions.0 as usize,
+            dimensions.1 as usize,
+        );
+        return;
+    }
+    assert_midtones(&reference, |i| f64::from(merged[i]) / 65535.0, name);
+    drop(merged);
+    let scene = prepare_scene_linear(
+        &input,
+        &SceneLinearOptions {
+            denoise_intensity: 0,
+            ..Default::default()
+        },
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!((scene.width, scene.height), dimensions);
+    assert_midtones(
+        &reference,
+        |i| {
+            let value = f64::from(scene.data[i]).clamp(0.0, 1.0);
+            if value <= 0.0031308 {
+                12.92 * value
+            } else {
+                1.055 * value.powf(1.0 / 2.4) - 0.055
+            }
+        },
+        &format!("{name} scene"),
+    );
+}
+
+#[test]
+fn dp0_merged_color_matches_reference_midtones() {
+    check_merged_color("DP0Q0002.X3I", false);
+}
+
+#[test]
+fn quattro_h_merged_color_matches_reference_midtones() {
+    check_merged_color("_DQH0978.X3I", false);
+}
+
+// Unaligned long exposures dominate the merge and move its image away from frame 0.
+// The dp0 building patch peaks at (-9, -16), at the search bound. Enable after phase 2.
+#[test]
+#[ignore = "phase 2 alignment is not integrated; dp0 building peak is (-9, -16) at the search bound"]
+fn dp0_merged_position_matches_reference() {
+    check_merged_color("DP0Q0002.X3I", true);
+}
+
+#[test]
+#[ignore = "phase 2 alignment is not integrated; the unaligned merge moves away from frame 0"]
+fn quattro_h_merged_position_matches_reference() {
+    check_merged_color("_DQH0978.X3I", true);
 }

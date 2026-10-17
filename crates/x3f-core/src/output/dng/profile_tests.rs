@@ -2039,7 +2039,7 @@ fn x3i_corpus_dispatch_writes_scaled_linear_dng_and_preserves_contracts() {
         assert!(report
             .warnings
             .iter()
-            .any(|s| s == "denoise is not applied to X3I merges yet"));
+            .any(|s| s.starts_with("X3I denoise is off; set X3F_X3I_DENOISE_SCALE=")));
         for i in 0..7 {
             let exposure = container.frame_exposure_us(i).unwrap();
             assert!(report

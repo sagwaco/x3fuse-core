@@ -652,13 +652,24 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
         return Ok(());
     }
     if let (Some(container), None) = (&container, args.x3i_frame) {
-        if args.file_type == FileType::Dng {
-            let (tmpfile, outfile) = make_paths(infile, args.outdir.as_deref(), ".dng");
+        if matches!(
+            args.file_type,
+            FileType::Dng | FileType::Tiff | FileType::PpmP3 | FileType::PpmP6
+        ) {
+            let format = match args.file_type {
+                FileType::Dng => x3f_core::OutputFormat::Dng,
+                FileType::Tiff => x3f_core::OutputFormat::Tiff,
+                FileType::PpmP3 => x3f_core::OutputFormat::PpmAscii,
+                FileType::PpmP6 => x3f_core::OutputFormat::Ppm,
+                _ => unreachable!(),
+            };
+            let (tmpfile, outfile) =
+                make_paths(infile, args.outdir.as_deref(), args.file_type.extension());
             let _ = std::fs::remove_file(&tmpfile);
             let mut report = x3f_core::convert_file(
                 infile,
                 &tmpfile,
-                x3f_core::OutputFormat::Dng,
+                format,
                 &opts,
                 &std::sync::atomic::AtomicBool::new(false),
                 |_| {},
@@ -696,7 +707,9 @@ fn convert_one(infile: &Path, args: &Args) -> Result<(), String> {
             return Ok(());
         }
         if args.file_type != FileType::Meta {
-            return Err("X3I input: use -dng, -x3i-frame <n>, -x3i-extract or -meta".into());
+            return Err(
+                "X3I input: use -dng, -tiff, -ppm, -x3i-frame <n>, -x3i-extract or -meta".into(),
+            );
         }
     }
     let mut table = String::new();
@@ -926,6 +939,9 @@ mod tests {
             vec!["-x3i-extract", name],
             vec!["-x3i-frame", "0", name],
             vec!["-meta", name],
+            vec!["-tiff", name],
+            vec!["-ppm", name],
+            vec!["-ppm-ascii", name],
         ] {
             assert!(validate_args(&parse(&flags)).is_ok());
         }
@@ -1028,7 +1044,7 @@ mod tests {
                 "X3I merge: frames=7 s=1",
                 "X3I fallback samples: shortest exposure 1",
                 "X3I saturation warning: frame=6 plane=B falls back to 1.0",
-                "denoise is not applied to X3I merges yet",
+                "X3I denoise is off; set X3F_X3I_DENOISE_SCALE=0.3 to enable the experimental post-merge filter",
                 "-dng-highlight-mapping has no effect on X3I merges",
             ] {
                 assert!(show_x3i_warning(&args, line));
