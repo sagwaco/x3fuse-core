@@ -14,7 +14,7 @@ pub struct SceneLinearOptions {
     /// Lens shading; None uses the existing camera-specific default.
     pub apply_sgain: Option<bool>,
     /// Sensor denoising intensity, 0 through 10 (default 10).
-    /// X3I denoise also requires a positive `X3F_X3I_DENOISE_SCALE`.
+    /// X3I merge denoise also requires a positive `X3F_X3I_DENOISE_SCALE`.
     pub denoise_intensity: u8,
     /// Select GPU acceleration or portable CPU execution (default: Auto).
     pub denoise_backend: crate::DenoiseBackend,

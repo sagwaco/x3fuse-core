@@ -123,6 +123,11 @@ impl DngHighlightMapping {
 
 /// Which X3I data a conversion uses. X3F input ignores this choice.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
 pub enum X3iSource {
     /// Merge all frames into one extended-range image.
     #[default]

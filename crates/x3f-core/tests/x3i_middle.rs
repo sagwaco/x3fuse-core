@@ -28,6 +28,18 @@ fn default_source_is_merge() {
     assert_eq!(SceneLinearOptions::default().x3i_source, X3iSource::Merge);
 }
 
+#[cfg(feature = "serde")]
+#[test]
+fn source_serializes_as_snake_case() {
+    for (value, text) in [
+        (X3iSource::Merge, "\"merge\""),
+        (X3iSource::MiddleExposure, "\"middle_exposure\""),
+    ] {
+        assert_eq!(serde_json::to_string(&value).unwrap(), text);
+        assert_eq!(serde_json::from_str::<X3iSource>(text).unwrap(), value);
+    }
+}
+
 #[test]
 fn middle_exposure_matches_the_extracted_frame_bytes() {
     let Some(input) = corpus_file("DP0Q0002.X3I") else {
