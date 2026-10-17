@@ -75,7 +75,7 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 
 | Flag         | Output                          |
 | ------------ | ------------------------------- |
-| `-dng`       | DNG `LinearRaw` (**default**). Merge all frames for X3I input.   |
+| `-dng`       | DNG `LinearRaw` (**default**). Merge all frames for X3I input. Process X3I inputs serially; keep X3F batch conversion parallel.   |
 | `-tiff`      | 3×16-bit TIFF                   |
 | `-ppm`       | 3×16-bit PPM/P6 (binary)        |
 | `-ppm-ascii` | 3×16-bit PPM/P3 (ASCII)         |

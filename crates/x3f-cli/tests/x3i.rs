@@ -13,7 +13,7 @@ impl Drop for Scratch {
     }
 }
 
-fn run(input: &Path, outdir: &Path, flags: &[&str]) {
+fn run(input: &Path, outdir: &Path, flags: &[&str]) -> std::process::Output {
     let output = Command::new(common::X3F_EXTRACT)
         .args(flags)
         .arg("-o")
@@ -26,6 +26,7 @@ fn run(input: &Path, outdir: &Path, flags: &[&str]) {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    output
 }
 
 #[test]
@@ -168,7 +169,23 @@ fn corpus_dng_merge_writes_seven_frame_report() {
         let scratch =
             Scratch(std::env::temp_dir().join(format!("x3i-report-{}-{name}", std::process::id())));
         std::fs::create_dir(&scratch.0).unwrap();
-        run(&input, &scratch.0, &["-dng", "-no-denoise", "-x3i-report"]);
+        let output = run(
+            &input,
+            &scratch.0,
+            &[
+                "-dng",
+                "-no-denoise",
+                "-x3i-report",
+                "-q",
+                "-dng-highlight-recovery",
+                "-dng-highlight-mapping",
+                "linear",
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("X3I frame "));
+        assert!(stderr.contains("X3I merge: frames=7"));
+        assert!(stderr.contains("have no effect on X3I merges"));
         assert!(scratch.0.join(format!("{name}.dng")).is_file());
         assert!(!scratch.0.join(format!("{name}.dng.tmp")).exists());
         let report = std::fs::read_to_string(scratch.0.join(format!("{name}.x3i-report"))).unwrap();
@@ -197,6 +214,7 @@ fn corpus_dng_merge_writes_seven_frame_report() {
             }
         }
         assert!(report.contains("X3I merge: frames=7 s="));
+        assert!(report.contains("have no effect on X3I merges"));
         #[cfg(unix)]
         {
             let rss = report
@@ -211,6 +229,32 @@ fn corpus_dng_merge_writes_seven_frame_report() {
                     .unwrap()
                     > 0
             );
+        }
+        if name == "DP0Q0002.X3I" {
+            let dng = scratch.0.join(format!("{name}.dng"));
+            let expected = common::file_md5(&dng);
+            let report_path = scratch.0.join(format!("{name}.x3i-report"));
+            std::fs::remove_file(&report_path).unwrap();
+            std::fs::create_dir(&report_path).unwrap();
+            let output = Command::new(common::X3F_EXTRACT)
+                .args(["-dng", "-no-denoise", "-x3i-report", "-q", "-o"])
+                .arg(&scratch.0)
+                .arg(&input)
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("X3I report failed:"));
+            assert!(stderr.contains("DNG saved to"));
+            assert!(!stderr.contains("X3I frame "));
+            assert!(!stderr.contains("have no effect on X3I merges"));
+            assert_eq!(
+                common::file_md5(&dng),
+                expected,
+                "ignored highlight flags changed DNG bytes"
+            );
+            assert!(!scratch.0.join(format!("{name}.dng.tmp")).exists());
+            assert!(!scratch.0.join(format!("{name}.x3i-report.tmp")).exists());
         }
     }
 }
