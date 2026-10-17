@@ -33,7 +33,8 @@
 //! also quantises and clamps BMT to u16, including Y = min(4T, 65535).
 //! Clamping near black truncates noise. Its variance can be below the shield
 //! estimate. Fix c_ref at one and fit each c_i from at least 50 flat blocks
-//! with both raw T samples above ten read sigmas. Clamp c_i to [0.5, 4].
+//! with both raw T samples above ten read sigmas. Clamp c_i to [0.5, 4]
+//! by default. Weak alignment can use a separate ghost threshold.
 //! Below ten sigmas, use the untruncated model without correction. It overestimates
 //! near-black variance and conservatively under-rejects these samples.
 //! Flag calibration when the median reference model term exceeds eight times
@@ -60,7 +61,7 @@
 //! Materialised variance adds 8N transient bytes. The ghost estimate adds 12N
 //! bytes for RGB and 8N for its two effective-variance groups.
 //! The reported ghost fraction counts valid weights below 0.1 after the 3x3
-//! minimum. This corresponds to |z| above 4.55 before the minimum.
+//! minimum. At sigma 3, this corresponds to |z| above 4.55 before the minimum.
 //! Ghost diagnostics are preliminary when alignment is weak or skipped.
 //! Validity adds N per frame; ghost weights add 4N. Alignment can also hold
 //! an input and output frame. Reference bins and the current noise mask add 2N bytes.
@@ -92,6 +93,14 @@ pub struct MergeOptions {
     pub fit_noise: bool,
     /// Lower effective-variance clamp. The default is 0.5.
     pub variance_floor: f32,
+    /// Upper effective-variance clamp. The default is 4.
+    pub variance_ceiling: f32,
+    /// Ghost threshold in sigma. The default is 3.
+    pub ghost_sigma: f32,
+    /// Ghost threshold for weak alignment. None uses the ordinary threshold.
+    pub weak_ghost_sigma: Option<f32>,
+    /// Return research ghost maps. Each non-reference frame adds one byte per pixel.
+    pub ghost_maps: bool,
     /// Reject samples that disagree with the reference estimate.
     pub ghost_rejection: bool,
     /// Fraction of the physical ceiling at the saturation roll-off midpoint.
@@ -124,6 +133,10 @@ impl Default for MergeOptions {
             ratio_trend_limit: 0.02,
             fit_noise: true,
             variance_floor: 0.5,
+            variance_ceiling: 4.0,
+            ghost_sigma: 3.0,
+            weak_ghost_sigma: None,
+            ghost_maps: false,
             ghost_rejection: true,
             saturation_knee: 0.75,
             saturation_width: 0.02,
@@ -152,6 +165,9 @@ impl MergeOptions {
                 std::env::var("X3F_X3I_NO_GHOST").ok().as_deref(),
                 std::env::var("X3F_X3I_RATIO_TREND").ok().as_deref(),
                 std::env::var("X3F_X3I_C_MIN").ok().as_deref(),
+                std::env::var("X3F_X3I_C_MAX").ok().as_deref(),
+                std::env::var("X3F_X3I_GHOST_SIGMA").ok().as_deref(),
+                std::env::var("X3F_X3I_WEAK_GHOST_SIGMA").ok().as_deref(),
             ],
         )
     }
@@ -206,13 +222,14 @@ impl MergeOptions {
         max_s: Option<&str>,
         saturation: Option<&str>,
         rolloff: Option<&str>,
-        phase2: [Option<&str>; 5],
+        phase2: [Option<&str>; 8],
     ) -> Result<Self, Error> {
         let mut options = Self::default();
         let parse = |value: &str| {
-            value.trim().parse::<f32>().map_err(|_| {
-                Error::InvalidData("invalid X3I noise, scale or saturation override".into())
-            })
+            value
+                .trim()
+                .parse::<f32>()
+                .map_err(|_| Error::InvalidData("invalid X3I numeric override".into()))
         };
         if let Some(noise) = noise {
             options.fit_noise = false;
@@ -260,6 +277,15 @@ impl MergeOptions {
         if let Some(floor) = phase2[4] {
             options.variance_floor = parse(floor)?;
         }
+        if let Some(ceiling) = phase2[5] {
+            options.variance_ceiling = parse(ceiling)?;
+        }
+        if let Some(sigma) = phase2[6] {
+            options.ghost_sigma = parse(sigma)?;
+        }
+        if let Some(sigma) = phase2[7] {
+            options.weak_ghost_sigma = Some(parse(sigma)?);
+        }
         options.validate()?;
         Ok(options)
     }
@@ -267,6 +293,14 @@ impl MergeOptions {
     fn validate(&self) -> Result<(), Error> {
         if !self.variance_floor.is_finite()
             || !(0.0 < self.variance_floor && self.variance_floor <= 1.0)
+            || !self.variance_ceiling.is_finite()
+            || self.variance_ceiling < self.variance_floor
+            || [
+                self.ghost_sigma,
+                self.weak_ghost_sigma.unwrap_or(self.ghost_sigma),
+            ]
+            .iter()
+            .any(|s| !s.is_finite() || *s <= 0.0 || !s.powi(2).is_normal())
             || !self.ratio_trend_limit.is_finite()
             || self.ratio_trend_limit < 0.0
             || !self.saturation_knee.is_finite()
@@ -438,6 +472,10 @@ pub struct MergeReport {
     pub ghost_bin_pixels: Vec<[usize; 10]>,
     /// Fraction of valid pixels with ghost weight below 0.1 after the 3x3 minimum.
     pub ghost_fractions: Vec<f32>,
+    /// Ghost threshold used per frame. Frame zero has no rejection.
+    pub ghost_sigmas: Vec<f32>,
+    /// True when alignment ran and its result was weak or skipped.
+    pub weak_alignments: Vec<bool>,
     /// Transforms in source order. Frame zero and disabled alignment use identity.
     pub alignments: Vec<Alignment>,
     /// Rejected ratio fits and alignment estimates.
@@ -470,17 +508,10 @@ impl MergeReport {
             self.noise_k[0], self.noise_k[1], self.noise_k[2], self.noise_blocks[0], self.noise_blocks[1], self.noise_blocks[2]
         )];
         for i in 0..self.scales.len() {
-            let correction = |values: &[f32]| {
-                if i == 0 || self.calibration_blocks[i] >= 50 {
-                    format!("{:.6}", values[i])
-                } else {
-                    "-".into()
-                }
-            };
             lines.push(format!(
-                "X3I frame {}: statistics nominal={:.12} refined={:.12} raw_plane_scales={:?} c={} c_chroma={} median_z2_flat={:?} calibration_blocks={} ghost_fraction={:.9} ghost_threshold=0.1 ghost_status=preliminary black_offset={:?} calibration_weak={}",
+                "X3I frame {}: statistics nominal={:.12} refined={:.12} raw_plane_scales={:?} c={:.6} c_chroma={:.6} median_z2_flat={:?} calibration_blocks={} ghost_fraction={:.9} ghost_threshold=0.1 ghost_status=preliminary black_offset={:?} calibration_weak={} alignment_weak={} ghost_sigma={:.6} ghost_enabled={}",
                 self.frame_indices[i], self.nominal_scales[i], self.scales[i], self.plane_scales[i],
-                correction(&self.effective_variance), correction(&self.chroma_variance), self.median_z_squared[i], self.calibration_blocks[i], self.ghost_fractions[i], self.aligned_ratios[i].black_offset, self.weak_calibration[i]
+                self.effective_variance[i], self.chroma_variance[i], self.median_z_squared[i], self.calibration_blocks[i], self.ghost_fractions[i], self.aligned_ratios[i].black_offset, self.weak_calibration[i], self.weak_alignments[i], self.ghost_sigmas[i], self.ghost_sigmas[i] != 0.0
             ));
             let fit = &self.aligned_ratios[i];
             for bin in 0..8 {
@@ -500,7 +531,7 @@ impl MergeReport {
             lines.push(format!(
                 "X3I frame {}: alignment dx={:.6} dy={:.6} peak={:.6} tile_spread={:.6} similarity={:?} retained_tiles={} max_tile_residual={:.6} weak={} skipped={}",
                 self.frame_indices[i], a.dx, a.dy, a.peak, a.tile_spread, a.similarity, a.retained_tiles, a.max_tile_residual,
-                i != 0 && (a.retained_tiles <= 3 || a.max_tile_residual > 1.5), a.skipped
+                self.weak_alignments[i], a.skipped
             ));
         }
         lines
@@ -525,6 +556,49 @@ impl MergeReport {
     }
 }
 
+/// Research ghost weight image at the full merge resolution.
+/// 255 means weight one and 0 means fully rejected. 128 marks invalid pixels;
+/// valid weights that round to 128 use 127 so the marker stays distinct.
+#[derive(Clone, Debug)]
+pub struct GhostMap {
+    /// Source frame index. The reference has no map.
+    pub frame_index: usize,
+    /// Full merge width in pixels.
+    pub width: u32,
+    /// Full merge height in pixels.
+    pub height: u32,
+    /// Final weights after the 3x3 minimum, one byte per pixel in row order.
+    pub data: Vec<u8>,
+}
+
+fn weak_alignment(alignment: &Alignment) -> bool {
+    alignment.skipped || alignment.retained_tiles <= 4 || alignment.max_tile_residual > 1.5
+}
+
+fn ghost_map(frame: &FramePlanes, weights: &[f32], frame_index: usize) -> GhostMap {
+    GhostMap {
+        frame_index,
+        width: frame.width,
+        height: frame.height,
+        data: weights
+            .iter()
+            .zip(&frame.valid)
+            .map(|(&weight, &valid)| {
+                if valid == 0 {
+                    128
+                } else {
+                    let code = (weight * 255.0).round() as u8;
+                    if code == 128 {
+                        127
+                    } else {
+                        code
+                    }
+                }
+            })
+            .collect(),
+    }
+}
+
 /// Extended-range camera raster in reference-frame units.
 #[derive(Clone, Debug)]
 pub struct MergedScene {
@@ -540,6 +614,8 @@ pub struct MergedScene {
     pub camera_to_rgb: [f64; 9],
     /// Exposure and range statistics for this raster.
     pub report: MergeReport,
+    /// Research ghost maps. Empty unless requested in MergeOptions.
+    pub ghost_maps: Vec<GhostMap>,
 }
 
 fn validate_frame(frame: &MergeFrame, control: Control<'_>) -> Result<[f64; 3], Error> {
@@ -1201,10 +1277,16 @@ fn calibration_blocks(
     Ok(blocks)
 }
 
-fn calibrate(blocks: &[Vec<CalibrationBlock>], k: f32, chroma: bool, floor: f32) -> Vec<f32> {
+fn calibrate(
+    blocks: &[Vec<CalibrationBlock>],
+    k: f32,
+    chroma: bool,
+    floor: f32,
+    ceiling: f32,
+) -> Vec<f32> {
     let solve = |blocks: &[CalibrationBlock], reference: f32| {
         if blocks.len() < 50 {
-            return 1.0;
+            return 1.0f32.clamp(floor, ceiling);
         }
         let mut values: Vec<_> = blocks
             .iter()
@@ -1218,7 +1300,7 @@ fn calibrate(blocks: &[Vec<CalibrationBlock>], k: f32, chroma: bool, floor: f32)
                     / (b.frame[0] + k * b.frame[1]).max(1e-12)
             })
             .collect();
-        median(&mut values).unwrap().clamp(floor, 4.0)
+        median(&mut values).unwrap().clamp(floor, ceiling)
     };
     std::iter::once(1.0)
         .chain(blocks.iter().skip(1).map(|b| solve(b, 1.0)))
@@ -1231,6 +1313,7 @@ fn ghost_weights_masked(
     estimate_var: &[[f32; 2]],
     correction: [f32; 2],
     above_black: &[u8],
+    sigma: f32,
     control: Control<'_>,
 ) -> Result<Vec<f32>, Error> {
     let width = frame.width as usize;
@@ -1259,7 +1342,7 @@ fn ghost_weights_masked(
                             / (factor * frame.var[p * 2 + 1] + estimate_var[p][group])
                     })
                     .fold(0.0f32, f32::max);
-                *weight = (-z_squared / 9.0).exp();
+                *weight = (-z_squared / sigma.powi(2)).exp();
             }
             Ok(())
         })?;
@@ -1309,7 +1392,7 @@ fn ghost_weights(
     correction: [f32; 2],
     control: Control<'_>,
 ) -> Result<Vec<f32>, Error> {
-    ghost_weights_masked(frame, estimate, estimate_var, correction, &[], control)
+    ghost_weights_masked(frame, estimate, estimate_var, correction, &[], 3.0, control)
 }
 
 /// Load each frame once for statistics and once for accumulation (2n calls).
@@ -1363,6 +1446,8 @@ pub fn merge(
             ..Default::default()
         }],
         ghost_fractions: vec![0.0; frame_count],
+        ghost_sigmas: vec![0.0; frame_count],
+        weak_alignments: vec![false; frame_count],
         noise_k: options.noise_k,
         ..Default::default()
     };
@@ -1476,6 +1561,7 @@ pub fn merge(
         report.aligned_ratios.push(fit);
         report.frame_indices.push(frame.frame_index);
         report.exposure_us.push(frame.shutter_us);
+        report.weak_alignments[i] = options.align.enabled && weak_alignment(&alignment);
         report.alignments.push(alignment);
     }
     drop(reference_luma);
@@ -1500,13 +1586,28 @@ pub fn merge(
         report.noise_k[2],
         false,
         options.variance_floor,
+        options.variance_ceiling,
     );
     report.chroma_variance = calibrate(
         &calibration,
         report.noise_k[2],
         true,
         options.variance_floor,
+        options.variance_ceiling,
     );
+    for i in 1..frame_count {
+        if options.ghost_rejection {
+            let weak = report.weak_alignments[i];
+            report.ghost_sigmas[i] = if weak {
+                options
+                    .weak_ghost_sigma
+                    .unwrap_or(options.ghost_sigma)
+                    .min(options.ghost_sigma)
+            } else {
+                options.ghost_sigma
+            };
+        }
+    }
     report.median_z_squared = calibration
         .iter()
         .enumerate()
@@ -1552,6 +1653,7 @@ pub fn merge(
     order.sort_by_key(|&i| report.exposure_us[i]);
     order.insert(0, 0);
     let mut reference_bins = Vec::new();
+    let mut ghost_maps = Vec::new();
     for i in order {
         control.check()?;
         let mut frame = load(i)?;
@@ -1629,11 +1731,15 @@ pub fn merge(
                 &estimate_var,
                 correction,
                 &above_black,
+                report.ghost_sigmas[i],
                 control,
             )?
         } else {
             vec![1.0; pixels]
         };
+        if options.ghost_maps && i != 0 {
+            ghost_maps.push(ghost_map(&planes, &ghost, report.frame_indices[i]));
+        }
         let valid_count = planes.valid.iter().filter(|&&v| v != 0).count();
         report.ghost_fractions[i] = if valid_count == 0 {
             0.0
@@ -1756,6 +1862,7 @@ pub fn merge(
         s: report.s,
         camera_to_rgb,
         report,
+        ghost_maps,
     })
 }
 
@@ -2063,7 +2170,7 @@ mod tests {
                 .unwrap(),
             );
         }
-        let actual = calibrate(&blocks, 0.0, false, options.variance_floor);
+        let actual = calibrate(&blocks, 0.0, false, options.variance_floor, 4.0);
         for i in 0..expected.len() {
             assert!(
                 (actual[i] / expected[i] - 1.0).abs() < 0.25,
@@ -2071,7 +2178,7 @@ mod tests {
             );
         }
         assert_eq!(
-            calibrate(&[vec![], vec![]], 0.0, false, options.variance_floor),
+            calibrate(&[vec![], vec![]], 0.0, false, options.variance_floor, 4.0),
             [1.0, 1.0]
         );
         let weights = ghost_weights(
@@ -2126,9 +2233,9 @@ mod tests {
             frame: [1.0, 0.0],
         };
         let blocks = [vec![], vec![block; 50]];
-        let fit = calibrate(&blocks, 0.0, false, 0.1);
+        let fit = calibrate(&blocks, 0.0, false, 0.1, 4.0);
         assert_eq!(fit, [1.0, 0.1]);
-        assert_eq!(calibrate(&blocks, 0.0, false, 0.5), [1.0, 0.5]);
+        assert_eq!(calibrate(&blocks, 0.0, false, 0.5, 4.0), [1.0, 0.5]);
     }
 
     #[test]
@@ -2283,6 +2390,7 @@ mod tests {
                 report.effective_variance[index],
             ],
             &above_black,
+            3.0,
             Control::none(),
         )
         .unwrap();
@@ -2457,7 +2565,7 @@ mod tests {
                 frame: [1.0, 0.0],
             };
             assert_eq!(
-                calibrate(&[vec![], vec![block; 50]], 0.0, false, 0.5),
+                calibrate(&[vec![], vec![block; 50]], 0.0, false, 0.5, 4.0),
                 [1.0, correction]
             );
             let mut seed = 41;
@@ -2519,6 +2627,7 @@ mod tests {
                     &variance,
                     [correction; 2],
                     &[0; 16],
+                    3.0,
                     Control::none()
                 )
                 .unwrap(),
@@ -2931,10 +3040,7 @@ mod tests {
                     correction(0),
                     correction(i),
                 );
-                let alignment = &scene.report.alignments[i];
-                let trusted = !alignment.skipped
-                    && alignment.retained_tiles > 3
-                    && alignment.max_tile_residual <= 1.5
+                let trusted = !scene.report.weak_alignments[i]
                     && correction(i)
                         .iter()
                         .all(|&c| c >= fitted.variance_floor && c < 4.0);
@@ -3005,12 +3111,8 @@ mod tests {
         assert!(lines[1].contains("nominal=1.000000000000 refined=1.000000000000"));
         assert!(lines[20].contains("dx=0.000000"));
         assert!(lines[20].contains("weak=false"));
-        let mut report = scene.report;
-        for (tiles, residual, weak) in [(3, 0.0, true), (4, 1.5, false), (4, 1.51, true)] {
-            report.alignments[1].retained_tiles = tiles;
-            report.alignments[1].max_tile_residual = residual;
-            assert!(report.statistics()[40].contains(&format!("weak={weak}")));
-        }
+        assert!(scene.report.weak_alignments.iter().all(|&weak| !weak));
+        assert_eq!(scene.report.ghost_sigmas, [0.0, 3.0, 3.0]);
     }
 
     #[test]
@@ -3251,13 +3353,197 @@ mod tests {
     }
 
     #[test]
+    fn ghost_controls_reject_invalid_thresholds_and_clamps() {
+        let controls = [
+            None,
+            None,
+            None,
+            None,
+            Some("0.2"),
+            Some("2"),
+            Some("2.5"),
+            Some("1.5"),
+        ];
+        let options = MergeOptions::parse_env(None, None, None, None, controls).unwrap();
+        assert_eq!(options.variance_ceiling, 2.0);
+        assert_eq!(options.ghost_sigma, 2.5);
+        assert_eq!(options.weak_ghost_sigma, Some(1.5));
+        for index in 5..8 {
+            for invalid in ["", "bad", "NaN", "inf", "-1", "0", "1e-30", "1e30"] {
+                let mut values = controls;
+                values[index] = Some(invalid);
+                // Very small and large C_MAX values are valid if they exceed C_MIN.
+                if index == 5 && invalid == "1e30" {
+                    continue;
+                }
+                assert!(matches!(
+                    MergeOptions::parse_env(None, None, None, None, values),
+                    Err(Error::InvalidData(_))
+                ));
+            }
+        }
+        let inherited = MergeOptions::parse_env(
+            None,
+            None,
+            None,
+            None,
+            [None, None, None, None, None, None, Some("2.5"), None],
+        )
+        .unwrap();
+        assert_eq!(inherited.weak_ghost_sigma, None);
+        assert_eq!(MergeOptions::default().weak_ghost_sigma, None);
+        let mut below_floor = controls;
+        below_floor[5] = Some("0.1");
+        assert!(matches!(
+            MergeOptions::parse_env(None, None, None, None, below_floor),
+            Err(Error::InvalidData(_))
+        ));
+        below_floor[5] = Some("0.2");
+        assert!(MergeOptions::parse_env(None, None, None, None, below_floor).is_ok());
+    }
+
+    #[test]
+    fn weak_alignment_reads_only_consensus_residual_and_skip() {
+        let mut alignment = Alignment {
+            retained_tiles: 5,
+            max_tile_residual: 1.5,
+            ..Default::default()
+        };
+        assert!(!weak_alignment(&alignment));
+        alignment.retained_tiles = 4;
+        assert!(weak_alignment(&alignment));
+        alignment.retained_tiles = 5;
+        alignment.max_tile_residual = 1.5001;
+        assert!(weak_alignment(&alignment));
+        alignment.max_tile_residual = 0.0;
+        alignment.skipped = true;
+        assert!(weak_alignment(&alignment));
+    }
+
+    #[test]
+    fn weak_threshold_requires_enabled_alignment_and_rejection() {
+        let mut options = MergeOptions {
+            ghost_sigma: 2.5,
+            weak_ghost_sigma: Some(1.5),
+            ..Default::default()
+        };
+        let load = |_| Ok(frame(1000, 0.1));
+        let skipped = merge(2, load, &options, Control::none()).unwrap();
+        assert!(skipped.report.alignments[1].skipped);
+        assert!(skipped.report.weak_alignments[1]);
+        assert_eq!(skipped.report.ghost_sigmas, [0.0, 1.5]);
+        options.weak_ghost_sigma = None;
+        options.ghost_sigma = 4.0;
+        let inherited = merge(2, load, &options, Control::none()).unwrap();
+        assert_eq!(inherited.report.ghost_sigmas, [0.0, 4.0]);
+        options.ghost_sigma = 2.5;
+        options.weak_ghost_sigma = Some(1.5);
+        options.align.enabled = false;
+        let disabled = merge(2, load, &options, Control::none()).unwrap();
+        assert_eq!(disabled.report.weak_alignments, [false, false]);
+        assert_eq!(disabled.report.ghost_sigmas, [0.0, 2.5]);
+        options.ghost_rejection = false;
+        let no_ghost = merge(2, load, &options, Control::none()).unwrap();
+        assert_eq!(no_ghost.report.ghost_sigmas, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn variance_ceiling_bounds_fits_and_low_support_fallbacks() {
+        let block = CalibrationBlock {
+            residual: [10.0; 3],
+            median_squared: [1.0; 3],
+            reference: [1.0, 0.0],
+            frame: [1.0, 0.0],
+        };
+        assert_eq!(
+            calibrate(&[vec![], vec![block; 50]], 0.0, false, 0.5, 0.75),
+            [1.0, 0.75]
+        );
+        assert_eq!(
+            calibrate(&[vec![], vec![]], 0.0, false, 0.5, 0.75),
+            [1.0, 0.75]
+        );
+    }
+
+    #[test]
+    fn ghost_map_encodes_final_rejection_static_and_invalid_pixels() {
+        let mut frame = FramePlanes {
+            width: 16,
+            height: 16,
+            x: vec![0.1; 16 * 16 * 3],
+            var: vec![1e-6; 16 * 16 * 2],
+            d_max: vec![0.1; 16 * 16],
+            valid: vec![1; 16 * 16],
+        };
+        frame.x[(8 * 16 + 8) * 3..(8 * 16 + 8) * 3 + 3].fill(0.5);
+        frame.valid[0] = 0;
+        let weights = ghost_weights_masked(
+            &frame,
+            &vec![0.1; 16 * 16 * 3],
+            &vec![[1e-6; 2]; 16 * 16],
+            [1.0; 2],
+            &[],
+            3.0,
+            Control::none(),
+        )
+        .unwrap();
+        let map = ghost_map(&frame, &weights, 5);
+        assert_eq!((map.frame_index, map.width, map.height), (5, 16, 16));
+        assert_eq!(map.data.len(), 256);
+        assert_eq!(map.data[0], 128);
+        assert_eq!(map.data[2 * 16 + 2], 255);
+        for y in 7..=9 {
+            for x in 7..=9 {
+                assert_eq!(map.data[y * 16 + x], 0);
+            }
+        }
+        let middle = ghost_map(&frame, &vec![128.0 / 255.0; 256], 5);
+        assert_eq!(middle.data.iter().filter(|&&v| v == 128).count(), 1);
+    }
+
+    #[test]
+    fn ghost_maps_do_not_change_merge_bits_or_reports() {
+        let mut options = phase1_options();
+        options.ghost_rejection = true;
+        let load = |i| {
+            let mut f = frame(1000, 0.1);
+            f.frame_index = i;
+            if i == 1 {
+                f.bmt[15] = 0.5;
+            }
+            Ok(f)
+        };
+        let off = merge(2, load, &options, Control::none()).unwrap();
+        assert!(off.ghost_maps.is_empty());
+        options.ghost_maps = true;
+        let on = merge(2, load, &options, Control::none()).unwrap();
+        assert_eq!(
+            off.bmt.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            on.bmt.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(off.report, on.report);
+        assert_eq!(off.s, on.s);
+        assert_eq!(on.ghost_maps.len(), 1);
+        assert_eq!(on.ghost_maps[0].data.len(), (on.width * on.height) as usize);
+    }
+
+    #[test]
     fn phase2_overrides_parse_without_environment_mutation() {
         let options = MergeOptions::parse_env(
             None,
             None,
             None,
             None,
-            [Some("1"), Some("1"), Some("1"), Some("0.03"), Some("0.2")],
+            [
+                Some("1"),
+                Some("1"),
+                Some("1"),
+                Some("0.03"),
+                Some("0.2"),
+                None,
+                None,
+                None,
+            ],
         )
         .unwrap();
         assert!(!options.align.enabled && options.fixed_ratios && !options.ghost_rejection);
@@ -3269,7 +3555,7 @@ mod tests {
                 None,
                 None,
                 None,
-                [None, None, None, None, Some(floor)]
+                [None, None, None, None, Some(floor), None, None, None]
             )
             .is_err());
         }
@@ -3278,7 +3564,16 @@ mod tests {
             None,
             None,
             None,
-            [Some("0"), Some("0"), Some("0"), None, None],
+            [
+                Some("0"),
+                Some("0"),
+                Some("0"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
         )
         .unwrap();
         assert!(defaults.align.enabled && !defaults.fixed_ratios && defaults.ghost_rejection);
@@ -3289,7 +3584,7 @@ mod tests {
                 None,
                 None,
                 None,
-                [None, None, None, Some(limit), None]
+                [None, None, None, Some(limit), None, None, None, None]
             )
             .is_err());
         }
@@ -3632,7 +3927,7 @@ mod tests {
     #[test]
     fn rolloff_override_parses_and_validates() {
         let options =
-            MergeOptions::parse_env(None, None, None, Some("0.75, 0.05, 0.15"), [None; 5]).unwrap();
+            MergeOptions::parse_env(None, None, None, Some("0.75, 0.05, 0.15"), [None; 8]).unwrap();
         assert_eq!(options.saturation_knee, 0.75);
         assert_eq!(options.saturation_width, 0.05);
         assert_eq!(options.validity_margin, 0.15);
@@ -3659,7 +3954,7 @@ mod tests {
             "0.8,0.03,nan",
             "x,0.03,0.1",
         ] {
-            assert!(MergeOptions::parse_env(None, None, None, Some(value), [None; 5]).is_err());
+            assert!(MergeOptions::parse_env(None, None, None, Some(value), [None; 8]).is_err());
         }
     }
 
@@ -4020,7 +4315,7 @@ mod tests {
             Some("8"),
             None,
             None,
-            [None; 5],
+            [None; 8],
         )
         .unwrap();
         assert_eq!(options.noise_sigma, Some(0.002));
@@ -4028,15 +4323,15 @@ mod tests {
         assert_eq!(options.noise_k, [0.0001; 3]);
         assert_eq!(options.noise_q, [0.01; 3]);
         let measured =
-            MergeOptions::parse_env(Some(",0.0001,0"), None, None, None, [None; 5]).unwrap();
+            MergeOptions::parse_env(Some(",0.0001,0"), None, None, None, [None; 8]).unwrap();
         assert_eq!(measured.noise_sigma, None);
         assert!(!measured.fit_noise);
         assert_eq!(options.max_s, Some(8.0));
         for value in ["1,2", "1,2,3,4", "nan,0,0", "-1,0,0", "0,-1,0", "x,0,0"] {
-            assert!(MergeOptions::parse_env(Some(value), None, None, None, [None; 5]).is_err());
+            assert!(MergeOptions::parse_env(Some(value), None, None, None, [None; 8]).is_err());
         }
         for value in ["nan", "inf", "0.5", "x"] {
-            assert!(MergeOptions::parse_env(None, Some(value), None, None, [None; 5]).is_err());
+            assert!(MergeOptions::parse_env(None, Some(value), None, None, [None; 8]).is_err());
         }
     }
 
@@ -4044,7 +4339,7 @@ mod tests {
     fn saturation_override_requires_three_positive_finite_fractions() {
         assert_eq!(phase1_options().saturation, None);
         let options =
-            MergeOptions::parse_env(None, None, Some("0.44, 0.43, 0.55"), None, [None; 5]).unwrap();
+            MergeOptions::parse_env(None, None, Some("0.44, 0.43, 0.55"), None, [None; 8]).unwrap();
         assert_eq!(options.saturation, Some([0.44, 0.43, 0.55]));
         for value in [
             "",
@@ -4058,7 +4353,7 @@ mod tests {
             "x,1,1",
         ] {
             assert!(
-                MergeOptions::parse_env(None, None, Some(value), None, [None; 5]).is_err(),
+                MergeOptions::parse_env(None, None, Some(value), None, [None; 8]).is_err(),
                 "{value}"
             );
         }

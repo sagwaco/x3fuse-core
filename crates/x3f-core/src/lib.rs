@@ -223,6 +223,8 @@ pub struct ProcessOptions {
     /// Cineon film-print, 50 ≈ moderate log; larger is flatter still at
     /// the cost of shadow noise).
     pub cineon: bool,
+    /// Return research X3I ghost maps in ConversionReport. The default is false.
+    pub x3i_ghost_maps: bool,
 }
 
 impl Default for ProcessOptions {
@@ -244,6 +246,7 @@ impl Default for ProcessOptions {
             dng_highlight_recovery: false,
             dng_highlight_mapping: DngHighlightMapping::default(),
             cineon: false,
+            x3i_ghost_maps: false,
         }
     }
 }

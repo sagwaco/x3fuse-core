@@ -18,6 +18,7 @@ pub(crate) fn merge_frames(
 ) -> Result<MergedScene, Error> {
     let mut merge_options = x3i_merge::MergeOptions::from_env()?;
     merge_options.process = options.clone();
+    merge_options.ghost_maps = options.x3i_ghost_maps;
     merge_options.process.denoise_intensity = 0;
     merge_options.saturation =
         Some(merge_options.saturation_for_with_warnings(container, control, warnings)?);
@@ -343,6 +344,7 @@ mod tests {
             s: 3.0,
             camera_to_rgb: [2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.5],
             report: Default::default(),
+            ghost_maps: Vec::new(),
         };
         let control = Control::none();
         let rendering = Rendering::resolve(
@@ -398,6 +400,7 @@ mod tests {
             s: 3.0,
             camera_to_rgb: [0.0; 9],
             report: Default::default(),
+            ghost_maps: Vec::new(),
         };
         for row in 1..7 {
             for col in 0..8 {
