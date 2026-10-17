@@ -53,6 +53,13 @@ fn merged_scene_and_rendered_outputs_preserve_the_public_contract() {
                 .count(),
             7
         );
+        let merge_stages: Vec<_> = stages
+            .iter()
+            .copied()
+            .filter(|s| matches!(s, ConversionStage::Decode | ConversionStage::Process))
+            .collect();
+        assert_eq!(merge_stages[..7], [ConversionStage::Decode; 7]);
+        assert_eq!(merge_stages[7..], [ConversionStage::Process; 7]);
         assert!(!stages.contains(&ConversionStage::Write));
         if name == "DP0Q0002.X3I" {
             assert!(scene.data.iter().copied().fold(f32::NEG_INFINITY, f32::max) > 1.0);
