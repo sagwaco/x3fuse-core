@@ -2105,6 +2105,7 @@ fn x3i_corpus_dispatch_writes_scaled_linear_dng_and_preserves_contracts() {
         if scale > 1.0 {
             assert_eq!(maximum, 65535, "{name}");
         }
+        let merged_raw = (name == "_DQH0978.X3I").then(|| decoded_raw(&bytes));
         drop(bytes);
         // A second call must fail before it reads or modifies the destination.
         assert!(convert_file(
@@ -2130,6 +2131,58 @@ fn x3i_corpus_dispatch_writes_scaled_linear_dng_and_preserves_contracts() {
         let reference = std::fs::read(&output).unwrap();
         let reference_baseline = root(&reference)[&t::BASELINE_EXPOSURE].rationals()[0];
         assert!((merged_baseline - reference_baseline - scale.log2()).abs() < 1e-6);
+        if let Some(merged_raw) = merged_raw {
+            assert!(scale > 1.0, "sd Quattro H must retain extended highlights");
+            let reference_raw = decoded_raw(&reference);
+            assert_eq!(merged_raw.len(), reference_raw.len());
+            let mut histogram = vec![0usize; 3 * usize::from(u16::MAX) + 1];
+            for pixel in reference_raw.as_chunks::<3>().0 {
+                histogram[pixel.iter().map(|&v| usize::from(v)).sum::<usize>()] += 1;
+            }
+            let target = (reference_raw.len() / 3).div_ceil(100);
+            let mut selected = 0;
+            let threshold = (0..histogram.len())
+                .rev()
+                .find(|&sum| {
+                    selected += histogram[sum];
+                    selected >= target
+                })
+                .unwrap();
+            let mut reference_planes: [Vec<u16>; 3] = std::array::from_fn(|_| Vec::new());
+            let mut merged_planes: [Vec<u16>; 3] = std::array::from_fn(|_| Vec::new());
+            for (reference, merged) in reference_raw
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .zip(merged_raw.as_chunks::<3>().0)
+            {
+                if reference.iter().map(|&v| usize::from(v)).sum::<usize>() < threshold {
+                    continue;
+                }
+                for c in 0..3 {
+                    reference_planes[c].push(reference[c]);
+                    merged_planes[c].push(merged[c]);
+                }
+            }
+            let median = |values: &mut [u16]| {
+                values.sort_unstable();
+                let middle = values.len() / 2;
+                if values.len().is_multiple_of(2) {
+                    (f64::from(values[middle - 1]) + f64::from(values[middle])) / 2.0
+                } else {
+                    f64::from(values[middle])
+                }
+            };
+            for c in 0..3 {
+                let reference = median(&mut reference_planes[c]);
+                let merged = median(&mut merged_planes[c]) * scale;
+                eprintln!(
+                    "{name} top 1% channel {c}: pixels={selected} threshold={threshold} frame0={reference} merged={merged:.6} ratio={:.9}",
+                    merged / reference
+                );
+                assert!((merged / reference - 1.0).abs() <= 0.05, "channel {c}");
+            }
+        }
         drop(reference);
         std::fs::remove_file(&output).unwrap();
 
