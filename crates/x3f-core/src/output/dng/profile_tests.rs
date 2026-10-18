@@ -1844,3 +1844,404 @@ fn write_color_mode_camera_fixtures() {
     std::fs::write(destination.join("sdk-pixel-probes.tsv"), probes).unwrap();
     std::fs::write(destination.join("profiles.tsv"), names).unwrap();
 }
+
+#[test]
+fn prebuilt_x3i_scale_preserves_raw_and_disables_preview_gain() {
+    let corpus = std::env::var_os("X3F_TEST_FILES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../x3f_test_files"));
+    let input = corpus.join("_SDI8284.X3F");
+    if !input.is_file() {
+        eprintln!("skip: missing _SDI8284.X3F for the prebuilt DNG check");
+        return;
+    }
+    let reader = loaded_reader(&input);
+    let control = x3f_sys::Control::none();
+    let source_opts = crate::ProcessOptions {
+        denoise_intensity: 0,
+        apply_sgain: Some(false),
+        ..Default::default()
+    };
+    let source_inputs =
+        super::super::WriterInputs::resolve(&reader, &source_opts, control, &mut Vec::new())
+            .unwrap();
+    let source = reader
+        .get_image_with_control(&source_inputs.opts, control)
+        .unwrap();
+    drop(reader);
+    let destination = std::env::temp_dir().join(format!("x3f-prebuilt-{}", std::process::id()));
+    std::fs::create_dir_all(&destination).unwrap();
+    let mut outputs = Vec::new();
+    let mut baselines = Vec::new();
+    for (i, scale, gain) in [(0, 1.0, false), (1, 4.0, false), (2, 4.0, true)] {
+        let opts = crate::ProcessOptions {
+            denoise_intensity: 0,
+            apply_sgain: Some(gain),
+            ..Default::default()
+        };
+        let reader = loaded_reader(&input);
+        let inputs =
+            super::super::WriterInputs::resolve(&reader, &opts, control, &mut Vec::new()).unwrap();
+        // Keep the same raster in all runs. Only writer settings and S differ.
+        let image = crate::Image {
+            data: source.data.clone(),
+            dng_highlight_scale: scale,
+            ..source
+        };
+        let path = destination.join(format!("{i}.dng"));
+        super::super::write_prepared(
+            &reader,
+            inputs,
+            image,
+            &path,
+            control,
+            &mut Vec::new(),
+            true,
+        )
+        .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let root_offset = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let root = directory(&bytes, 0, root_offset, Order::Little);
+        baselines.push(root[&t::BASELINE_EXPOSURE].rationals()[0]);
+        outputs.push(bytes);
+        std::fs::remove_file(path).unwrap();
+    }
+    fn raw_strips(bytes: &[u8]) -> Vec<&[u8]> {
+        let primary = root(bytes);
+        let raw = directory(
+            bytes,
+            0,
+            primary[&t::SUB_IFDS].longs()[0] as usize,
+            Order::Little,
+        );
+        raw[&t::STRIP_OFFSETS]
+            .longs()
+            .into_iter()
+            .zip(raw[&t::STRIP_BYTE_COUNTS].longs())
+            .map(|(offset, count)| &bytes[offset as usize..(offset + count) as usize])
+            .collect()
+    }
+    assert_eq!(raw_strips(&outputs[0]), raw_strips(&outputs[1]));
+    assert_eq!(baselines[1] - baselines[0], 4.0f64.log2());
+    assert_eq!(
+        outputs[1], outputs[2],
+        "prebuilt preview applied spatial gain twice"
+    );
+    std::fs::remove_dir(destination).unwrap();
+}
+
+#[test]
+fn prebuilt_color_mode_uses_extended_scale_for_profile_and_preview() {
+    let corpus = std::env::var_os("X3F_TEST_FILES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../x3f_test_files"));
+    let input = corpus.join("_SDI8284.X3F");
+    if !input.is_file() {
+        eprintln!("skip: missing _SDI8284.X3F for the prebuilt Color Mode check");
+        return;
+    }
+    let destination =
+        std::env::temp_dir().join(format!("x3f-prebuilt-mode-{}", std::process::id()));
+    std::fs::create_dir_all(&destination).unwrap();
+    let mut outputs = Vec::new();
+    for (i, scale) in [1.0, 4.0].into_iter().enumerate() {
+        let reader = loaded_reader(&input);
+        let opts = crate::ProcessOptions {
+            color_mode: Some(x3f_sys::ColorMode::Standard),
+            denoise_intensity: 0,
+            apply_sgain: Some(true),
+            ..Default::default()
+        };
+        let control = x3f_sys::Control::none();
+        let inputs =
+            super::super::WriterInputs::resolve(&reader, &opts, control, &mut Vec::new()).unwrap();
+        let image = crate::Image {
+            data: vec![512; 16 * 16 * 3],
+            rows: 16,
+            columns: 16,
+            channels: 3,
+            row_stride: 48,
+            levels: crate::ImageLevels {
+                black: [0.0; 3],
+                white: [65535; 3],
+            },
+            dng_highlight_scale: scale,
+            dng_shoulder_ceiling: 1.0,
+        };
+        let path = destination.join(format!("{i}.dng"));
+        super::super::write_prepared(
+            &reader,
+            inputs,
+            image,
+            &path,
+            control,
+            &mut Vec::new(),
+            true,
+        )
+        .unwrap();
+        outputs.push(std::fs::read(&path).unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
+    assert_eq!(decoded_raw(&outputs[0]), decoded_raw(&outputs[1]));
+    let first = root(&outputs[0]);
+    let extended = root(&outputs[1]);
+    assert_eq!(
+        extended[&t::BASELINE_EXPOSURE].rationals()[0]
+            - first[&t::BASELINE_EXPOSURE].rationals()[0],
+        2.0
+    );
+    let preview = |bytes: &[u8], root: &BTreeMap<u16, Entry<'_>>| {
+        let offset = root[&t::STRIP_OFFSETS].longs()[0] as usize;
+        let count = root[&t::STRIP_BYTE_COUNTS].longs()[0] as usize;
+        bytes[offset..offset + count].to_vec()
+    };
+    assert_ne!(
+        preview(&outputs[0], &first),
+        preview(&outputs[1], &extended)
+    );
+    std::fs::remove_dir(destination).unwrap();
+}
+
+#[test]
+fn x3i_corpus_dispatch_writes_scaled_linear_dng_and_preserves_contracts() {
+    use crate::{convert_file, ConversionStage, Error, OutputFormat, ProcessOptions, X3iContainer};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let corpus = std::env::var_os("X3F_TEST_FILES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../x3f_test_files"));
+    let destination = std::env::temp_dir().join(format!("x3i-wiring-{}", std::process::id()));
+    std::fs::create_dir_all(&destination).unwrap();
+    let cancel = AtomicBool::new(false);
+    for name in ["DP0Q0002.X3I", "_DQH0978.X3I"] {
+        let input = corpus.join(name);
+        if !input.is_file() {
+            eprintln!("skip: missing {name} for X3I DNG integration");
+            continue;
+        }
+        let container = X3iContainer::open(&input).unwrap();
+        assert_eq!(container.frames().len(), 7);
+        let output = destination.join(format!("{name}.dng"));
+        let options = ProcessOptions::default();
+        let mut processed = 0;
+        let report = convert_file(
+            &input,
+            &output,
+            OutputFormat::Dng,
+            &options,
+            &cancel,
+            |stage| {
+                processed += usize::from(stage == ConversionStage::Process);
+            },
+        )
+        .unwrap();
+        assert_eq!(processed, 7);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|s| s.starts_with("X3I denoise is off; set X3F_X3I_DENOISE_SCALE=")));
+        for i in 0..7 {
+            let exposure = container.frame_exposure_us(i).unwrap();
+            assert!(report
+                .warnings
+                .iter()
+                .any(|s| s.starts_with(&format!("X3I frame {i}: shutter_us={exposure} "))));
+        }
+        let summary = report
+            .warnings
+            .iter()
+            .find(|s| s.starts_with("X3I merge:"))
+            .unwrap();
+        let scale: f64 = summary
+            .split_whitespace()
+            .find_map(|s| s.strip_prefix("s="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(scale >= 1.0);
+        let bytes = std::fs::read(&output).unwrap();
+        let primary = root(&bytes);
+        let raw = directory(
+            &bytes,
+            0,
+            primary[&t::SUB_IFDS].longs()[0] as usize,
+            Order::Little,
+        );
+        let merged_baseline = primary[&t::BASELINE_EXPOSURE].rationals()[0];
+        assert_eq!(raw[&t::BITS_PER_SAMPLE].shorts(), [16, 16, 16]);
+        assert_eq!(raw[&t::SAMPLES_PER_PIXEL].shorts(), [3]);
+        assert_eq!(raw[&t::COMPRESSION].shorts(), [1]);
+        assert_eq!(primary[&t::LINEAR_RESPONSE_LIMIT].rationals(), [1.0]);
+        assert!(raw[&t::WHITE_LEVEL].longs().iter().all(|&v| v == 65535));
+        assert!(raw[&t::BLACK_LEVEL].rationals().iter().all(|&v| v == 0.0));
+        let mut samples = 0;
+        let mut maximum = 0;
+        for (offset, count) in raw[&t::STRIP_OFFSETS]
+            .longs()
+            .into_iter()
+            .zip(raw[&t::STRIP_BYTE_COUNTS].longs())
+        {
+            let strip = &bytes[offset as usize..(offset + count) as usize];
+            assert_eq!(strip.len() % 2, 0);
+            for chunk in strip.as_chunks::<2>().0 {
+                samples += 1;
+                maximum = maximum.max(u16::from_le_bytes(*chunk));
+            }
+        }
+        let rows = raw[&t::IMAGE_LENGTH].longs()[0];
+        let cols = raw[&t::IMAGE_WIDTH].longs()[0];
+        assert_eq!(samples, rows as usize * cols as usize * 3);
+        let raster_maximum: f64 = summary
+            .split_whitespace()
+            .find_map(|s| s.strip_prefix("maximum="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            maximum,
+            (raster_maximum / scale * 65535.0).round() as u16,
+            "{name}"
+        );
+        if scale > 1.0 {
+            assert_eq!(maximum, 65535, "{name}");
+        }
+        let merged_raw = (name == "_DQH0978.X3I").then(|| decoded_raw(&bytes));
+        drop(bytes);
+        // A second call must fail before it reads or modifies the destination.
+        assert!(convert_file(
+            &input,
+            &output,
+            OutputFormat::Dng,
+            &options,
+            &cancel,
+            |_| panic!("existing output")
+        )
+        .is_err());
+        std::fs::remove_file(&output).unwrap();
+
+        let mut frame0 = container.open_frame(0).unwrap();
+        frame0.load_property_list().unwrap();
+        frame0.load_camf().unwrap();
+        frame0.load_raw().unwrap();
+        let no_denoise = ProcessOptions {
+            denoise_intensity: 0,
+            ..Default::default()
+        };
+        frame0.dump_dng(&output, &no_denoise).unwrap();
+        let reference = std::fs::read(&output).unwrap();
+        let reference_baseline = root(&reference)[&t::BASELINE_EXPOSURE].rationals()[0];
+        assert!((merged_baseline - reference_baseline - scale.log2()).abs() < 1e-6);
+        if let Some(merged_raw) = merged_raw {
+            assert!(scale > 1.0, "sd Quattro H must retain extended highlights");
+            let reference_raw = decoded_raw(&reference);
+            assert_eq!(merged_raw.len(), reference_raw.len());
+            let mut histogram = vec![0usize; 3 * usize::from(u16::MAX) + 1];
+            for pixel in reference_raw.as_chunks::<3>().0 {
+                histogram[pixel.iter().map(|&v| usize::from(v)).sum::<usize>()] += 1;
+            }
+            let target = (reference_raw.len() / 3).div_ceil(100);
+            let mut selected = 0;
+            let threshold = (0..histogram.len())
+                .rev()
+                .find(|&sum| {
+                    selected += histogram[sum];
+                    selected >= target
+                })
+                .unwrap();
+            let mut reference_planes: [Vec<u16>; 3] = std::array::from_fn(|_| Vec::new());
+            let mut merged_planes: [Vec<u16>; 3] = std::array::from_fn(|_| Vec::new());
+            for (reference, merged) in reference_raw
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .zip(merged_raw.as_chunks::<3>().0)
+            {
+                if reference.iter().map(|&v| usize::from(v)).sum::<usize>() < threshold {
+                    continue;
+                }
+                for c in 0..3 {
+                    reference_planes[c].push(reference[c]);
+                    merged_planes[c].push(merged[c]);
+                }
+            }
+            let median = |values: &mut [u16]| {
+                values.sort_unstable();
+                let middle = values.len() / 2;
+                if values.len().is_multiple_of(2) {
+                    (f64::from(values[middle - 1]) + f64::from(values[middle])) / 2.0
+                } else {
+                    f64::from(values[middle])
+                }
+            };
+            for c in 0..3 {
+                let reference = median(&mut reference_planes[c]);
+                let merged = median(&mut merged_planes[c]) * scale;
+                eprintln!(
+                    "{name} top 1% channel {c}: pixels={selected} threshold={threshold} frame0={reference} merged={merged:.6} ratio={:.9}",
+                    merged / reference
+                );
+                assert!((merged / reference - 1.0).abs() <= 0.05, "channel {c}");
+            }
+        }
+        drop(reference);
+        std::fs::remove_file(&output).unwrap();
+
+        let mode_options = ProcessOptions {
+            color_mode: Some(crate::ColorMode::Standard),
+            ..no_denoise.clone()
+        };
+        let result = convert_file(
+            &input,
+            &output,
+            OutputFormat::Dng,
+            &mode_options,
+            &cancel,
+            |_| {},
+        );
+        if name == "DP0Q0002.X3I" {
+            result.unwrap();
+            std::fs::remove_file(&output).unwrap();
+        } else {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("sensor calibration port"));
+            assert!(!output.exists());
+        }
+        // Cancel during preparation of the first frame and a later frame.
+        for cancel_frame in [1, 2] {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let mut processes = 0;
+            std::thread::scope(|scope| {
+                let cancel_ref = &cancel;
+                let worker = scope.spawn(move || {
+                    receiver
+                        .recv_timeout(std::time::Duration::from_secs(180))
+                        .unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    cancel_ref.store(true, Ordering::Relaxed);
+                });
+                let result = convert_file(
+                    &input,
+                    &output,
+                    OutputFormat::Dng,
+                    &no_denoise,
+                    &cancel,
+                    |stage| {
+                        if stage == ConversionStage::Process {
+                            processes += 1;
+                            if processes == cancel_frame {
+                                sender.send(()).unwrap();
+                            }
+                        }
+                    },
+                );
+                worker.join().unwrap();
+                assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+            });
+            assert!(!output.exists());
+            cancel.store(false, Ordering::Relaxed);
+        }
+    }
+    std::fs::remove_dir(destination).unwrap();
+}

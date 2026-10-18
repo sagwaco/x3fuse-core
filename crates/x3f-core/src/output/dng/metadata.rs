@@ -111,15 +111,16 @@ impl Reader {
     /// row/column. The C code's `get_camf_rect_as_dngrect` does the same
     /// transform; we replicate it here.
     pub(crate) fn dng_active_area(&self, image: &crate::Image) -> Option<[u32; 4]> {
+        self.dng_active_area_for_size(image.rows, image.columns)
+    }
+
+    pub(crate) fn dng_active_area_for_size(&self, rows: u32, columns: u32) -> Option<[u32; 4]> {
         let cname = cstr("ActiveImageArea");
         let mut sigma_rect = [0u32; 4];
         let mut area = sys::x3f_area16_t {
-            data: image.data.as_ptr() as *mut u16,
-            buf: ptr::null_mut(),
-            rows: image.rows,
-            columns: image.columns,
-            channels: image.channels,
-            row_stride: image.row_stride,
+            rows,
+            columns,
+            ..unsafe { std::mem::zeroed() }
         };
         let ok = unsafe {
             sys::x3f_get_camf_rect(

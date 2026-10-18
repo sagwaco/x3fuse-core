@@ -14,13 +14,19 @@ pub struct SceneLinearOptions {
     /// Lens shading; None uses the existing camera-specific default.
     pub apply_sgain: Option<bool>,
     /// Sensor denoising intensity, 0 through 10 (default 10).
+    /// X3I merge denoise also requires a positive `X3F_X3I_DENOISE_SCALE`.
     pub denoise_intensity: u8,
     /// Select GPU acceleration or portable CPU execution (default: Auto).
     pub denoise_backend: crate::DenoiseBackend,
     /// Algorithm and advanced sensor-space denoising controls.
     pub denoise_options: crate::DenoiseOptions,
     /// Reconstruct clipped sensor layers (default false).
+    /// An X3I merge ignores this option and keeps extended highlight values.
     pub highlight_recovery: bool,
+    /// X3I input: merge all frames (default) or use only the middle exposure.
+    /// The middle exposure honours `highlight_recovery` and denoise as for X3F.
+    /// No effect on X3F input.
+    pub x3i_source: crate::X3iSource,
 }
 
 impl Default for SceneLinearOptions {
@@ -32,6 +38,7 @@ impl Default for SceneLinearOptions {
             denoise_backend: crate::DenoiseBackend::Auto,
             denoise_options: crate::DenoiseOptions::default(),
             highlight_recovery: false,
+            x3i_source: crate::X3iSource::default(),
         }
     }
 }
@@ -80,7 +87,11 @@ pub struct SceneLinearImage {
 /// area. This reads metadata only; it neither decodes nor crops RAW samples.
 /// Missing framing metadata returns None (use the full active area).
 pub fn read_as_shot_crop(input: &Path) -> Result<Option<[f32; 4]>, Error> {
-    let mut reader = Reader::open(input)?;
+    let mut reader = if crate::is_x3i(input)? {
+        crate::X3iContainer::open(input)?.open_frame(0)?
+    } else {
+        Reader::open(input)?
+    };
     reader.load_camf()?;
     reader.load_property_list()?;
     // SAFETY: the fresh reader owns the directory and metadata throughout.
@@ -156,7 +167,30 @@ pub fn prepare_scene_linear(
         ));
     }
     on_stage(ConversionStage::Read);
-    let reader = Reader::open_with_control(input, control)?;
+    let container = if crate::is_x3i(input)? {
+        Some(crate::X3iContainer::open(input)?)
+    } else {
+        None
+    };
+    let middle = match &container {
+        Some(container) if options.x3i_source == crate::X3iSource::MiddleExposure => {
+            Some(container.middle_exposure_frame()?)
+        }
+        _ => None,
+    };
+    let denoise_scale = if container.is_some() && middle.is_none() {
+        crate::x3i_output::read_denoise_scale(options.denoise_intensity, options.denoise_options)?
+    } else {
+        0.0
+    };
+    let reader = match (&container, middle) {
+        (Some(container), Some(index)) => container.open_frame_with_control(index, control)?,
+        (Some(container), None) => container.open_frame(0)?,
+        _ => Reader::open_with_control(input, control)?,
+    };
+    // A middle exposure takes the single-frame path below, as an X3F does.
+    let container = container.filter(|_| middle.is_none());
+    let control = reader.with_control(control);
     on_stage(ConversionStage::Decode);
     control.check()?;
     // SAFETY: this call uniquely owns the fresh reader and all loaded sections.
@@ -183,8 +217,10 @@ pub fn prepare_scene_linear(
         .orientation
         .filter(|v| (1..=8).contains(v))
         .unwrap_or(1);
-    on_stage(ConversionStage::Process);
-    control.check()?;
+    if container.is_none() {
+        on_stage(ConversionStage::Process);
+        control.check()?;
+    }
     let cwb = crate::wb_cstring(Some(&wb))?;
     // SAFETY: RAW is still unprocessed, and the reader and WB name outlive the call.
     let color_mode_calibration = match unsafe {
@@ -194,6 +230,64 @@ pub fn prepare_scene_linear(
         Err(sys::Error::InvalidData(_)) => None,
         Err(error) => return Err(error.into()),
     };
+    if let Some(container) = container {
+        // Each frame must carry its own input window through preparation.
+        let merge_control = Control::new(cancel);
+        let process = crate::ProcessOptions {
+            fix_bad: options.fix_bad,
+            apply_sgain: options.apply_sgain,
+            denoise_intensity: options.denoise_intensity,
+            denoise_backend: options.denoise_backend,
+            denoise_options: options.denoise_options,
+            ..Default::default()
+        };
+        let mut merged = crate::x3i_output::merge_frames(
+            &container,
+            &reader,
+            &process,
+            merge_control,
+            &mut on_stage,
+            &mut Vec::new(),
+        )?;
+        if denoise_scale > 0.0 {
+            let mut image = crate::x3i_merge::to_image(&merged)?;
+            if crate::x3i_output::denoise(&mut image, &process, denoise_scale, merge_control)? {
+                crate::x3i_output::restore_denoised(&mut merged, &image, merge_control)?;
+            }
+        }
+        validate_matrix(&merged.camera_to_rgb)?;
+        let [top, left, bottom, right] = crate::x3i_output::bounds(&merged, &reader, true);
+        let mut data = Vec::with_capacity((bottom - top) as usize * (right - left) as usize * 3);
+        for row in top..bottom {
+            merge_control.check()?;
+            for col in left..right {
+                let offset = (row as usize * merged.width as usize + col as usize) * 3;
+                for value in crate::x3i_output::multiply(
+                    &merged.camera_to_rgb,
+                    &merged.bmt[offset..offset + 3],
+                ) {
+                    let value = value as f32;
+                    if !value.is_finite() {
+                        return Err(Error::InvalidData("nonfinite X3I scene RGB".into()));
+                    }
+                    data.push(value);
+                }
+            }
+        }
+        merge_control.check()?;
+        return Ok(SceneLinearImage {
+            data,
+            width: right - left,
+            height: bottom - top,
+            orientation,
+            white_balance: WhiteBalanceCalibration {
+                camera_to_rgb: merged.camera_to_rgb,
+                xyz_to_camera,
+                as_shot_neutral: color.neutral,
+            },
+            color_mode_calibration,
+        });
+    }
     // SAFETY: preparation consumes only this fresh reader's decoded buffers.
     let linear = unsafe {
         sys::get_scene_linear_controlled(

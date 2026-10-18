@@ -1228,6 +1228,74 @@ unsafe fn yuv_to_bmt(area: *mut Area16, dt: DType) {
 // process.rs and the two Quattro passes in quattro.rs).
 // ----------------------------------------------------------------------
 
+/// Denoise B, M and T channels with the Quattro profile. Other cameras are unsupported.
+/// Width and height use pixels. Row stride and slice length use u16 samples, not bytes.
+/// The slice length must equal height times row stride. Width times channels must
+/// not exceed row stride. Row padding is never changed.
+/// Scale multiplies `DenoiseOptions::strength`. Noise levels use 16-bit camera codes.
+/// Adjust scale for other code ranges. For X3I samples divided by S, divide scale by S.
+/// The bridge compresses all channels by four before filtering to avoid YUV overflow.
+/// It adds the filtered residual to the original codes in steps of four.
+/// This can cause bands in deep shadows. At X3I S=11.4, one code is about
+/// 0.00017 reference units and can be close to one noise standard deviation.
+/// Zero scale or disabled luminance and chroma leaves the data unchanged.
+/// Cancellation returns `Error::Cancelled` and leaves the input unchanged.
+/// Zero dimensions, channels other than three, invalid stride or length, arithmetic
+/// overflow, invalid denoise options, or a negative or nonfinite scale returns
+/// `Error::InvalidData`. Backend errors are returned by the selected kernel.
+pub fn denoise_u16(
+    data: &mut [u16],
+    width: u32,
+    height: u32,
+    channels: u32,
+    row_stride: u32,
+    scale: f32,
+    control: Control<'_>,
+) -> crate::Result<()> {
+    control.check()?;
+    let logical = width.checked_mul(channels);
+    let length = (height as usize).checked_mul(row_stride as usize);
+    if width == 0
+        || height == 0
+        || channels != 3
+        || logical.is_none_or(|n| n > row_stride)
+        || length != Some(data.len())
+        || !scale.is_finite()
+        || scale < 0.0
+    {
+        return Err(crate::Error::InvalidData("invalid u16 denoise raster"));
+    }
+    control
+        .denoise_options
+        .validate()
+        .map_err(crate::Error::InvalidData)?;
+    if scale == 0.0 || (!control.denoise_options.luminance && !control.denoise_options.chroma) {
+        return Ok(());
+    }
+    let mut compressed: Vec<u16> = data.iter().map(|v| v / 4).collect();
+    let mut area = Area16 {
+        data: compressed.as_mut_ptr(),
+        buf: std::ptr::null_mut(),
+        rows: height,
+        columns: width,
+        channels,
+        row_stride,
+    };
+    // SAFETY: the checks above cover each row. The kernel does not free this buffer.
+    unsafe { denoise_area_controlled(&mut area, DENOISE_F23, scale / 4.0, control) }?;
+    control.check()?;
+    for (row, filtered) in data
+        .chunks_exact_mut(row_stride as usize)
+        .zip(compressed.chunks_exact(row_stride as usize))
+    {
+        for (original, filtered) in row[..logical.unwrap() as usize].iter_mut().zip(filtered) {
+            let residual = (i32::from(*filtered) - i32::from(*original / 4)) * 4;
+            *original = sat_u16_i32(i32::from(*original) + residual);
+        }
+    }
+    Ok(())
+}
+
 /// BMT→YUV, full `denoise_nlm`, YUV→BMT (was the OpenCV `x3f_denoise`).
 ///
 /// # Safety
@@ -1344,6 +1412,93 @@ pub(crate) unsafe fn denoise_active_area(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn u16_bridge_validates_and_preserves_cancelled_or_disabled_input() {
+        use std::sync::atomic::AtomicBool;
+        let source: Vec<u16> = (0..8 * 8 * 3)
+            .map(|i| 3000 + (i * 71 % 200) as u16)
+            .collect();
+        let control = Control::none().with_denoise_backend(DenoiseBackend::Cpu);
+        let mut data = source.clone();
+        denoise_u16(&mut data, 8, 8, 3, 24, 0.0, control).unwrap();
+        assert_eq!(data, source);
+        for algorithm in [DenoiseAlgorithm::Nlm, DenoiseAlgorithm::Bm3d] {
+            let options = DenoiseOptions {
+                algorithm,
+                ..Default::default()
+            };
+            let selected = control.with_denoise_options(options).unwrap();
+            denoise_u16(&mut data, 8, 8, 3, 24, 0.3, selected).unwrap();
+            assert!(data.iter().all(|&v| (1000..6000).contains(&v)));
+        }
+        let before = data.clone();
+        let cancel = AtomicBool::new(true);
+        assert!(matches!(
+            denoise_u16(&mut data, 8, 8, 3, 24, 0.3, Control::new(&cancel)),
+            Err(crate::Error::Cancelled)
+        ));
+        assert_eq!(data, before);
+        for (width, height, channels, stride) in [
+            (0, 8, 3, 24),
+            (8, 0, 3, 24),
+            (8, 8, 2, 24),
+            (9, 8, 3, 24),
+            (8, 9, 3, 24),
+        ] {
+            assert!(matches!(
+                denoise_u16(&mut data, width, height, channels, stride, 0.3, control),
+                Err(crate::Error::InvalidData(_))
+            ));
+        }
+        assert!(denoise_u16(&mut data, 8, 8, 3, 24, f32::NAN, control).is_err());
+        let mut padded = vec![60000; 8 * 30];
+        for (row, input) in padded.chunks_exact_mut(30).zip(source.chunks_exact(24)) {
+            row[..24].copy_from_slice(input);
+        }
+        denoise_u16(&mut padded, 8, 8, 3, 30, 0.3, control).unwrap();
+        for row in padded.chunks_exact(30) {
+            assert!(row[..24].iter().all(|&v| (1000..6000).contains(&v)));
+            assert_eq!(&row[24..], &[60000; 6]);
+        }
+        for (length, stride) in [(8 * 23, 23), (8 * 24 + 1, 24)] {
+            let mut invalid = vec![3000; length];
+            assert!(matches!(
+                denoise_u16(&mut invalid, 8, 8, 3, stride, 0.3, control),
+                Err(crate::Error::InvalidData(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn u16_bridge_preserves_full_range_and_smooth_shadows() {
+        let control = Control::none().with_denoise_backend(DenoiseBackend::Cpu);
+        for algorithm in [DenoiseAlgorithm::Nlm, DenoiseAlgorithm::Bm3d] {
+            let control = control
+                .with_denoise_options(DenoiseOptions {
+                    algorithm,
+                    ..Default::default()
+                })
+                .unwrap();
+            let mut bright = vec![60001; 8 * 8 * 3];
+            denoise_u16(&mut bright, 8, 8, 3, 24, 0.3, control).unwrap();
+            assert_eq!(bright, vec![60001; 8 * 8 * 3]);
+            let mut dark: Vec<u16> = (0..8)
+                .flat_map(|_| (0..32).flat_map(|x| [256 + x; 3]))
+                .collect();
+            let original = dark.clone();
+            denoise_u16(&mut dark, 32, 8, 3, 96, 0.0, control).unwrap();
+            assert_eq!(dark, original);
+            denoise_u16(&mut dark, 32, 8, 3, 96, 0.3, control).unwrap();
+            for row in dark.chunks_exact(96) {
+                for pair in row.chunks_exact(3).collect::<Vec<_>>().windows(2) {
+                    for c in 0..3 {
+                        assert!(pair[0][c].abs_diff(pair[1][c]) <= 4);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn advanced_settings_validate_and_disabled_planes_are_exact() {

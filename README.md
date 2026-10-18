@@ -75,13 +75,18 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 
 | Flag         | Output                          |
 | ------------ | ------------------------------- |
-| `-dng`       | DNG `LinearRaw` (**default**)   |
-| `-tiff`      | 3×16-bit TIFF                   |
-| `-ppm`       | 3×16-bit PPM/P6 (binary)        |
-| `-ppm-ascii` | 3×16-bit PPM/P3 (ASCII)         |
+| `-dng`       | DNG `LinearRaw` (**default**). Merge all frames for X3I input. Process X3I inputs serially; keep X3F batch conversion parallel.   |
+| `-tiff`      | 3×16-bit TIFF, including merged X3I RGB |
+| `-ppm`       | 3×16-bit PPM/P6 (binary), including merged X3I RGB |
+| `-ppm-ascii` | 3×16-bit PPM/P3 (ASCII), including merged X3I RGB |
 | `-jpg`       | embedded JPEG preview           |
 | `-raw`       | RAW area, undecoded             |
 | `-meta`      | metadata dump                   |
+| `-x3i-frame <n>` | Convert frame `n` of an X3I input (zero based). Append `_<n>` before the output extension. |
+| `-x3i-middle` | Convert only the middle exposure of an X3I input, as `-x3i-frame <n>` does for that frame. Append `_<n>` before the output extension. Excludes `-x3i-frame`, `-x3i-extract` and `-x3i-report`. |
+| `-x3i-ghost-map` | With an X3I DNG, TIFF or PPM merge, write each non-reference ghost-weight image as `<input>.ghost<n>.pgm`. Honour `-o`. |
+| `-x3i-report` | With X3I `-dng`, write estimated sensor ceilings, raw-plane ratios in eight reference-level bins, noise, clipping, merge counts and peak RSS to `<input>.x3i-report`. |
+| `-x3i-extract` | Copy all X3I frames to new `<stem>_<n>.X3F` files. Use `-o` to select a directory. Excludes output flags. |
 | `-histogram` | histogram CSV                   |
 | `-loghist`   | histogram CSV with log exposure |
 
@@ -113,6 +118,32 @@ x3f_extract <switches> <file1.X3F> [file2.X3F ...]
 | `-matrixmax <M>`          | max matrix elements in metadata dump (default 100)                                 |
 
 A few `X3F_*` environment variables tune specific stages, e.g. `X3F_CINEON_SCALE` (Cineon log-curve scale; default 100) and `X3F_DNG_SHOULDER_KNEE` (highlight-recovery knee; default `0.85`).
+
+X3I merges support DNG, TIFF and PPM. DNG preserves extended highlight range.
+TIFF and PPM clip output above one and skip the RGB chroma LUT and single-frame
+highlight recovery. X3I post-merge denoise stays off unless
+`X3F_X3I_DENOISE_SCALE` is positive, even with the default CLI denoise intensity.
+Residual quantization can cause deep-shadow bands.
+See [X3I merge and outputs](docs/src/x3i.md) and the
+[denoise measurements](docs/src/x3i.md#experimental-denoise).
+A merge of the tested Quattro captures needs 2 to 3 GB of memory; see
+[X3I memory](docs/src/x3i.md#memory).
+
+| X3I environment override | Effect |
+| --- | --- |
+| `X3F_X3I_NOISE=sigma,k,q` | Set normalized read, linear and quadratic noise terms. |
+| `X3F_X3I_MAX_S=value` | Cap highlight encoding scale; report clipped samples. |
+| `X3F_X3I_SATURATION=b,m,t` | Override per-plane physical sensor ceilings. |
+| `X3F_X3I_ROLLOFF=knee,width,margin` | Set knee, width and validity margin relative to the ceiling. Defaults: `0.75,0.02,0.15`. |
+| `X3F_X3I_NO_ALIGN=1` | Disable frame alignment. Merge frames at their original positions. |
+| `X3F_X3I_FIXED_RATIOS=1` | Keep nominal shutter ratios. Report fitted ratios without applying them. |
+| `X3F_X3I_NO_GHOST=1` | Disable ghost rejection and effective-variance calibration. |
+| `X3F_X3I_GHOST_SIGMA=value` | Set the positive ghost threshold in sigma. Default: `3`. |
+| `X3F_X3I_WEAK_GHOST_SIGMA=value` | Set the weak-alignment ghost threshold. Default: GHOST_SIGMA; see [controls](docs/src/x3i.md#research-overrides). |
+| `X3F_X3I_C_MAX=value` | Set the finite effective-variance upper clamp. Default: `4`; at least C_MIN. |
+| `X3F_X3I_C_MIN=value` | Set the effective-variance calibration floor. Default: `0.5`; range: above zero through one. |
+| `X3F_X3I_RATIO_TREND=value` | Set the maximum relative trend across clean supported ratio bins. Default: `0.02` (2 percent). Larger trends keep the nominal ratio. |
+| `X3F_X3I_DENOISE_SCALE=value` | Positive enables experimental post-merge NLM or BM3D; unset or zero disables it. |
 
 ### Examples
 
