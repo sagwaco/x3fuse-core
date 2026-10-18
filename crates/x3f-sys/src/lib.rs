@@ -52,7 +52,7 @@ mod _wasm_c_shim_anchors {
 
 // Rust NLM and BM3D denoising, called directly by the pipeline on every target.
 mod denoise;
-pub use denoise::{DenoiseAlgorithm, DenoiseBackend, DenoiseOptions, NlmOptions};
+pub use denoise::{denoise_u16, DenoiseAlgorithm, DenoiseBackend, DenoiseOptions, NlmOptions};
 
 // Native Rust replacement for `x3f_expand_quattro`. The legacy C symbol of
 // the same name in `src/x3f_process.c` resolves to this `#[no_mangle] extern
@@ -199,12 +199,15 @@ pub(crate) mod spp_denoise;
 // recovery family. preprocess_data / convert_data / convert entry
 // points remain C until later phases.
 mod color_modes;
+mod merge_frame;
+pub use merge_frame::MergeFrame;
 mod process;
 pub use color_modes::{
     available_color_modes, color_mode_linear_tone_lut, color_mode_tone_index, color_mode_tone_lut,
     resolve_color_mode, ColorMode, ColorModeCalibration, ColorModeColorDq, ColorModeParameters,
     ColorModeRenderLuts, ColorModeSensor, ColorModeToneParameters,
 };
+pub use process::get_merge_frame_controlled;
 pub use process::{
     color_mode_calibration, get_image_controlled, get_preview_controlled,
     get_scene_linear_controlled, x3f_get_bmt_to_xyz, x3f_get_digital_iso_gain,

@@ -19,6 +19,7 @@ gpu = ["x3f-core/gpu"]
 
 [dependencies]
 x3f-core.workspace = true
+libc = "0.2"
 # M7b: rayon par_iter over args.files for batch-mode parallelism. Each
 # top-level worker runs one file end-to-end (decode → process → write)
 # so the per-image thread-local DNG_HIGHLIGHT_SCALE in x3f-sys stays

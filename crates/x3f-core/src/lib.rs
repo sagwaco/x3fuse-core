@@ -35,6 +35,7 @@ use std::ptr::NonNull;
 
 use thiserror::Error;
 use x3f_sys as sys;
+pub use x3f_sys::MergeFrame;
 pub use x3f_sys::{ColorMode, DenoiseAlgorithm, DenoiseBackend, DenoiseOptions, NlmOptions};
 // Shadow the external libc crate with x3f-sys's compat shim. On every
 // target except wasm32-unknown-unknown this is `pub use libc::*;`; on
@@ -43,11 +44,16 @@ pub use x3f_sys::{ColorMode, DenoiseAlgorithm, DenoiseBackend, DenoiseOptions, N
 use x3f_sys::sysabi as libc;
 
 mod conversion;
+mod frame_export;
 mod globals;
 mod icc;
 mod image;
 pub mod output;
 mod scene;
+mod x3i;
+pub mod x3i_align;
+pub mod x3i_merge;
+mod x3i_output;
 
 pub use conversion::{convert_file, ConversionReport, ConversionStage, OutputFormat};
 pub use globals::{
@@ -60,6 +66,7 @@ pub use scene::{
     prepare_scene_linear, read_as_shot_crop, SceneLinearImage, SceneLinearOptions,
     WhiteBalanceCalibration,
 };
+pub use x3i::{frame_ev, is_x3i, FrameEntry, X3iContainer};
 
 /// Color space the processed RGB output is converted to.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +121,22 @@ impl DngHighlightMapping {
     }
 }
 
+/// Which X3I data a conversion uses. X3F input ignores this choice.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
+pub enum X3iSource {
+    /// Merge all frames into one extended-range image.
+    #[default]
+    Merge,
+    /// Process only the middle exposure frame, as `-x3i-frame <n>` does.
+    /// See [`X3iContainer::middle_exposure_frame`].
+    MiddleExposure,
+}
+
 /// Per-conversion processing options. Mirrors the parameters of the legacy
 /// `x3f_dump_*` C entry points.
 #[derive(Debug, Clone)]
@@ -146,6 +169,7 @@ pub struct ProcessOptions {
     /// intermediate values linearly attenuate filter strength
     /// (`scale = intensity / 10`). Values above 10 are clamped. Backed by the
     /// selected NLM/BM3D algorithm with portable Rust and optional GPU backends.
+    /// X3I denoise also requires a positive `X3F_X3I_DENOISE_SCALE`.
     pub denoise_intensity: u8,
     /// Select GPU acceleration or portable CPU execution (default: Auto).
     /// Enable the `gpu` Cargo feature for native acceleration. Auto falls back
@@ -215,6 +239,12 @@ pub struct ProcessOptions {
     /// Cineon film-print, 50 ≈ moderate log; larger is flatter still at
     /// the cost of shadow noise).
     pub cineon: bool,
+    /// X3I input: merge all frames (default) or use only the middle exposure.
+    /// The middle exposure follows the single-frame rules for color modes,
+    /// the Merrill pipeline, highlight recovery and embedded JPEG output. No effect on X3F input.
+    pub x3i_source: X3iSource,
+    /// Return research X3I ghost maps in ConversionReport. The default is false.
+    pub x3i_ghost_maps: bool,
 }
 
 impl Default for ProcessOptions {
@@ -236,6 +266,8 @@ impl Default for ProcessOptions {
             dng_highlight_recovery: false,
             dng_highlight_mapping: DngHighlightMapping::default(),
             cineon: false,
+            x3i_source: X3iSource::default(),
+            x3i_ghost_maps: false,
         }
     }
 }
@@ -348,6 +380,7 @@ fn path_to_cstring(path: &Path) -> Result<CString, Error> {
 pub struct Reader {
     file: NonNull<libc::FILE>,
     x3f: NonNull<sys::x3f_t>,
+    window: Option<(u64, u64)>,
     /// When constructed via [`Reader::from_bytes`], holds the heap
     /// copy of the input buffer that the FILE* reads through. The
     /// field is dropped after `x3f_delete` + `fclose` in [`Drop`],
@@ -422,6 +455,7 @@ impl Reader {
         Ok(Reader {
             file,
             x3f,
+            window: None,
             _backing: Some(owned),
         })
     }
@@ -432,6 +466,25 @@ impl Reader {
     }
 
     fn open_with_control(path: &Path, control: sys::Control<'_>) -> Result<Self, Error> {
+        Self::open_window(path, None, control)
+    }
+
+    pub(crate) fn with_control<'a>(&self, control: sys::Control<'a>) -> sys::Control<'a> {
+        match self.window {
+            Some((base, length)) => control.with_window(base, length),
+            None => control,
+        }
+    }
+
+    pub(crate) fn open_window(
+        path: &Path,
+        window: Option<(u64, u64)>,
+        control: sys::Control<'_>,
+    ) -> Result<Self, Error> {
+        let control = match window {
+            Some((base, length)) => control.with_window(base, length),
+            None => control,
+        };
         control.check()?;
         #[cfg(not(windows))]
         let file_ptr = {
@@ -459,6 +512,17 @@ impl Reader {
                 source: std::io::Error::last_os_error(),
             });
         };
+        if window.is_none() {
+            let mut magic = [0u8; 4];
+            // SAFETY: file is open and magic has space for four bytes.
+            let count = unsafe { libc::fread(magic.as_mut_ptr().cast(), 1, 4, file.as_ptr()) };
+            if count == 4 && &magic == b"FOVi" {
+                unsafe { libc::fclose(file.as_ptr()) };
+                return Err(Error::InvalidData(
+                    "X3I input requires X3iContainer::open_frame".into(),
+                ));
+            }
+        }
         // SAFETY: file is a valid open FILE* that x3f_new_from_file may read
         // from. The library does not take ownership; we keep the FILE* alive
         // for the lifetime of Reader. libc::FILE and bindgen's FILE are both
@@ -482,6 +546,7 @@ impl Reader {
         Ok(Reader {
             file,
             x3f,
+            window,
             _backing: None,
         })
     }
@@ -497,7 +562,14 @@ impl Reader {
             return Err(Error::Library(LibraryError::Argument));
         }
         // SAFETY: x3f and de are non-null and valid.
-        unsafe { sys::load_data(self.x3f.as_ptr(), de, sys::Control::none()) }.map_err(Into::into)
+        unsafe {
+            sys::load_data(
+                self.x3f.as_ptr(),
+                de,
+                self.with_control(sys::Control::none()),
+            )
+        }
+        .map_err(Into::into)
     }
 
     /// Decode the embedded JPEG thumbnail into memory.
@@ -542,7 +614,14 @@ impl Reader {
             return Err(Error::Library(LibraryError::Argument));
         }
         // SAFETY: de is non-null.
-        unsafe { sys::load_data(self.x3f.as_ptr(), de, sys::Control::none()) }.map_err(Into::into)
+        unsafe {
+            sys::load_data(
+                self.x3f.as_ptr(),
+                de,
+                self.with_control(sys::Control::none()),
+            )
+        }
+        .map_err(Into::into)
     }
 
     /// Load the RAW image block without decoding (used for `-raw` dump).
@@ -553,8 +632,14 @@ impl Reader {
             return Err(Error::Library(LibraryError::Argument));
         }
         // SAFETY: de is non-null.
-        unsafe { sys::load_image_block(self.x3f.as_ptr(), de, sys::Control::none()) }
-            .map_err(Into::into)
+        unsafe {
+            sys::load_image_block(
+                self.x3f.as_ptr(),
+                de,
+                self.with_control(sys::Control::none()),
+            )
+        }
+        .map_err(Into::into)
     }
 
     /// Dump the metadata to a file (textual format matching the legacy CLI).
@@ -700,7 +785,7 @@ impl Reader {
                     rgb_chroma_lut: opts.rgb_chroma_lut,
                     ..sys::ProcessingOptions::default()
                 },
-                sys::Control::none()
+                self.with_control(sys::Control::none())
                     .with_denoise_backend(opts.denoise_backend)
                     .with_denoise_options(opts.denoise_options)?,
             )

@@ -16,6 +16,10 @@ pub enum OutputFormat {
     Dng,
     /// Processed 16-bit TIFF.
     Tiff,
+    /// Processed 16-bit binary PPM.
+    Ppm,
+    /// Processed 16-bit ASCII PPM.
+    PpmAscii,
     /// The camera's embedded JPEG, without re-encoding.
     Jpeg,
 }
@@ -38,6 +42,8 @@ pub enum ConversionStage {
 pub struct ConversionReport {
     /// Human-readable warnings, for example a missing matching DNG opcode.
     pub warnings: Vec<String>,
+    /// Research X3I ghost maps. Empty unless ProcessOptions::x3i_ghost_maps is true.
+    pub ghost_maps: Vec<crate::x3i_merge::GhostMap>,
 }
 
 /// Convert one image into exactly `output`, which must not already exist.
@@ -77,10 +83,33 @@ pub fn convert_file(
     let result = (|| {
         on_stage(ConversionStage::Read);
         control.check()?;
-        let reader = Reader::open_with_control(input, control)?;
+        let mut middle = None;
+        if crate::is_x3i(input)? {
+            if options.x3i_source == crate::X3iSource::MiddleExposure {
+                let container = crate::X3iContainer::open(input)?;
+                let index = container.middle_exposure_frame()?;
+                middle = Some((index, container.frame_exposure_us(index)?, container));
+            } else if format == OutputFormat::Jpeg {
+                return Err(Error::InvalidData(
+                    "X3I embedded JPEG output requires a selected frame".into(),
+                ));
+            } else {
+                return convert_x3i(input, output, format, options, control, &mut on_stage);
+            }
+        }
+        let reader = match &middle {
+            Some((index, _, container)) => container.open_frame_with_control(*index, control)?,
+            None => Reader::open_with_control(input, control)?,
+        };
+        let control = reader.with_control(control);
         on_stage(ConversionStage::Decode);
         control.check()?;
         let mut report = ConversionReport::default();
+        if let Some((index, shutter_us, _)) = &middle {
+            report.warnings.push(format!(
+                "X3I middle exposure: frame {index} shutter_us={shutter_us}"
+            ));
+        }
 
         // SAFETY: the reader uniquely owns its parsed section directory for
         // this entire call. load_data checks ranges and frees failed allocations.
@@ -143,6 +172,17 @@ pub fn convert_file(
                 )
                 .map_err(|error| output_error(output, error))?;
             }
+            OutputFormat::Ppm | OutputFormat::PpmAscii => {
+                let image = reader.get_image_with_control(options, control)?;
+                on_stage(ConversionStage::Write);
+                crate::output::ppm::write_controlled(
+                    &image,
+                    output,
+                    format == OutputFormat::Ppm,
+                    control,
+                )
+                .map_err(|error| output_error(output, error))?;
+            }
             OutputFormat::Jpeg => {
                 on_stage(ConversionStage::Write);
                 control.check()?;
@@ -184,6 +224,144 @@ pub fn convert_file(
     result
 }
 
+fn convert_x3i(
+    input: &Path,
+    output: &Path,
+    format: OutputFormat,
+    options: &ProcessOptions,
+    control: Control<'_>,
+    on_stage: &mut impl FnMut(ConversionStage),
+) -> Result<ConversionReport, Error> {
+    use crate::{output::dng, x3i_output, X3iContainer};
+
+    let denoise_scale =
+        x3i_output::read_denoise_scale(options.denoise_intensity, options.denoise_options)?;
+    let container = X3iContainer::open(input)?;
+    let frame0 = container.open_frame(0)?;
+    let mut report = ConversionReport::default();
+    on_stage(ConversionStage::Decode);
+    let frame0_control = frame0.with_control(control);
+    frame0_control.check()?;
+    // SAFETY: frame0 owns these sections and its input window.
+    unsafe {
+        let x3f = frame0.x3f.as_ptr();
+        let property = sys::x3f_get_prop(x3f);
+        if !property.is_null() {
+            sys::load_data(x3f, property, frame0_control)?;
+        }
+        sys::load_data(x3f, sys::x3f_get_camf(x3f), frame0_control)?;
+        if options.color_mode.is_some() {
+            // Color Mode calibration needs the unprocessed RAW samples.
+            sys::load_data(x3f, sys::x3f_get_raw(x3f), frame0_control)?;
+        }
+    }
+    let inputs = if format == OutputFormat::Dng {
+        Some(dng::WriterInputs::resolve(
+            &frame0,
+            options,
+            frame0_control,
+            &mut report.warnings,
+        )?)
+    } else {
+        None
+    };
+    let rendering = if format != OutputFormat::Dng {
+        Some(x3i_output::Rendering::resolve(
+            &frame0,
+            options,
+            frame0_control,
+            &mut report.warnings,
+        )?)
+    } else {
+        None
+    };
+    let process = inputs.as_ref().map_or(options, |inputs| &inputs.opts);
+    let mut scene = x3i_output::merge_frames(
+        &container,
+        &frame0,
+        process,
+        control,
+        on_stage,
+        &mut report.warnings,
+    )?;
+    for ((index, exposure), scale) in scene
+        .report
+        .frame_indices
+        .iter()
+        .zip(&scene.report.exposure_us)
+        .zip(&scene.report.scales)
+    {
+        report.warnings.push(format!(
+            "X3I frame {index}: shutter_us={exposure} scale={scale:.12}"
+        ));
+    }
+    report.warnings.push(format!(
+        "X3I saturation: B={:.9} M={:.9} T={:.9}",
+        scene.report.saturation[0], scene.report.saturation[1], scene.report.saturation[2],
+    ));
+    report.warnings.push(format!(
+        "X3I merge: frames={} s={:.12} fallback_best_snr={} fallback_shortest={} fallback_zero={} clipped_samples={} minimum={:.17} maximum={:.17}",
+        scene.report.frames_used, scene.s, scene.report.fallback_best_snr,
+        scene.report.fallback_shortest, scene.report.fallback_zero, scene.report.clipped_samples,
+        scene.report.minimum, scene.report.maximum,
+    ));
+    report.ghost_maps = std::mem::take(&mut scene.ghost_maps);
+    report.warnings.extend(scene.report.statistics());
+    report.warnings.extend(scene.report.warnings());
+    let mut image = crate::x3i_merge::to_image(&scene)?;
+    let denoised = x3i_output::denoise(&mut image, options, denoise_scale, control)?;
+    if options.denoise_intensity > 0
+        && (options.denoise_options.luminance || options.denoise_options.chroma)
+        && !denoised
+    {
+        report.warnings.push("X3I denoise is off; set X3F_X3I_DENOISE_SCALE=0.3 to enable the experimental post-merge filter".into());
+    }
+    if let Some(rendering) = rendering {
+        if denoised {
+            x3i_output::restore_denoised(&mut scene, &image, control)?;
+        }
+        image = rendering.render(&scene, &frame0, options.crop, control)?;
+    }
+    drop(scene);
+    on_stage(ConversionStage::Write);
+    control.check()?;
+    match format {
+        OutputFormat::Dng => dng::write_prepared(
+            &frame0,
+            inputs.unwrap(),
+            image,
+            output,
+            control,
+            &mut report.warnings,
+            true,
+        )?,
+        OutputFormat::Tiff => {
+            let profile = crate::icc::processed_profile(options.color_encoding, options.cineon);
+            crate::output::tiff::write_controlled(
+                &image,
+                output,
+                options.compress,
+                profile.as_deref(),
+                dng::exif::CaptureMetadata::from_reader(&frame0)
+                    .orientation
+                    .unwrap_or(1),
+                control,
+            )
+            .map_err(|error| output_error(output, error))?;
+        }
+        OutputFormat::Ppm | OutputFormat::PpmAscii => crate::output::ppm::write_controlled(
+            &image,
+            output,
+            format == OutputFormat::Ppm,
+            control,
+        )
+        .map_err(|error| output_error(output, error))?,
+        OutputFormat::Jpeg => unreachable!("X3I JPEG requires a selected frame"),
+    }
+    control.check()?;
+    Ok(report)
+}
+
 pub(crate) fn check_io(control: Control<'_>) -> io::Result<()> {
     control
         .check()
@@ -223,6 +401,43 @@ mod tests {
         }
         bytes.extend_from_slice(&directory.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn x3i_formats_fail_before_parsing_and_preserve_destinations() {
+        let input = std::env::temp_dir().join(format!("x3i-formats-{}.bin", std::process::id()));
+        let output = input.with_extension("out");
+        std::fs::write(&input, b"FOVi").unwrap();
+        let cancel = AtomicBool::new(false);
+        {
+            let format = OutputFormat::Jpeg;
+            let error = convert_file(
+                &input,
+                &output,
+                format,
+                &ProcessOptions::default(),
+                &cancel,
+                |_| {},
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, Error::InvalidData(ref message) if message == "X3I embedded JPEG output requires a selected frame")
+            );
+            assert!(!output.exists());
+        }
+        std::fs::write(&output, b"keep").unwrap();
+        assert!(convert_file(
+            &input,
+            &output,
+            OutputFormat::Dng,
+            &ProcessOptions::default(),
+            &cancel,
+            |_| panic!("reserved destination must fail first")
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"keep");
+        std::fs::remove_file(output).unwrap();
+        std::fs::remove_file(input).unwrap();
     }
 
     #[test]
