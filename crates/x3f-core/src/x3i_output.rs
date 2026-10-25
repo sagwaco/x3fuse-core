@@ -336,7 +336,9 @@ mod tests {
         for word in [0x20000u32, 1, 24, 24, u32::from_le_bytes(*b"PROP"), 48] {
             bytes.extend(word.to_le_bytes());
         }
-        let reader = Reader::from_bytes(&bytes).unwrap();
+        let input = std::env::temp_dir().join(format!("x3i-render-{}.x3f", std::process::id()));
+        std::fs::write(&input, &bytes).unwrap();
+        let reader = Reader::open(&input).unwrap();
         let scene = MergedScene {
             bmt: vec![0.25, 0.25, 1.0, -1.0, 2.0, 3.0],
             width: 2,
@@ -389,6 +391,8 @@ mod tests {
             rendering.render(&scene, &reader, false, Control::new(&cancelled)),
             Err(Error::Cancelled)
         ));
+        drop(reader);
+        std::fs::remove_file(input).unwrap();
     }
 
     #[test]

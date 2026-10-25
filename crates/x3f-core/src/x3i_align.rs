@@ -2296,6 +2296,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "6192 by 4128 memory and timing measurement; run in release mode"]
     fn measure_full_frame() {
