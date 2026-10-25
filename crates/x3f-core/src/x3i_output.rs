@@ -125,13 +125,13 @@ pub(crate) fn restore_denoised(
     Ok(())
 }
 
-pub(crate) fn bounds(scene: &MergedScene, reader: &Reader, crop: bool) -> [u32; 4] {
-    if crop {
-        if let Some(active) = reader.dng_active_area_for_size(scene.height, scene.width) {
+pub(crate) fn bounds(height: u32, width: u32, active: Option<[u32; 4]>) -> [u32; 4] {
+    if let Some(active @ [top, left, bottom, right]) = active {
+        if top < bottom && left < right && bottom <= height && right <= width {
             return active;
         }
     }
-    [0, 0, scene.height, scene.width]
+    [0, 0, height, width]
 }
 
 pub(crate) fn multiply(matrix: &[f64; 9], pixel: &[f32]) -> [f64; 3] {
@@ -270,7 +270,12 @@ impl Rendering {
         crop: bool,
         control: Control<'_>,
     ) -> Result<Image, Error> {
-        let [top, left, bottom, right] = bounds(scene, reader, crop);
+        let active = if crop {
+            reader.dng_active_area_for_size(scene.height, scene.width)
+        } else {
+            None
+        };
+        let [top, left, bottom, right] = bounds(scene.height, scene.width, active);
         let mut data = Vec::with_capacity((bottom - top) as usize * (right - left) as usize * 3);
         let matrix = if self.native {
             self.matrix
@@ -323,6 +328,24 @@ impl Rendering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crop_bounds_use_the_full_raster_for_invalid_rectangles() {
+        assert_eq!(bounds(100, 100, Some([10, 20, 90, 80])), [10, 20, 90, 80]);
+        for active in [
+            None,
+            Some([10, 80, 90, 20]),
+            Some([90, 20, 10, 80]),
+            Some([10, 20, 10, 80]),
+            Some([10, 20, 90, 20]),
+            Some([0, 0, 101, 100]),
+            Some([0, 0, 100, 101]),
+            Some([0, 0, u32::MAX, u32::MAX]),
+        ] {
+            assert_eq!(bounds(100, 100, active), [0, 0, 100, 100]);
+        }
+    }
+
     #[test]
     fn rendered_samples_use_the_camera_matrix_transfer_and_clip() {
         let mut bytes = b"FOVb".to_vec();

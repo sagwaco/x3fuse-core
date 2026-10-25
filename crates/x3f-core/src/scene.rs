@@ -256,7 +256,11 @@ pub fn prepare_scene_linear(
             }
         }
         validate_matrix(&merged.camera_to_rgb)?;
-        let [top, left, bottom, right] = crate::x3i_output::bounds(&merged, &reader, true);
+        let [top, left, bottom, right] = crate::x3i_output::bounds(
+            merged.height,
+            merged.width,
+            reader.dng_active_area_for_size(merged.height, merged.width),
+        );
         let mut data = Vec::with_capacity((bottom - top) as usize * (right - left) as usize * 3);
         for row in top..bottom {
             merge_control.check()?;
