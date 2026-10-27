@@ -152,7 +152,7 @@ pub struct ColorModeCalibration {
     pub wb_gain: [f64; 3],
     /// For x in [0,1], gained input is (x * this + count_offset) * wb_gain.
     pub normalized_to_counts: [f64; 3],
-    /// Merrill legacy-black to trimmed-black shift, before WB gain.
+    /// Native black offset in count units, before WB gain.
     pub count_offset: [f64; 3],
     pub iso_gain: f64,
     /// Apply after linear tone, before output transfer.
@@ -208,21 +208,13 @@ pub(crate) unsafe fn sensor(x3f: *mut x3f_t) -> Result<ColorModeSensor> {
         return Ok(ColorModeSensor::Merrill);
     }
     // The directory image type identifies Quattro before RAW decode. PROP is absent.
+    // sd Quattro and H share the dp Quattro tone and creative stages.
+    unsafe { crate::process::sd_quattro_camera(x3f) }?;
     let raw = unsafe { x3f_get_raw(x3f) };
     if !raw.is_null()
         && matches!(
             unsafe { (*raw).header.data_subsection.image_data.type_format },
-            0x0001_0025 | 0x0001_0027
-        )
-    {
-        return Err(Error::InvalidData(
-            "sd Quattro and sd Quattro H color modes require their sensor calibration port",
-        ));
-    }
-    if !raw.is_null()
-        && matches!(
-            unsafe { (*raw).header.data_subsection.image_data.type_format },
-            0x0001_0023
+            0x0001_0023 | 0x0001_0025 | 0x0001_0027
         )
         && unsafe { (*x3f).header.version } >= 0x0003_0000
     {
@@ -261,7 +253,11 @@ unsafe fn properties<'a>(x3f: *mut x3f_t, list: &CStr) -> Result<Vec<(&'a CStr, 
         .collect()
 }
 
-unsafe fn float_matrix(x3f: *mut x3f_t, key: &CStr, shape: &[usize]) -> Result<Vec<f64>> {
+pub(crate) unsafe fn float_matrix(
+    x3f: *mut x3f_t,
+    key: &CStr,
+    shape: &[usize],
+) -> Result<Vec<f64>> {
     let (mut a, mut b, mut data) = (0, 0, ptr::null_mut());
     if unsafe {
         x3f_get_camf_matrix_var(
@@ -540,6 +536,11 @@ pub unsafe fn resolve_color_mode(
         ));
     }
     unsafe { crate::process::color_mode_base_calibration(x3f, ptr::null_mut(), sensor) }?;
+    // Export rejects an sd Quattro gained range past the native count clamp.
+    let mut maximum = [0; 3];
+    if unsafe { x3f_get_max_raw(x3f, maximum.as_mut_ptr()) } != 0 {
+        unsafe { crate::process::sd_quattro_preprocess(x3f, maximum) }?;
+    }
     if sensor == ColorModeSensor::Merrill {
         unsafe { crate::process::merrill_color_dq(x3f) }?;
     }
@@ -774,7 +775,7 @@ mod tests {
                 std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../x3f_test_files")
             });
         let mut checked = 0;
-        for name in ["sigma_sd1_merrill_15.x3f", "_SDI8284.X3F"] {
+        for name in ["sigma_sd1_merrill_15.x3f", "_SDI8284.X3F", "SDQH5087.X3F"] {
             let path = root.join(name);
             if !path.exists() {
                 continue;

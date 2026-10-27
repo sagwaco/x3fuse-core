@@ -33,12 +33,65 @@ ColorDQ, native count bounds and rounding, integer tone, Q12 output conversion
 and output gamma. It can differ from the raw reader's approximate profile
 render. There is no second reconstruction or denoise pass.
 
-Merrill supports six modes. Supported dp Quattro files support eleven. The
-shared resolver rejects sd Quattro and sd Quattro H until their sensor
-calibration is ported. Missing calibration does not produce an identity look.
+Merrill supports six modes. Supported dp Quattro, sd Quattro and sd Quattro H
+files support eleven. Missing calibration does not produce an identity look.
 Sigma HP correction is OFF for this native baseline. DNG highlight recovery
 is a separate setting. The real dp2 Quattro count-12 PictureMode resolves
 AsShot to Standard without fallback; the two DNG selections are byte-equal.
+
+## sd Quattro and sd Quattro H
+
+The RAW type and CAMERAID must agree: type 0x10025 with CAMERAID 40 is
+sd Quattro, and type 0x10027 with CAMERAID 41 is sd Quattro H. A mismatch is
+an error. SPP processes sd Quattro with lib95 (Quattro) and sd Quattro H
+with lib92 (Tiger). Static native evidence for these rules:
+
+- Preprocess gives counts
+  `min(DIG * (raw - RawOffset) * 100 / SensorISO, 65535)`. DIG is the CAMF
+  `DigitalISOGain`. Only lib92 reads it; it is unity for sd Quattro.
+  A missing RawOffset is 2048 for sd Quattro and 256 for sd Quattro H. A
+  missing or zero SensorISO is 100. The port maps the normalized sample `x` to
+  `g * (x * (max - black) + black - RawOffset)`, where `g = DIG * 100 /
+  SensorISO` and `black` is the measured black. The small count offset is
+  nonzero. DIG does not go into the WB or ISO gains. A gain whose sensor
+  range exceeds the 65535 clamp is rejected, because the linear matrix
+  cannot express the clamp. The exact boundary is accepted.
+- The color path uses the GatherParams WB copy B: TempGainFact * WB gains,
+  normalized by green. It does not use copy A, which also contains the
+  `_HI`/`_BR_3COL_HI` sensor adjustment. Fluorescent applies the native
+  F-number table (sd Quattro) or CAMF FnumberGainTable (sd Quattro H). A
+  missing sd Quattro H table is unity. A missing EXIF FNumber or a malformed
+  table is an error; the port does not copy any native fallback.
+- dp Quattro keeps its pinned convention: minimum-normalized WB, measured
+  black as the native black and unit scale. lib95 also subtracts RawOffset
+  there. Changing this would change the pinned outputs.
+- Tone, per-mode tone rows, contrast compensation and the TealAndOrange
+  override use the same operations and constants in lib92 and lib95. The
+  comparison normalizes relocated addresses, branch targets, assert paths
+  and line numbers. The only extra lib92 tone
+  gate (priMakeToneLUT +0x5d8) selects progress reporting, not tone math.
+
+These are static results. The managed C# bodies are stubs, so a managed
+pre-pass cannot be excluded. There are no SPP image captures for these
+bodies, so runtime SPP parity is not established.
+
+Limits:
+
+- Only the full-resolution (HI) layout of the corpus is validated. No
+  LOW or MED file was available. The port has no layout gate.
+- All local sd Quattro and H files are ISO 100.
+- SDQH5085 records Auto WB gains [0.839935, 1.04999, 1.54372]. Through the
+  physical ColorMatrix, its neutral gives negative Z, outside the classic
+  profile model. Explicit modes return "invalid classic profile as-shot
+  white". There is no clamp or WB substitution. The corpus audits use its
+  Sunlight preset. The no-option DNG is not affected.
+- Existing x3fuse names for CAMF WB codes 3 and 6 are "Shadow" and
+  "Florescent". The CAMF keys are "Shade" and "Fluorescent", so an as-shot
+  Shade or Fluorescent file fails the calibration lookup. A Custom WB
+  without a custom CC matrix also fails. This affects dp Quattro as well.
+- Merged X3I DNGs resolve with frame calibration. The profile fit
+  extrapolates values above the native range. This is not validated
+  against SPP.
 
 ## Native coordinates and the classic matrices
 
@@ -178,6 +231,13 @@ published Sharma reference pairs. The worst per-mode as-shot values are:
 | dp2 Merrill 8040, Adobe source | 0.91 | 0.33 |
 | dp2 Quattro 8284 | 0.34 | 0.14 |
 | dp0 Quattro 0010 | 0.18 | 1.99 |
+| sd Quattro SDIM0002 | 0.24 | 2.55 |
+| sd Quattro H SDQH5085, explicit Sunlight WB | 0.98 | 1.50 |
+| sd Quattro H _DQH1429 | 0.34 | 1.82 |
+
+SDQH5085 uses Sunlight because its as-shot Auto white is outside the classic
+profile model. These values compare the profile with the native renderer on
+the same raster. They are not SPP image captures.
 
 The grid/cap choices are unchanged on the held-out dp2 Merrill and dp0
 Quattro files. Tables derive from calibration and native math, not fitted

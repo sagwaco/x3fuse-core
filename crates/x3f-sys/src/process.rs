@@ -3294,20 +3294,24 @@ pub(crate) unsafe fn color_mode_base_calibration(
                 );
             }
             let temperature = merrill_temperature_gain(temperature);
-            let mut camera = 0;
-            unsafe {
-                x3f_get_camf_unsigned(x3f, c"CAMERAID".as_ptr().cast_mut(), &mut camera);
-            }
-            let mut adjustment = [1.0; 3];
-            if camera == X3F_CAMERAID_SDQ {
-                unsafe {
-                    x3f_get_camf_float_vector(
-                        x3f,
-                        c"SensorAdjustmentGainFact_HI".as_ptr().cast_mut(),
-                        adjustment.as_mut_ptr(),
-                    );
-                }
+            let gain = if unsafe { sd_quattro_camera(x3f) }?.is_some() {
+                // Color uses GatherParams WB_B (params+0x208): temperature-only
+                // and green-normalized, with no HI/LOW sensor adjustment
+                // (lib95 0xa2308, lib92 0x9f308, Stage2 0x89ad4).
+                let fluorescent = if !wb.is_null()
+                    && unsafe { CStr::from_ptr(wb) }
+                        .to_bytes()
+                        .eq_ignore_ascii_case(b"Fluorescent")
+                {
+                    unsafe { sd_quattro_fluorescent(x3f) }?
+                } else {
+                    [1.0; 3]
+                };
+                let b: [f64; 3] =
+                    std::array::from_fn(|c| temperature[c] * gain[c] * fluorescent[c]);
+                b.map(|v| v / b[1])
             } else {
+                let mut adjustment = [1.0; 3];
                 let mut version = [0_u32; 3];
                 if unsafe {
                     x3f_get_camf_matrix(
@@ -3337,9 +3341,8 @@ pub(crate) unsafe fn color_mode_base_calibration(
                         );
                     }
                 }
-            }
-            let gain =
-                std::array::from_fn(|c| (temperature[c] * adjustment[c]) * (gain[c] / minimum));
+                std::array::from_fn(|c| (temperature[c] * adjustment[c]) * (gain[c] / minimum))
+            };
             let (mut capture, mut range) = (0.0, 0);
             unsafe {
                 x3f_get_camf_float(x3f, c"CaptureISO".as_ptr().cast_mut(), &mut capture);
@@ -3425,15 +3428,16 @@ pub unsafe fn color_mode_calibration(
                 "missing Merrill trimmed-black calibration",
             ));
         }
-        (unsafe { merrill_count_scale(x3f) }.unwrap(), unsafe {
+        ([unsafe { merrill_count_scale(x3f) }.unwrap(); 3], unsafe {
             merrill_trimmed_black(&shield, control)
         }?)
+    } else if let Some((gain, offset)) = unsafe { sd_quattro_preprocess(x3f, maximum) }? {
+        (gain, [offset; 3])
     } else {
-        (1.0, black)
+        ([1.0; 3], black)
     };
-    let normalized_to_counts =
-        std::array::from_fn(|c| count_scale * (f64::from(maximum[c]) - black[c]));
-    let count_offset = std::array::from_fn(|c| count_scale * (black[c] - native_black[c]));
+    let (normalized_to_counts, count_offset) =
+        native_count_span(maximum, black, native_black, count_scale);
     if normalized_to_counts
         .iter()
         .any(|v| !v.is_finite() || *v <= 0.0)
@@ -3466,6 +3470,160 @@ pub unsafe fn color_mode_calibration(
         output_to_srgb,
         color_dq,
     })
+}
+
+/// Map x in [0,1] to native counts: (x * span + offset) is
+/// scale * (raw - native_black) for raw = black + x * (maximum - black).
+/// dp Quattro keeps its pinned measured-black, unit-scale convention, although
+/// lib95 also subtracts RawOffset and divides by SensorISO / 100 there.
+fn native_count_span(
+    maximum: [u32; 3],
+    black: [f64; 3],
+    native_black: [f64; 3],
+    scale: [f64; 3],
+) -> ([f64; 3], [f64; 3]) {
+    (
+        std::array::from_fn(|c| scale[c] * (f64::from(maximum[c]) - black[c])),
+        std::array::from_fn(|c| scale[c] * (black[c] - native_black[c])),
+    )
+}
+
+/// sd Quattro and H preprocess gain and black for
+/// min(DigitalISOGain * (raw - RawOffset) * 100 / SensorISO, 65535)
+/// (lib95 priProcessF23PreprocessStage 0x897e8, lib92 0x88324).
+/// Only lib92 (sd Quattro H) reads DigitalISOGain. Returns None for other cameras.
+pub(crate) unsafe fn sd_quattro_preprocess(
+    x3f: *mut x3f_t,
+    maximum: [u32; 3],
+) -> crate::Result<Option<([f64; 3], f64)>> {
+    let Some(camera) = unsafe { sd_quattro_camera(x3f) }? else {
+        return Ok(None);
+    };
+    // Missing RawOffset uses the engine default: lib95 0x893b4, lib92 0x880ac.
+    let mut raw_offset = if camera == X3F_CAMERAID_SDQ {
+        2048
+    } else {
+        256
+    };
+    let (mut digital, mut sensor_iso) = ([1.0; 3], 0.0);
+    unsafe {
+        if camera == X3F_CAMERAID_SDQH {
+            x3f_get_camf_float_vector(
+                x3f,
+                c"DigitalISOGain".as_ptr().cast_mut(),
+                digital.as_mut_ptr(),
+            );
+        }
+        x3f_get_camf_float(x3f, c"SensorISO".as_ptr().cast_mut(), &mut sensor_iso);
+        x3f_get_camf_unsigned(x3f, c"RawOffset".as_ptr().cast_mut(), &mut raw_offset);
+    }
+    // GatherParams uses unit sensor ISO gain for zero (lib95 0xa18c0).
+    if sensor_iso == 0.0 {
+        sensor_iso = 100.0;
+    }
+    let raw_offset = f64::from(raw_offset);
+    sd_quattro_gain(digital, sensor_iso, raw_offset, maximum)
+        .map(|gain| Some((gain, raw_offset)))
+        .ok_or(crate::Error::InvalidData(
+            "unsupported sd Quattro digital gain, SensorISO or gained count range",
+        ))
+}
+
+/// Native sd Quattro Fluorescent table (lib95 0x1a3da0): F-number, R, G, B rows.
+const SDQ_FLUORESCENT: [u32; 24] = [
+    0x3fb33333, 0x40000000, 0x40333333, 0x40800000, 0x40b33333, 0x41000000, //
+    0x3f7c25af, 0x3f7df84d, 0x3f7f16b1, 0x3f7fc3b5, 0x3f800000, 0x3f800000, //
+    0x3f800000, 0x3f800000, 0x3f800000, 0x3f800000, 0x3f800000, 0x3f800000, //
+    0x3f81a416, 0x3f80a5ce, 0x3f803223, 0x3f800cc8, 0x3f800000, 0x3f800000,
+];
+
+/// Fluorescent WB gain at the EXIF F-number. sd Quattro uses the built-in
+/// table; sd Quattro H reads CAMF FnumberGainTable, and its absence is unity.
+unsafe fn sd_quattro_fluorescent(x3f: *mut x3f_t) -> crate::Result<[f64; 3]> {
+    let invalid = |m| Err(crate::Error::InvalidData(m));
+    let f = unsafe { merrill_exif(x3f, Control::none()) }?
+        .f_number
+        .filter(|&(n, d)| n != 0 && d != 0)
+        .map(|(n, d)| (f64::from(n) / f64::from(d)) as f32);
+    let Some(f) = f else {
+        return invalid("sd Quattro Fluorescent color modes require an EXIF FNumber");
+    };
+    let table: [f32; 24] = if unsafe { sd_quattro_camera(x3f) }? == Some(X3F_CAMERAID_SDQ) {
+        SDQ_FLUORESCENT.map(f32::from_bits)
+    } else if unsafe { crate::meta::camf_find_by_name(x3f, c"FnumberGainTable".as_ptr()) }.is_none()
+    {
+        return Ok([1.0; 3]);
+    } else {
+        let values =
+            unsafe { crate::color_modes::float_matrix(x3f, c"FnumberGainTable", &[4, 6]) }?;
+        std::array::from_fn(|i| values[i] as f32)
+    };
+    fluorescent_gain(&table, f).ok_or(crate::Error::InvalidData(
+        "invalid sd Quattro FnumberGainTable",
+    ))
+}
+
+/// FluorescentColorBaranceAdjustment (lib92 0x9fbfc, lib95 0xa218c) in float32.
+fn fluorescent_gain(t: &[f32; 24], f: f32) -> Option<[f64; 3]> {
+    if !t.iter().all(|v| v.is_finite()) || !t[..6].windows(2).all(|w| w[0] < w[1]) {
+        return None;
+    }
+    let node = |i: usize| [t[6 + i], t[12 + i], t[18 + i]].map(f64::from);
+    if f <= t[0] {
+        return Some(node(0));
+    }
+    if f > t[5] {
+        return Some(node(5));
+    }
+    let i = (1..6).find(|&i| t[i] >= f)?;
+    // Native fmadd: (f - t0) * t1 + ((t1 - f) * t0) rounds once.
+    Some([6, 12, 18].map(|b| {
+        let near = (t[i] - f) * t[b + i - 1];
+        f64::from((f - t[i - 1]).mul_add(t[b + i], near) / (t[i] - t[i - 1]))
+    }))
+}
+
+/// Reject gains whose sensor range would exceed the native 65535 count clamp,
+/// because the linear render matrix cannot express that clamp.
+fn sd_quattro_gain(
+    digital: [f64; 3],
+    sensor_iso: f64,
+    raw_offset: f64,
+    maximum: [u32; 3],
+) -> Option<[f64; 3]> {
+    let positive = |v: f64| v.is_finite() && v > 0.0;
+    if !positive(sensor_iso) || !digital.into_iter().all(positive) {
+        return None;
+    }
+    let gain = digital.map(|g| g * (100.0 / sensor_iso));
+    (0..3)
+        .all(|c| {
+            let top = gain[c] * (f64::from(maximum[c]) - raw_offset);
+            positive(gain[c]) && top > 0.0 && top <= 65535.0
+        })
+        .then_some(gain)
+}
+
+/// Return the sd Quattro or H CAMERAID when it matches the RAW image type.
+/// Reject a mismatch, so a new format never uses dp Quattro calibration.
+pub(crate) unsafe fn sd_quattro_camera(x3f: *mut x3f_t) -> crate::Result<Option<u32>> {
+    let raw = unsafe { x3f_get_raw(x3f) };
+    let format = if raw.is_null() {
+        0
+    } else {
+        unsafe { (*raw).header.data_subsection.image_data.type_format }
+    };
+    let mut camera = 0;
+    unsafe {
+        x3f_get_camf_unsigned(x3f, c"CAMERAID".as_ptr().cast_mut(), &mut camera);
+    }
+    match (format, camera) {
+        (0x0001_0025, X3F_CAMERAID_SDQ) | (0x0001_0027, X3F_CAMERAID_SDQH) => Ok(Some(camera)),
+        (0x0001_0025 | 0x0001_0027, _) | (_, X3F_CAMERAID_SDQ | X3F_CAMERAID_SDQH) => Err(
+            crate::Error::InvalidData("sd Quattro CAMERAID does not match the RAW image type"),
+        ),
+        _ => Ok(None),
+    }
 }
 
 fn merrill_render_matrix(
@@ -3770,6 +3928,7 @@ struct MerrillRender {
 
 struct QuattroColorModeRender {
     matrix: [f64; 9],
+    offset: [f64; 3],
     recovery_matrix: [f64; 9],
     luts: crate::merrill::RenderLuts,
 }
@@ -3780,11 +3939,12 @@ impl QuattroColorModeRender {
         params: &crate::ColorModeParameters,
         luts: crate::merrill::RenderLuts,
     ) -> crate::Result<Self> {
-        let (matrix, _) = calibration.render_matrix(params);
+        let (matrix, offset) = calibration.render_matrix(params);
         let mut physical = *params;
         physical.creative_matrix = None;
         let (physical_matrix, _) = calibration.render_matrix(&physical);
         // Quattro recovery uses physical calibration before the selected look.
+        // It classifies normalized sensor input, so it omits the native pedestal.
         let recovery_matrix = physical_matrix.map(|v| v / params.pixel_saturation);
         if matrix
             .iter()
@@ -3797,14 +3957,20 @@ impl QuattroColorModeRender {
         }
         Ok(Self {
             matrix,
+            offset,
             recovery_matrix,
             luts,
         })
     }
 
     fn render(&self, input: [f64; 3]) -> [u16; 3] {
-        let indices = mat3x1_mul_native(&self.matrix, input)
-            .map(|v| crate::color_mode_tone_index(crate::ColorModeSensor::Quattro, v));
+        let counts = mat3x1_mul_native(&self.matrix, input);
+        let indices = std::array::from_fn(|c| {
+            crate::color_mode_tone_index(
+                crate::ColorModeSensor::Quattro,
+                counts[c] + self.offset[c],
+            )
+        });
         // shortcut: use the native ordinary restore bounds with neutral residual
         // gain until the native spatial filters replace the existing NLM path.
         self.luts.render_indices(indices)
@@ -7401,14 +7567,165 @@ mod tests {
         );
         let expected = luts.render([0.0, 65535.0, 501.0]);
         assert_ne!(luts.render([-100.0, 70000.0, 500.75]), expected);
-        let render = super::QuattroColorModeRender {
+        let mut render = super::QuattroColorModeRender {
             matrix: identity,
+            offset: [0.0; 3],
             recovery_matrix: identity,
             luts,
         };
         assert_eq!(render.render([-100.0, 70000.0, 500.75]), expected);
         assert_eq!(expected[0], 0);
         assert!(expected[1] > 65500);
+        // The sd Quattro pedestal shifts counts before rounding and bounds.
+        render.offset = [100.0, -2000.0, 0.5];
+        assert_eq!(render.render([-200.0, 70000.0, 500.25]), expected);
+    }
+
+    #[test]
+    fn sd_quattro_fluorescent_interpolates_native_table() {
+        let t = super::SDQ_FLUORESCENT.map(f32::from_bits);
+        let wide = [0.98495, 1.0, 1.01282];
+        let at = |f: f32| super::fluorescent_gain(&t, f).unwrap();
+        // Bounds return the end nodes; lib95 0xa2224 holds the f/1.4 node.
+        assert_eq!(at(1.0), [0.98495_f32, 1.0, 1.01282].map(f64::from));
+        assert_eq!(at(1.4), at(1.0));
+        assert_eq!(at(16.0), [1.0; 3]);
+        // Native float32 oracle (sdq-native-evidence oracle/fl.c).
+        let oracle = [
+            (1.8, [0.989696622, 1.0, 1.00764668]),
+            (2.4, [0.994255006, 1.0, 1.00329506]),
+            (3.5, [0.997979999, 1.0, 1.0008651]),
+            (5.0, [0.999655008, 1.0, 1.00014627]),
+            (5.6, [1.0; 3]),
+            (7.0, [1.0; 3]),
+        ];
+        for (f, expected) in oracle {
+            assert_eq!(at(f), expected.map(|v: f64| f64::from(v as f32)), "f/{f}");
+        }
+        assert!(at(2.4)[0] > wide[0] && at(2.4)[2] < wide[2]);
+        assert!(super::fluorescent_gain(&t, f32::NAN).is_none());
+        let mut unsorted = t;
+        unsorted.swap(1, 2);
+        assert!(super::fluorescent_gain(&unsorted, 2.4).is_none());
+        let mut nonfinite = t;
+        nonfinite[20] = f32::INFINITY;
+        assert!(super::fluorescent_gain(&nonfinite, 2.4).is_none());
+    }
+
+    #[test]
+    fn sd_quattro_preprocess_maps_digital_gain_and_raw_offset() {
+        let maximum = [16383; 3];
+        // _DQH1429: DigitalISOGain [4,4,2], SensorISO 100, RawOffset 256.
+        let gain = super::sd_quattro_gain([4.0, 4.0, 2.0], 100.0, 256.0, maximum).unwrap();
+        assert_eq!(gain, [4.0, 4.0, 2.0]);
+        let black = [256.5, 256.25, 257.0];
+        let (span, offset) = super::native_count_span(maximum, black, [256.0; 3], gain);
+        assert_eq!(offset, [2.0, 1.0, 2.0]);
+        // x = 0 is the measured black; x = 1 is the gained raw maximum.
+        let top: [f64; 3] = std::array::from_fn(|c| span[c] + offset[c]);
+        assert_eq!(top, [64508.0, 64508.0, 32254.0]);
+        // SensorISO 200 halves the counts; SensorISO 50 doubles them past the clamp.
+        assert_eq!(
+            super::sd_quattro_gain([1.0; 3], 200.0, 2048.0, maximum),
+            Some([0.5; 3])
+        );
+        assert!(super::sd_quattro_gain([4.0, 4.0, 2.0], 50.0, 256.0, maximum).is_none());
+        // Exact clamp boundary: 65535 = g * (16383 - 256) is accepted.
+        let limit = 65535.0 / 16127.0;
+        assert!(super::sd_quattro_gain([limit; 3], 100.0, 256.0, maximum).is_some());
+        assert!(
+            super::sd_quattro_gain([limit * (1.0 + 1e-12); 3], 100.0, 256.0, maximum).is_none()
+        );
+        // Two invalid signs must not cancel into a positive gain.
+        assert!(super::sd_quattro_gain([-1.0; 3], -100.0, 256.0, maximum).is_none());
+        for bad in [0.0, -1.0, f64::NAN] {
+            assert!(super::sd_quattro_gain([1.0, bad, 1.0], 100.0, 256.0, maximum).is_none());
+            assert!(super::sd_quattro_gain([1.0; 3], bad, 256.0, maximum).is_none());
+        }
+        assert!(super::sd_quattro_gain([1.0; 3], 100.0, 16383.0, maximum).is_none());
+    }
+
+    #[test]
+    fn sd_quattro_preprocess_reads_camf_defaults_and_camera_dispatch() {
+        use super::*;
+        unsafe {
+            let mut camera = X3F_CAMERAID_SDQ;
+            let mut digital = [2.0_f64, 3.0, 4.0];
+            let mut sensor_iso = 0.0_f64;
+            let mut entries: [camf_entry_t; 3] = std::mem::zeroed();
+            let mut dims: [camf_dim_entry_t; 3] = std::mem::zeroed();
+            for (i, (name, data, size, typ)) in [
+                (
+                    c"CAMERAID",
+                    (&mut camera as *mut u32).cast(),
+                    1,
+                    matrix_type_t_M_UINT,
+                ),
+                (
+                    c"DigitalISOGain",
+                    digital.as_mut_ptr().cast(),
+                    3,
+                    matrix_type_t_M_FLOAT,
+                ),
+                (
+                    c"SensorISO",
+                    (&mut sensor_iso as *mut f64).cast(),
+                    1,
+                    matrix_type_t_M_FLOAT,
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                dims[i].size = size;
+                entries[i].id = u32::from_le_bytes(*b"CMbM");
+                entries[i].name_address = name.as_ptr().cast_mut();
+                entries[i].matrix_dim = 1;
+                entries[i].matrix_dim_entry = &mut dims[i];
+                entries[i].matrix_elements = size;
+                entries[i].matrix_decoded_type = typ;
+                entries[i].matrix_decoded = data;
+            }
+            let mut sections: [x3f_directory_entry_t; 2] = std::mem::zeroed();
+            sections[0].header.identifier = u32::from_le_bytes(*b"SECc");
+            sections[0].header.data_subsection.camf.entry_table = camf_entry_table_t {
+                size: 2,
+                element: entries.as_mut_ptr(),
+            };
+            sections[1].header.identifier = u32::from_le_bytes(*b"SECi");
+            let mut x3f: x3f_t = std::mem::zeroed();
+            x3f.directory_section.num_directory_entries = 2;
+            x3f.directory_section.directory_entry = sections.as_mut_ptr();
+            for (id, format, offset, gain) in [
+                (X3F_CAMERAID_SDQ, 0x0001_0025, 2048.0, [1.0; 3]),
+                (X3F_CAMERAID_SDQH, 0x0001_0027, 256.0, digital),
+            ] {
+                *entries[0].matrix_decoded.cast::<u32>() = id;
+                sections[1].header.data_subsection.image_data.type_format = format;
+                // RawOffset is absent. SensorISO is absent, then explicitly zero.
+                *entries[2].matrix_decoded.cast::<f64>() = 0.0;
+                for count in [2, 3] {
+                    sections[0].header.data_subsection.camf.entry_table.size = count;
+                    assert_eq!(
+                        sd_quattro_preprocess(&mut x3f, [16383; 3]).unwrap(),
+                        Some((gain, offset)),
+                        "CAMERAID {id}, CAMF entries {count}"
+                    );
+                }
+                *entries[2].matrix_decoded.cast::<f64>() = 200.0;
+                assert_eq!(
+                    sd_quattro_preprocess(&mut x3f, [16383; 3]).unwrap(),
+                    Some((gain.map(|g| g / 2.0), offset))
+                );
+                sections[1].header.data_subsection.image_data.type_format =
+                    if id == X3F_CAMERAID_SDQ {
+                        0x0001_0027
+                    } else {
+                        0x0001_0025
+                    };
+                assert!(sd_quattro_preprocess(&mut x3f, [16383; 3]).is_err());
+            }
+        }
     }
 
     #[test]
