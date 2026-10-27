@@ -114,7 +114,11 @@ for TIFF and DNG. Merrill tone rows use the contrast-list ordinal. dp Quattro
 uses its native enum bounds, built-in tone shapes and quarter-resolution
 curve reconstruction. TIFF applies the mode before its output ICC encoding.
 The option defaults to `None`; the stages above keep their existing behavior
-when it is absent. sd Quattro and sd Quattro H modes remain unsupported.
+when it is absent. sd Quattro and sd Quattro H use the dp Quattro tone
+stages. Their raw counts include `RawOffset` and `SensorISO`. Only
+sd Quattro H reads `DigitalISOGain`; it is unity for sd Quattro. Their WB
+uses the green-normalized native copy without the sensor adjustment.
+These rules come from static native evidence, not from SPP image captures.
 
 The experimental DNG mode path clears the creative selection before raw
 processing, then builds profile metadata and a selected-mode preview from

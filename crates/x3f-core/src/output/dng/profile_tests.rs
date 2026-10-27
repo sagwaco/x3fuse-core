@@ -689,6 +689,26 @@ fn loaded_reader(path: &std::path::Path) -> Reader {
     reader
 }
 
+/// SDQH5085's Auto white is outside the classic profile model, so the
+/// audits use its Sunlight preset. Other files use the as-shot WB.
+fn audit_wb(file: &str, reader: &Reader) -> String {
+    if file == "SDQH5085.X3F" {
+        "Sunlight".into()
+    } else {
+        reader.dng_default_wb()
+    }
+}
+
+/// Load a supplemental corpus file, or report a skip when it is absent.
+fn optional_reader(corpus: &std::path::Path, name: &str) -> Option<Reader> {
+    let path = corpus.join(name);
+    if !path.is_file() {
+        eprintln!("skip: missing {}", path.display());
+        return None;
+    }
+    Some(loaded_reader(&path))
+}
+
 #[test]
 #[ignore = "checks legacy profile camera whites after the WhiteXY row correction"]
 fn legacy_profiles_keep_the_as_shot_camera_white() {
@@ -699,9 +719,14 @@ fn legacy_profiles_keep_the_as_shot_camera_white() {
         "_SDI8040.X3F",
         "_SDI8284.X3F",
         "DP0Q0010.X3F",
+        "SDIM0002.X3F",
+        "SDQH5085.X3F",
+        "_DQH1429.X3F",
     ] {
-        let reader = loaded_reader(&corpus.join(file));
-        let wb = reader.dng_default_wb();
+        let Some(reader) = optional_reader(&corpus, file) else {
+            continue;
+        };
+        let wb = audit_wb(file, &reader);
         let calibration = ColorCalibration::new(&reader, &wb).unwrap();
         let color0 = sdk_color(serialized(
             calibration
@@ -723,7 +748,7 @@ fn legacy_profiles_keep_the_as_shot_camera_white() {
             &mut Vec::new(),
             x3f_sys::Control::none(),
         )
-        .unwrap();
+        .unwrap_or_else(|e| panic!("{file}: {e}"));
         let data = serialized_profile_metadata(&reader, &calibration, &profiles, 1.0);
         let primary = root(&data);
         let xy = profiles
@@ -732,6 +757,16 @@ fn legacy_profiles_keep_the_as_shot_camera_white() {
         let wanted = multiply(&color0, xy_xyz(xy));
         let max = wanted.into_iter().fold(0.0, f64::max);
         let wanted = wanted.map(|v| v / max);
+        // Each stored ColorMatrix entry is rounded to 1/10000, then the SDK
+        // read rounds it again. Two half steps per entry move a component
+        // by at most 1e-4 * sum|XYZ|; max normalization can double that.
+        let budget = 2.0e-4 * xy_xyz(xy).iter().map(|v| v.abs()).sum::<f64>() / max;
+        // Keep the measured limit for the original fixtures.
+        let limit = if ["SDIM0002.X3F", "SDQH5085.X3F", "_DQH1429.X3F"].contains(&file) {
+            budget
+        } else {
+            0.0001
+        };
         let mut count = 0;
         let mut error = 0.0_f64;
         for off in primary[&t::EXTRA_CAMERA_PROFILES].longs() {
@@ -755,8 +790,11 @@ fn legacy_profiles_keep_the_as_shot_camera_white() {
             count += 1;
         }
         assert_eq!(count, 6);
-        assert!(error < 0.0001, "{file} legacy white error={error}");
-        eprintln!("{file}: all6legacy camera whites match physical as-shot white within{error:.8}");
+        assert!(
+            error <= limit,
+            "{file} legacy white error={error} limit={limit}"
+        );
+        eprintln!("{file}: all 6 legacy camera whites match physical as-shot white within {error:.8} (rounding budget {budget:.8})");
     }
 }
 
@@ -774,9 +812,14 @@ fn classic_color_mode_matrix_audit() {
         "_SDI8040.X3F",
         "_SDI8284.X3F",
         "DP0Q0010.X3F",
+        "SDIM0002.X3F",
+        "SDQH5085.X3F",
+        "_DQH1429.X3F",
     ] {
-        let reader = loaded_reader(&corpus.join(file));
-        let wb = reader.dng_default_wb();
+        let Some(reader) = optional_reader(&corpus, file) else {
+            continue;
+        };
+        let wb = audit_wb(file, &reader);
         let calibration = ColorCalibration::new(&reader, &wb).unwrap();
         let prepared = PreparedColorModes::resolve(
             &reader,
@@ -799,7 +842,8 @@ fn classic_color_mode_matrix_audit() {
             .map(|v| (v * 10_000.0).round().max(1.0) / 10_000.0);
         let maximum = neutral.into_iter().fold(0.0, f64::max);
         let neutral = neutral.map(|v| (v / maximum).clamp(0.001, 1.0));
-        let xy = white_xy(color0, neutral).unwrap();
+        let xy = white_xy(color0, neutral)
+            .unwrap_or_else(|e| panic!("{file}: {e}; CM0={color0:?} neutral={neutral:?}"));
         let basis = mat3_mul(
             &srgb_to_xyz_d50(),
             &super::super::rgb_table::quantized_output(prepared.native.output_to_srgb),
@@ -832,7 +876,14 @@ fn classic_color_mode_matrix_audit() {
             let relative = mat3_mul(&basis, &mat3_mul(&relative, &mat3_inverse(&basis)));
             let relative = mat3_mul(&relative, &forward0);
             let absolute =
-                Matrices::new(&prepared.native, params, color0, neutral, xy, count_scale).unwrap();
+                Matrices::new(&prepared.native, params, color0, neutral, xy, count_scale)
+                    .unwrap_or_else(|e| {
+                        let (counts, offset) = prepared.native.render_matrix(params);
+                        panic!(
+                            "{file} {}: {e}; counts={counts:?} offset={offset:?}",
+                            params.mode
+                        )
+                    });
             let relative = Matrices::from_absolute(relative, color0, xy).unwrap();
             let (counts, _) = prepared.native.render_matrix(params);
             let wanted = mat3_mul(&xyz_d50_to_prophoto(), &mat3_mul(&basis, &counts))
@@ -890,9 +941,14 @@ fn classic_color_mode_residual_audit() {
         "_SDI8284.X3F",
         "_SDI8040.X3F",
         "DP0Q0010.X3F",
+        "SDIM0002.X3F",
+        "SDQH5085.X3F",
+        "_DQH1429.X3F",
     ] {
-        let reader = loaded_reader(&corpus.join(file));
-        let wb = reader.dng_default_wb();
+        let Some(reader) = optional_reader(&corpus, file) else {
+            continue;
+        };
+        let wb = audit_wb(file, &reader);
         let calibration = ColorCalibration::new(&reader, &wb).unwrap();
         let prepared = PreparedColorModes::resolve(
             &reader,
@@ -911,7 +967,8 @@ fn classic_color_mode_residual_audit() {
             .map(|v| (v * 10_000.0).round().max(1.0) / 10_000.0);
         let maximum = neutral.into_iter().fold(0.0, f64::max);
         let neutral = neutral.map(|v| (v / maximum).clamp(0.001, 1.0));
-        let xy = white_xy(color0, neutral).unwrap();
+        let xy = white_xy(color0, neutral)
+            .unwrap_or_else(|e| panic!("{file}: {e}; CM0={color0:?} neutral={neutral:?}"));
         let standard = prepared
             .modes
             .iter()
@@ -970,7 +1027,14 @@ fn classic_color_mode_residual_audit() {
             .collect();
         for params in &prepared.modes {
             let matrices =
-                Matrices::new(&prepared.native, params, color0, neutral, xy, count_scale).unwrap();
+                Matrices::new(&prepared.native, params, color0, neutral, xy, count_scale)
+                    .unwrap_or_else(|e| {
+                        let (counts, offset) = prepared.native.render_matrix(params);
+                        panic!(
+                            "{file} {}: {e}; counts={counts:?} offset={offset:?}",
+                            params.mode
+                        )
+                    });
             let native =
                 NativeRendering::new(&prepared.native, params, x3f_sys::Control::none()).unwrap();
             let fit = ClassicFit::new(
@@ -1239,6 +1303,109 @@ fn color_mode_recovery_scale_is_restored_once() {
 }
 
 #[test]
+#[ignore = "perturbs DigitalISOGain on the sd Quattro H corpus file in memory"]
+fn sd_quattro_digital_iso_gain_enters_mode_profiles_once() {
+    let Some(corpus) = std::env::var_os("X3F_TEST_FILES").map(PathBuf::from) else {
+        eprintln!("skip: set X3F_TEST_FILES to run the sd Quattro DigitalISOGain check");
+        return;
+    };
+    let measure = |reader: &Reader| {
+        let wb = reader.dng_default_wb();
+        let calibration = ColorCalibration::new(reader, &wb).unwrap();
+        let prepared = PreparedColorModes::resolve(
+            reader,
+            &wb,
+            x3f_sys::ColorMode::Standard,
+            &mut Vec::new(),
+            x3f_sys::Control::none(),
+        )
+        .unwrap();
+        let native = prepared.native.clone();
+        let profiles = prepared
+            .finish(
+                reader,
+                &wb,
+                &calibration,
+                1.0,
+                &mut Vec::new(),
+                x3f_sys::Control::none(),
+            )
+            .unwrap();
+        let data = serialized_profile_metadata(reader, &calibration, &profiles, 1.0);
+        let primary = root(&data);
+        let baseline = primary[&t::BASELINE_EXPOSURE].rationals()[0];
+        let mut entries = vec![primary];
+        entries.extend(
+            entries[0][&t::EXTRA_CAMERA_PROFILES]
+                .longs()
+                .into_iter()
+                .map(|o| extra(&data, o as usize)),
+        );
+        for profile in entries
+            .iter()
+            .filter(|p| p.contains_key(&t::PROFILE_LOOK_TABLE_DATA))
+        {
+            assert_eq!(
+                baseline + profile[&t::BASELINE_EXPOSURE_OFFSET].rationals()[0],
+                0.0,
+                "{}",
+                profile[&t::PROFILE_NAME].text()
+            );
+        }
+        (baseline, calibration.neutral, native)
+    };
+    let name = "_DQH1429.X3F";
+    let Some(reader) = optional_reader(&corpus, name) else {
+        return;
+    };
+    let gain = [4.0, 4.0, 2.0];
+    assert_eq!(reader.dng_digital_iso_gain(), gain);
+    let (baseline, neutral, native) = measure(&reader);
+    // Same file and calibration, with only DigitalISOGain replaced by unity.
+    // SAFETY: the reader owns the decoded CAMF matrix and nothing borrows it.
+    unsafe {
+        let (mut size, mut data) = (0, std::ptr::null_mut());
+        assert_ne!(
+            x3f_sys::x3f_get_camf_matrix_var(
+                reader.x3f.as_ptr(),
+                c"DigitalISOGain".as_ptr().cast_mut(),
+                &mut size,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                x3f_sys::matrix_type_t_M_FLOAT,
+                &mut data,
+            ),
+            0
+        );
+        assert_eq!(size, 3);
+        std::slice::from_raw_parts_mut(data.cast::<f64>(), 3).fill(1.0);
+    }
+    assert_eq!(reader.dng_digital_iso_gain(), [1.0; 3]);
+    let (unity_baseline, unity_neutral, unity_native) = measure(&reader);
+    // The raw is not scaled by the gain. BaselineExposure carries its scalar
+    // part once, and the neutral carries its relative part once.
+    let mean = (gain[0] * gain[1] * gain[2]).cbrt();
+    assert!((baseline - unity_baseline - mean.log2()).abs() <= 0.0001);
+    for (c, g) in gain.iter().enumerate() {
+        assert!((neutral[c] * g / mean / unity_neutral[c] - 1.0).abs() < 1e-12);
+    }
+    // Native Tiger preprocessing applies the gain to raw counts before WB,
+    // CC, ISO and tone: counts = DIG * 100/SensorISO * (raw - RawOffset).
+    for (c, g) in gain.iter().enumerate() {
+        let ratio = native.normalized_to_counts[c] / unity_native.normalized_to_counts[c];
+        assert!((ratio / g - 1.0).abs() < 1e-12, "count span {c}: {ratio}");
+        if unity_native.count_offset[c] != 0.0 {
+            let ratio = native.count_offset[c] / unity_native.count_offset[c];
+            assert!((ratio / g - 1.0).abs() < 1e-12, "count offset {c}: {ratio}");
+        }
+    }
+    assert_eq!(native.wb_gain, unity_native.wb_gain);
+    assert_eq!(native.iso_gain, unity_native.iso_gain);
+    assert_eq!(native.sensor_to_srgb, unity_native.sensor_to_srgb);
+    eprintln!("{name}: BaselineExposure {baseline:.4} vs unity {unity_baseline:.4}; native spans and offsets scale by {gain:?}; WB, ISO and CC unchanged");
+}
+
+#[test]
 #[ignore = "decodes Merrill and Quattro corpus exports across compression and recovery settings"]
 fn color_mode_corpus_preserves_decoded_raw_and_calibration() {
     let corpus = std::env::var_os("X3F_TEST_FILES")
@@ -1251,12 +1418,19 @@ fn color_mode_corpus_preserves_decoded_raw_and_calibration() {
     let destination =
         std::env::temp_dir().join(format!("x3f-dng-mode-invariance-{}", std::process::id()));
     std::fs::create_dir_all(&destination).unwrap();
-    for name in ["sigma_sd1_merrill_15.x3f", "_SDI8284.X3F"] {
+    for name in [
+        "sigma_sd1_merrill_15.x3f",
+        "_SDI8284.X3F",
+        "SDIM0002.X3F",
+        "_DQH1429.X3F",
+        "SDQH5085.X3F",
+    ] {
         let input = corpus.join(name);
         if !input.is_file() {
             eprintln!("skip: missing {}", input.display());
             continue;
         }
+        let wb = (name == "SDQH5085.X3F").then(|| "Sunlight".to_owned());
         let modes = loaded_reader(&input).available_color_modes().unwrap();
         assert!(
             modes.contains(&x3f_sys::ColorMode::Standard)
@@ -1280,6 +1454,7 @@ fn color_mode_corpus_preserves_decoded_raw_and_calibration() {
                         compress,
                         dng_highlight_recovery: recovery,
                         denoise_intensity: 0,
+                        wb: wb.clone(),
                         ..crate::ProcessOptions::default()
                     };
                     reader.dump_dng(&output, &opts).unwrap();
@@ -1318,6 +1493,7 @@ fn color_mode_corpus_preserves_decoded_raw_and_calibration() {
                             &output,
                             &crate::ProcessOptions {
                                 denoise_intensity: 0,
+                                wb: wb.clone(),
                                 ..crate::ProcessOptions::default()
                             },
                         )
@@ -1669,58 +1845,104 @@ fn write_monochrome_as_shot_corpus_and_check_profiles() {
 }
 
 #[test]
-#[ignore = "checks the real dp2 Quattro PictureMode against explicit named DNG selection"]
-fn quattro_as_shot_matches_recorded_profile_and_raw() {
+#[ignore = "checks the sd Quattro H Auto white that the classic profile model cannot represent"]
+fn sd_quattro_h_unrepresentable_as_shot_white_is_rejected() {
     let Some(corpus) = std::env::var_os("X3F_TEST_FILES").map(PathBuf::from) else {
-        eprintln!("skip: set X3F_TEST_FILES to run dp2 Quattro AsShot equivalence");
+        eprintln!("skip: set X3F_TEST_FILES to run the SDQH5085 white check");
         return;
     };
-    let input = corpus.join("_SDI8284.X3F");
-    let mut reader = loaded_reader(&input);
-    reader.load_thumbnail_jpeg().unwrap();
-    let jpeg = reader.dng_thumb_jpeg_bytes().unwrap();
-    let exif = x3f_sys::jpeg_exif::parse_jpeg_exif(&jpeg).unwrap();
-    assert_eq!(exif.picture_mode.as_deref(), Some("Standard"));
-    let named = x3f_sys::ColorMode::Standard;
-    let resolved =
-        unsafe { x3f_sys::resolve_color_mode(reader.x3f.as_ptr(), x3f_sys::ColorMode::AsShot) }
-            .unwrap();
-    assert_eq!(resolved.mode, named);
-    assert!(!resolved.as_shot_fallback);
-    let modes = reader.available_color_modes().unwrap();
-    drop(reader);
-
-    let destination = std::env::temp_dir().join(format!("x3f-dng-as-shot-{}", std::process::id()));
+    let name = "SDQH5085.X3F";
+    let Some(reader) = optional_reader(&corpus, name) else {
+        return;
+    };
+    // Auto gains [0.839935, 1.04999, 1.54372] give negative Z through CM0.
+    assert_eq!(reader.dng_default_wb(), "Auto");
+    let destination = std::env::temp_dir().join(format!("x3f-dng-white-{}", std::process::id()));
     std::fs::create_dir_all(&destination).unwrap();
-    let mut outputs = Vec::new();
-    for selection in [x3f_sys::ColorMode::AsShot, named] {
-        let reader = loaded_reader(&input);
-        let header_mode = reader.dng_color_mode();
-        let path = destination.join(format!("{}.dng", selection.name()));
-        reader
-            .dump_dng(
-                &path,
-                &crate::ProcessOptions {
-                    color_mode: Some(selection),
-                    compress: true,
-                    denoise_intensity: 0,
-                    ..crate::ProcessOptions::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(reader.dng_color_mode(), header_mode);
-        let data = std::fs::read(&path).unwrap();
-        assert_mode_profiles(&data, named.name(), &modes);
-        outputs.push(data);
-        std::fs::remove_file(path).unwrap();
-    }
-    assert_raw_equal(&outputs[0], &outputs[1]);
+    let path = destination.join("standard.dng");
+    let error = reader
+        .dump_dng(
+            &path,
+            &crate::ProcessOptions {
+                color_mode: Some(x3f_sys::ColorMode::Standard),
+                denoise_intensity: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
     assert!(
-        outputs[0] == outputs[1],
-        "dp2 Quattro AsShot and Standard DNGs differ in raw, preview, profiles or default"
+        error
+            .to_string()
+            .contains("invalid classic profile as-shot white"),
+        "{error}"
     );
+    assert!(!path.exists());
     std::fs::remove_dir(destination).unwrap();
-    eprintln!("_SDI8284.X3F: recorded PictureMode Standard, no fallback; AsShot and named DNGs are byte-identical with independently verified raw/profiles/default");
+}
+
+#[test]
+#[ignore = "checks real Quattro PictureMode values against explicit named DNG selection"]
+fn quattro_as_shot_matches_recorded_profile_and_raw() {
+    let Some(corpus) = std::env::var_os("X3F_TEST_FILES").map(PathBuf::from) else {
+        eprintln!("skip: set X3F_TEST_FILES to run Quattro AsShot equivalence");
+        return;
+    };
+    for (name, recorded, named) in [
+        ("_SDI8284.X3F", "Standard", x3f_sys::ColorMode::Standard),
+        ("SDIM0002.X3F", "Standard", x3f_sys::ColorMode::Standard),
+        ("_DQH1429.X3F", "SunsetRed", x3f_sys::ColorMode::SunsetRed),
+    ] {
+        let input = corpus.join(name);
+        let Some(mut reader) = optional_reader(&corpus, name) else {
+            continue;
+        };
+        reader.load_thumbnail_jpeg().unwrap();
+        let jpeg = reader.dng_thumb_jpeg_bytes().unwrap();
+        let exif = x3f_sys::jpeg_exif::parse_jpeg_exif(&jpeg).unwrap();
+        assert_eq!(exif.picture_mode.as_deref(), Some(recorded), "{name}");
+        let resolved =
+            unsafe { x3f_sys::resolve_color_mode(reader.x3f.as_ptr(), x3f_sys::ColorMode::AsShot) }
+                .unwrap();
+        assert_eq!(resolved.mode, named, "{name}");
+        assert!(!resolved.as_shot_fallback, "{name}");
+        let modes = reader.available_color_modes().unwrap();
+        assert!(modes.contains(&named), "{name}: {modes:?}");
+        drop(reader);
+
+        let destination =
+            std::env::temp_dir().join(format!("x3f-dng-as-shot-{}", std::process::id()));
+        std::fs::create_dir_all(&destination).unwrap();
+        let mut outputs = Vec::new();
+        for selection in [x3f_sys::ColorMode::AsShot, named] {
+            let reader = loaded_reader(&input);
+            let header_mode = reader.dng_color_mode();
+            let path = destination.join(format!("{name}-{}.dng", selection.name()));
+            reader
+                .dump_dng(
+                    &path,
+                    &crate::ProcessOptions {
+                        color_mode: Some(selection),
+                        compress: true,
+                        denoise_intensity: 0,
+                        ..crate::ProcessOptions::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(reader.dng_color_mode(), header_mode);
+            let data = std::fs::read(&path).unwrap();
+            assert_mode_profiles(&data, named.name(), &modes);
+            outputs.push(data);
+            std::fs::remove_file(path).unwrap();
+        }
+        assert_raw_equal(&outputs[0], &outputs[1]);
+        assert!(
+            outputs[0] == outputs[1],
+            "{name}: AsShot and {} DNGs differ in raw, preview, profiles or default",
+            named.name()
+        );
+        std::fs::remove_dir(destination).unwrap();
+        eprintln!("{name}: recorded PictureMode {recorded}, no fallback; AsShot and named DNGs are byte-identical with independently verified raw/profiles/default");
+    }
 }
 
 #[test]
@@ -2198,16 +2420,37 @@ fn x3i_corpus_dispatch_writes_scaled_linear_dng_and_preserves_contracts() {
             &cancel,
             |_| {},
         );
-        if name == "DP0Q0002.X3I" {
-            result.unwrap();
-            std::fs::remove_file(&output).unwrap();
-        } else {
-            assert!(result
-                .unwrap_err()
-                .to_string()
-                .contains("sensor calibration port"));
-            assert!(!output.exists());
-        }
+        result.unwrap();
+        let modes = {
+            let mut frame = container.open_frame(0).unwrap();
+            frame.load_property_list().unwrap();
+            frame.load_camf().unwrap();
+            frame.available_color_modes().unwrap()
+        };
+        // The merged BaselineExposure uses 1e-6 steps and each profile
+        // offset uses 1e-4 steps, so their sum is zero within 5.1e-5 EV.
+        let bytes = std::fs::read(&output).unwrap();
+        let primary = root(&bytes);
+        let baseline = primary[&t::BASELINE_EXPOSURE].rationals()[0];
+        assert_eq!(primary[&t::PROFILE_NAME].text(), "Standard");
+        assert_eq!(primary[&t::AS_SHOT_PROFILE_NAME].text(), "Standard");
+        let mut names: Vec<String> = primary[&t::EXTRA_CAMERA_PROFILES]
+            .longs()
+            .into_iter()
+            .map(|o| extra(&bytes, o as usize))
+            .chain([primary])
+            .filter(|p| p.contains_key(&t::PROFILE_LOOK_TABLE_DATA))
+            .map(|p| {
+                let total = baseline + p[&t::BASELINE_EXPOSURE_OFFSET].rationals()[0];
+                assert!(total.abs() <= 5.1e-5, "{name}: exposure sum {total}");
+                p[&t::PROFILE_NAME].text().to_owned()
+            })
+            .collect();
+        let mut expected: Vec<_> = modes.iter().map(|m| m.name().to_owned()).collect();
+        names.sort();
+        expected.sort();
+        assert_eq!(names, expected, "{name}");
+        std::fs::remove_file(&output).unwrap();
         // Cancel during preparation of the first frame and a later frame.
         for cancel_frame in [1, 2] {
             let (sender, receiver) = std::sync::mpsc::channel();

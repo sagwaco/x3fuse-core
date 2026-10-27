@@ -63,8 +63,8 @@ fn merged_scene_and_rendered_outputs_preserve_the_public_contract() {
         assert!(!stages.contains(&ConversionStage::Write));
         if name == "DP0Q0002.X3I" {
             assert!(scene.data.iter().copied().fold(f32::NEG_INFINITY, f32::max) > 1.0);
-            assert!(scene.color_mode_calibration.is_some());
         }
+        assert!(scene.color_mode_calibration.is_some(), "{name}");
         let dimensions = (scene.width, scene.height);
         let expected_dimensions = if name == "DP0Q0002.X3I" {
             (5424, 3616)

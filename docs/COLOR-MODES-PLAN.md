@@ -17,12 +17,14 @@ option preserves existing output byte for byte.
 | Camera family | Ordinary modes |
 | --- | --- |
 | Supported full-resolution Merrill | Standard, Vivid, Neutral, Portrait, Landscape, FOV Classic Blue |
-| Supported dp Quattro | The Merrill names plus Sunset Red, Forest Green, FOV Classic Yellow, Cinema, Teal and Orange |
+| Supported dp Quattro, sd Quattro and sd Quattro H | The Merrill names plus Sunset Red, Forest Green, FOV Classic Yellow, Cinema, Teal and Orange |
 
-Availability depends on valid camera calibration. sd Quattro and sd Quattro H
-remain unsupported because their native sensor calibration and resolution
-paths have not been ported. An explicit unsupported request returns an error.
-Do not substitute an identity look for missing required calibration.
+Availability depends on valid camera calibration. The sd Quattro and
+sd Quattro H port uses static native evidence. Only their full-resolution
+layout at ISO 100 is validated. See the
+[DNG development notes](../crates/x3f-core/src/output/dng/COLOR-MODES.md#sd-quattro-and-sd-quattro-h).
+An explicit unsupported request returns an error. Do not substitute an
+identity look for missing required calibration.
 
 Normal Quattro strength is effect 0, alpha 1. Initial mode rendering uses Sigma
 HP correction OFF. This is an x3fuse baseline, not a claim about SPP's default
