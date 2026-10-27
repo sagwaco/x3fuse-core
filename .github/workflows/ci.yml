@@ -246,6 +246,7 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p dist
+          cp LICENSE NOTICE dist/
           # CLI executables — each artifact holds a single renamed binary.
           for f in artifacts/x3f_extract-*/x3f_extract-*; do
             install -m 0755 "$f" "dist/$(basename "$f")"
@@ -253,9 +254,11 @@ jobs:
           # iOS xcframework — re-wrap so the zip's top level is X3F.xcframework/.
           mkdir -p stage/X3F.xcframework
           cp -R artifacts/X3F.xcframework/. stage/X3F.xcframework/
+          cp LICENSE NOTICE stage/X3F.xcframework/
           ( cd stage && zip -qr - X3F.xcframework ) > dist/X3F.xcframework.zip
           # wasm bundles — one zip per target (libx3f.a + x3f.wasm + x3f.h).
           for t in wasm32-wasip1 wasm32-unknown-unknown; do
+            cp LICENSE NOTICE "artifacts/x3f-$t/"
             ( cd "artifacts/x3f-$t" && zip -qr - . ) > "dist/x3f-$t.zip"
           done
           ls -la dist
