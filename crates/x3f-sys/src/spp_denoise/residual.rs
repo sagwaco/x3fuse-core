@@ -467,7 +467,8 @@ pub fn despeckle3(
         return Err(Error::InvalidData("invalid SPP despeckle parameters"));
     }
     let scaled = (level / 100.0).min(64.0).max(floor);
-    let threshold = (64.0 / 1024.0 / scaled).powf(3.0);
+    // Native Despeckle3 (0x7bfd0): powf(64 / (4096 / s), 3).
+    let threshold = (64.0_f32 / (4096.0_f32 / scaled)).powf(3.0);
     let [cols, rows] = size;
     if cols < 4 || rows < 3 {
         return Ok(());

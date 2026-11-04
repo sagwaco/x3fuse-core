@@ -531,7 +531,7 @@ fn generate_quattro_tone_curve(
 }
 
 /// CreateGammaLUT_F20 @0x561f4; manager @0x9efe4 supplies mask65535,size65536.
-fn generate_gamma_lut(native_target: u32) -> Vec<u16> {
+pub(crate) fn generate_gamma_lut(native_target: u32) -> Vec<u16> {
     let (threshold, slope, offset, power): (f64, f64, f64, f64) = match native_target {
         1 | 3 | 5 | 7 | 9 | 10 => (0.0, 1.0, 0.0, 1.0 / 2.2),
         4 | 6 | 8 | 11 => (0.0, 1.0, 0.0, 1.0 / 1.8),

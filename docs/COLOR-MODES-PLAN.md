@@ -51,7 +51,9 @@ embedded JPEG's Sigma MakerNote tag 0x003d. The bounded EXIF parser accepts both
 byte orders and variable ASCII counts, including 12 and 16. Named capability
 queries do not require that JPEG metadata. Unknown or missing As Shot values
 fall back to Standard and report a warning. Recorded Monochrome and Sepia
-return an unsupported-mode error. Explicit unknown CLI names are errors.
+return an unsupported-mode error here. Without a Color Mode, `-spp-pipeline`
+renders recorded Monochrome through the native monochrome branch; see
+[SPP alignment](src/spp-alignment.md#monochrome-and-fpn-suppression). Explicit unknown CLI names are errors.
 
 ```sh
 x3f_extract -tiff -color sRGB -color-mode Vivid input.X3F

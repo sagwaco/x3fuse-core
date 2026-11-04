@@ -2050,6 +2050,33 @@ unsafe fn merrill_request_gain(
     wb: *mut libc::c_char,
     control: Control<'_>,
 ) -> Option<[f64; 3]> {
+    let parts = unsafe { merrill_gain_parts(x3f, wb, control) }?;
+    let base: [f64; 3] = if parts.divide {
+        std::array::from_fn(|c| parts.white_balance[c] / 0.55)
+    } else {
+        std::array::from_fn(|c| parts.white_balance[c] + parts.white_balance[c])
+    };
+    Some(std::array::from_fn(|c| {
+        ((base[c] * parts.fnumber[c]) * parts.temperature[c]) * parts.sensor[c]
+    }))
+}
+
+/// The CAMF inputs of the Merrill request gains: WhiteBalanceGains of the
+/// white balance, and the F-number, temperature and sensor gain factors.
+pub(crate) struct MerrillGainParts {
+    pub white_balance: [f64; 3],
+    /// SD1 Merrill (process 2.0.x) divides by 0.55; DP Merrill doubles.
+    pub divide: bool,
+    pub fnumber: [f64; 3],
+    pub temperature: [f64; 3],
+    pub sensor: [f64; 3],
+}
+
+pub(crate) unsafe fn merrill_gain_parts(
+    x3f: *mut x3f_t,
+    wb: *mut libc::c_char,
+    control: Control<'_>,
+) -> Option<MerrillGainParts> {
     let mut wb_gain = [0.0; 3];
     if unsafe {
         x3f_get_camf_matrix_for_wb(
@@ -2063,7 +2090,7 @@ unsafe fn merrill_request_gain(
     } == 0
     {
         if !wb.is_null() && unsafe { CStr::from_ptr(wb) }.to_bytes() == b"Sunlight" {
-            return unsafe { merrill_request_gain(x3f, c"Daylight".as_ptr() as *mut _, control) };
+            return unsafe { merrill_gain_parts(x3f, c"Daylight".as_ptr() as *mut _, control) };
         }
         return None;
     }
@@ -2083,11 +2110,6 @@ unsafe fn merrill_request_gain(
         b"SIGMA SD1 Merrill" => true,
         b"SIGMA DP1 Merrill" | b"SIGMA DP2 Merrill" | b"SIGMA DP3 Merrill" => false,
         _ => return None,
-    };
-    let base: [f64; 3] = if divide {
-        std::array::from_fn(|c| wb_gain[c] / 0.55)
-    } else {
-        std::array::from_fn(|c| wb_gain[c] + wb_gain[c])
     };
     let mut fnumber = [1.0; 3];
     let mut temperature = [1.0; 3];
@@ -2116,10 +2138,13 @@ unsafe fn merrill_request_gain(
             sensor.as_mut_ptr(),
         );
     }
-    let temperature = merrill_temperature_gain(temperature);
-    Some(std::array::from_fn(|c| {
-        ((base[c] * fnumber[c]) * temperature[c]) * sensor[c]
-    }))
+    Some(MerrillGainParts {
+        white_balance: wb_gain,
+        divide,
+        fnumber,
+        temperature: merrill_temperature_gain(temperature),
+        sensor,
+    })
 }
 
 pub(crate) unsafe fn merrill_float_gain_front(
@@ -4205,9 +4230,68 @@ unsafe fn make_merrill_render_luts(
     spp: bool,
     control: Control<'_>,
 ) -> crate::Result<crate::merrill::RenderLuts> {
-    use crate::merrill::{RenderLuts, ToneParams, ToneSettings};
+    let inputs = unsafe { merrill_render_inputs(x3f, encoding, exif, spp, false) }?;
+    crate::merrill::RenderLuts::new(
+        inputs.params,
+        inputs.settings,
+        inputs.target,
+        inputs.native_target,
+        control,
+    )
+}
+
+/// Tone, output matrix and transfer of the Merrill SPP monochrome render.
+///
+/// Native `priProcessGenerateToneLUT` (0xa584c) skips
+/// ColorModeContrastCompensations in monochrome and selects the fixed
+/// "-ToneLUT-BnW-" curve; the TCColorModeSettings row is the one of
+/// "Monochrome" (absent from the compensations list, so its length). Toning
+/// gains are 1,1,1 for plain Monochrome.
+pub(crate) unsafe fn make_merrill_mono_render_luts(
+    x3f: *mut x3f_t,
+    encoding: x3f_color_encoding_t,
+    exif: &crate::jpeg_exif::JpegExif,
+    control: Control<'_>,
+) -> crate::Result<crate::merrill_mono::MonoRenderLuts> {
+    let inputs = unsafe { merrill_render_inputs(x3f, encoding, exif, true, true) }?;
+    let s = inputs.settings;
+    crate::merrill_mono::MonoRenderLuts::new(
+        inputs.params,
+        crate::merrill_mono::MonoToneSettings {
+            pixel_saturation: s.pixel_saturation,
+            exposure: s.exposure,
+            shadows: s.shadows,
+            contrast: s.contrast,
+            highlights: s.highlights,
+        },
+        inputs.target,
+        inputs.native_target,
+        [1.0; 3],
+        control,
+    )
+}
+
+struct MerrillRenderInputs {
+    params: crate::merrill::ToneParams,
+    settings: crate::merrill::ToneSettings,
+    target: [f64; 9],
+    native_target: u32,
+}
+
+unsafe fn merrill_render_inputs(
+    x3f: *mut x3f_t,
+    encoding: x3f_color_encoding_t,
+    exif: &crate::jpeg_exif::JpegExif,
+    spp: bool,
+    mono: bool,
+) -> crate::Result<MerrillRenderInputs> {
+    use crate::merrill::{ToneParams, ToneSettings};
     let mode_bytes = unsafe { (*x3f).header.color_mode.map(|b| b as u8) };
-    let mode = merrill_render_color_mode(&mode_bytes).unwrap_or(c"Standard");
+    let mode = if mono {
+        c"Monochrome"
+    } else {
+        merrill_render_color_mode(&mode_bytes).unwrap_or(c"Standard")
+    };
     let (mut names, mut values, mut count) = (ptr::null_mut(), ptr::null_mut(), 0);
     let (mut contrast, mut ordinal) = (0.0, 0);
     if unsafe {
@@ -4225,8 +4309,10 @@ unsafe fn make_merrill_render_luts(
             let name = unsafe { *names.add(i) };
             if !name.is_null() && unsafe { CStr::from_ptr(name) } == mode {
                 ordinal = i;
-                unsafe {
-                    x3f_get_camf_float(x3f, *values.add(i), &mut contrast);
+                if !mono {
+                    unsafe {
+                        x3f_get_camf_float(x3f, *values.add(i), &mut contrast);
+                    }
                 }
                 break;
             }
@@ -4278,21 +4364,19 @@ unsafe fn make_merrill_render_luts(
         x3f_color_encoding_e_PPRGB => 11,
         _ => unreachable!(),
     };
-    let luts = RenderLuts::new(
-        ToneParams::from_color_mode_rows(&settings_rows, ordinal),
-        ToneSettings {
+    Ok(MerrillRenderInputs {
+        params: ToneParams::from_color_mode_rows(&settings_rows, ordinal),
+        settings: ToneSettings {
             pixel_saturation: f64::from((1u32 << depth) - 1),
             exposure: env_atof("X3F_EV").unwrap_or(0.0),
             shadows: 0.0,
             contrast,
             highlights: 0.0,
-            alternate: false,
+            alternate: mono,
         },
         target,
         native_target,
-        control,
-    )?;
-    Ok(luts)
+    })
 }
 
 unsafe fn merrill_spatial_tables(

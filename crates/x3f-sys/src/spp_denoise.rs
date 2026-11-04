@@ -52,6 +52,7 @@
 
 use crate::{Error, Result};
 
+pub(crate) mod mono;
 pub(crate) mod params;
 pub(crate) mod pipeline;
 pub(crate) mod pixmap;
