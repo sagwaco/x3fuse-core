@@ -300,9 +300,11 @@ fn convert_x3i(
         scene.report.saturation[0], scene.report.saturation[1], scene.report.saturation[2],
     ));
     report.warnings.push(format!(
-        "X3I merge: frames={} s={:.12} fallback_best_snr={} fallback_shortest={} fallback_zero={} clipped_samples={} minimum={:.17} maximum={:.17}",
+        "X3I merge: frames={} s={:.12} fallback_best_snr={} fallback_shortest={} fallback_zero={} fallback_estimate={} unseeded_pixels={} neutral_clipped={} clipped_samples={} minimum={:.17} maximum={:.17}",
         scene.report.frames_used, scene.s, scene.report.fallback_best_snr,
-        scene.report.fallback_shortest, scene.report.fallback_zero, scene.report.clipped_samples,
+        scene.report.fallback_shortest, scene.report.fallback_zero,
+        scene.report.fallback_estimate, scene.report.unseeded_pixels,
+        scene.report.neutral_clipped, scene.report.clipped_samples,
         scene.report.minimum, scene.report.maximum,
     ));
     report.ghost_maps = std::mem::take(&mut scene.ghost_maps);

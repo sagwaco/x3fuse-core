@@ -488,9 +488,12 @@ whose distribution was truncated by the intermediate zero clamp.
 Release all statistics rasters before the accumulation pass reloads frame 0.
 This pass emits Process events. A hash of each first raw T row detects common
 loader changes. Ghost weights use the maximum channel squared residual `z²`,
-`exp(-z²/9)`, and a 3x3 minimum. The estimate starts from the reference, or the
-shortest valid exposure outside reference coverage. Reports count valid ghost
-weights below 0.1. Bin diagnostics go only to the `-x3i-report` file.
+`exp(-z²/9)`, and a 3x3 minimum. The estimate starts from the reference.
+Outside reference coverage, the clipped reference sample is a lower bound.
+There, the shortest valid frame whose T sample is not darker than the
+reference T by more than `max(3 sigma, 5 %)` seeds the estimate. A valid
+frame at a pixel that stays unseeded gets ghost weight zero. Reports count
+valid ghost weights below 0.1. Bin diagnostics go only to the `-x3i-report` file.
 
 Both passes process bands of 128 output rows in ascending order. For each
 band, the merge computes the frame planes only for the band rows, the halo
@@ -509,10 +512,23 @@ cover, unless most of the reference is invalid. See
 Weights use inverse variance with per-frame shield noise, linear and quadratic
 signal terms, exposure scaling squared and spatial gain squared. B and M
 share one chroma weight; T has a luma weight. The reference gets a minimum
-weight where valid. No signal-dependent dark weight is applied. When the
-weight sum is too small, use the valid frame with the best expected SNR.
-If none is valid, use the shortest exposure; otherwise use zero. Reports
-count each fallback and list the exposure multipliers and physical ceilings.
+weight where valid. No signal-dependent dark weight is applied. With ghost
+rejection, when the chroma or the luma weight sum is too small, the pixel
+takes all three planes of the ghost estimate. An unseeded pixel takes a
+stored fallback instead. It starts as the reference sample, blended toward
+camera neutral `n = inverse(camera_to_rgb) * [1, 1, 1]` at the level
+`max_c(x_c) / max_c(n_c)`, so no plane rises above the maximum input plane.
+The blend weight is a smoothstep from `1 - margin` to 1 of the saturation
+footprint `d_max` of the frame that supplies the sample (a step at one for a
+zero margin). Where the reference raw samples of the pixel saturate, each
+later frame that is invalid there through saturation (a finite `d_max` at or
+above the cut, so not a pixel outside the warp) clips its own sample the same
+way. It replaces the fallback if its neutral-clipped T is higher, so the
+fallback is the brightest lower bound. Clipped highlights thus become white.
+Without ghost rejection, use the valid frame with the best expected
+SNR. If none is valid, use the shortest exposure; otherwise use zero. Reports
+count each fallback, the unseeded and neutral-clipped pixels, and list the
+exposure multipliers and physical ceilings.
 
 After accumulation, mask the non-active border and compute `S` from the active
 maximum, with a minimum of one. Store `round(merged/S*65535)` as unsigned

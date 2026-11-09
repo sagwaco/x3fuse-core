@@ -316,6 +316,16 @@ variance after the intermediate zero clamp and conservatively under-rejects dark
 
 The accumulation pass compares each frame with the reference estimate.
 Ghost weights are `exp(-max_channel(z²)/sigma²)`, followed by a 3x3 minimum.
+Where the reference is clipped, a frame seeds the estimate only if its T
+sample is not much darker than the clipped reference sample; a valid frame
+that fails gets weight zero there. A pixel with too little weight takes the
+complete estimate pixel. A pixel that no frame seeded takes the brightest
+neutral-clipped sample: the reference sample, or, where the reference raw
+samples saturate, a brighter saturated sample of a later frame.
+The seed test compares with the reference sample only, so a valid frame that
+passes it wins over a brighter saturated sample of another frame.
+A warped saturated sample can exceed its source samples by the Catmull-Rom
+overshoot, about 12 percent at a plateau edge.
 The default sigma is 3. The weak threshold defaults to the ordinary threshold.
 Weak frames use the smaller of the ordinary and weak sigma controls.
 Reported ghost fractions count valid weights below 0.1. At the default

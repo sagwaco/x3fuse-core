@@ -533,6 +533,15 @@ pub struct MergeReport {
     pub fallback_shortest: usize,
     /// Samples with no available fallback. Valid input frames make this zero.
     pub fallback_zero: usize,
+    /// Samples that took the ghost estimate because a weight sum of their
+    /// pixel is below `w_min`. Only ghost rejection uses this fallback; it
+    /// then replaces the three fallbacks above.
+    pub fallback_estimate: usize,
+    /// Pixels that no frame seeded: the reference is invalid there and every
+    /// valid frame failed the seed test. They keep the reference sample.
+    pub unseeded_pixels: usize,
+    /// Unseeded pixels that the neutral clip changed (blend weight above zero).
+    pub neutral_clipped: usize,
     /// Samples clipped by the optional safety limit.
     pub clipped_samples: usize,
     /// Linear encoding scale. This is at least one and covers the raster maximum.
@@ -2320,7 +2329,12 @@ fn ghost_band(
             control.check()?;
             for (x, weight) in row.iter_mut().enumerate() {
                 let p = y * width + x;
-                if frame.valid[p] == 0 || estimate_var[p][1] == 0.0 {
+                if frame.valid[p] == 0 {
+                    continue;
+                }
+                // The seed test rejected this frame at an unseeded pixel.
+                if estimate_var[p][1] == 0.0 {
+                    *weight = 0.0;
                     continue;
                 }
                 // Share rejection across channels to keep colour ratios stable.
@@ -2412,9 +2426,18 @@ fn band_check(control: Control<'_>) -> Result<(), Error> {
     Ok(control.check()?)
 }
 
+/// Noise tolerance of the seed test, in standard deviations of the frame T sample.
+const SEED_SIGMAS: f32 = 3.0;
+/// Relative tolerance of the seed test, as a fraction of the reference T sample.
+const SEED_FRACTION: f32 = 0.05;
+
 /// Seed the ghost estimate of the pixels of `planes` that no earlier frame
 /// covered. Seeding again from the same planes writes the same values, so a
 /// halo row can be seeded before its own band.
+///
+/// With `copy`, `estimate` holds the clipped reference sample at an unseeded
+/// pixel. That sample is a lower bound of the true value, so a frame seeds
+/// the pixel only if its T sample is not much darker.
 fn seed(
     planes: &FramePlanes,
     estimate: &mut [f32],
@@ -2426,12 +2449,58 @@ fn seed(
     for p in 0..planes.valid.len() {
         if estimate_var[p][1] == 0.0 && planes.valid[p] != 0 {
             if copy {
+                let reference = estimate[p * 3 + 2];
+                let tolerance =
+                    (SEED_SIGMAS * planes.var[p * 2 + 1].sqrt()).max(SEED_FRACTION * reference);
+                if planes.x[p * 3 + 2] < reference - tolerance {
+                    continue;
+                }
                 estimate[p * 3..p * 3 + 3].copy_from_slice(&planes.x[p * 3..p * 3 + 3]);
             }
             estimate_var[p] = correction
                 .map(|c| if above_black[p] != 0 { c } else { 1.0 } * planes.var[p * 2 + 1]);
         }
     }
+}
+
+/// Camera samples of RGB white, `inverse(camera_to_rgb) * [1, 1, 1]`. None
+/// when a component is not finite or not positive.
+fn camera_neutral(camera_to_rgb: &[f64; 9]) -> Option<[f32; 3]> {
+    let inverse = crate::output::dng::metadata::mat3_inverse(camera_to_rgb);
+    let neutral: [f32; 3] =
+        std::array::from_fn(|r| inverse[r * 3..r * 3 + 3].iter().sum::<f64>() as f32);
+    neutral
+        .iter()
+        .all(|n| n.is_finite() && *n > 0.0)
+        .then_some(neutral)
+}
+
+/// Blend a sample `x` toward `neutral`. The neutral is the largest one that
+/// does not raise the maximum plane: `L = max_c(x_c) / max_c(n_c)`. `d` is the
+/// saturation footprint of the frame that supplies the sample. The blend
+/// weight is `smoothstep(1 - margin, 1, d)`; a zero margin gives a step at
+/// one. Returns the sample and the blend weight.
+fn neutral_clip(x: [f32; 3], neutral: Option<[f32; 3]>, d: f32, margin: f32) -> ([f32; 3], f32) {
+    let Some(n) = neutral else {
+        return (x, 0.0);
+    };
+    let level = x.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+        / n.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if level.is_nan() || level <= 0.0 {
+        return (x, 0.0);
+    }
+    let t = if margin > 0.0 {
+        let s = ((d - (1.0 - margin)) / margin).clamp(0.0, 1.0);
+        s * s * (3.0 - 2.0 * s)
+    } else if d >= 1.0 {
+        1.0
+    } else {
+        0.0
+    };
+    if t.is_nan() {
+        return (x, 0.0);
+    }
+    (std::array::from_fn(|c| x[c] + t * (n[c] * level - x[c])), t)
 }
 
 /// Change aligned statistics samples from the nominal scale to the applied
@@ -2526,7 +2595,11 @@ fn sparse_is_smaller(
     w_min <= 1e-3 && 32 * invalid + 8 * (height + 1) + seeded * pixels < dense
 }
 
-/// Fallback candidates and ghost-estimate variances.
+/// Fallback candidates and ghost-estimate variances. With ghost rejection,
+/// the fallback of a pixel that no frame seeded is the neutral-clipped
+/// reference sample. Where the reference raw samples saturate, a brighter
+/// neutral-clipped sample of a later saturated frame replaces it. The
+/// best-SNR slots keep the blend weight and the reference saturation flag.
 ///
 /// After the reference frame, a pixel whose weights are both at least `w_min`
 /// never reads its fallback: later weights are not negative, and adding them
@@ -3221,6 +3294,8 @@ fn merge_in_bands(
     };
     let mut reserve = Reserve::new(sparse, pixels, ghost, live);
     let mut scratch = Scratch::default();
+    let ceiling = options.saturation.unwrap_or([1.0; 3]);
+    let neutral = camera_neutral(&camera_to_rgb);
     let mut shortest_us = u32::MAX;
     // The first valid sample after the reference must come from the shortest exposure.
     let mut order: Vec<_> = (1..frame_count).collect();
@@ -3361,6 +3436,8 @@ fn merge_in_bands(
                 reserve.gather_fallback(rows.clone(), w, &mut scratch);
             }
             let offset = central.start;
+            // Ghost-estimate variances of `planes` after `seed`; zero is unseeded.
+            let seeded_var = &scratch.estimate_var;
             sum[rows.start * w * 3..rows.end * w * 3]
                 .par_chunks_mut(w * 3)
                 .zip(weights[rows.start * w..rows.end * w].par_chunks_mut(w))
@@ -3393,11 +3470,11 @@ fn merge_in_bands(
                                     planes.x[p * 3 + 2].max(0.0).powi(2)
                                 };
                                 let expected = expected_signal / var;
-                                let better = valid && expected > best_snr[x][group];
+                                let better = !ghost && valid && expected > best_snr[x][group];
                                 for c in if group == 0 { 0..2 } else { 2..3 } {
                                     let value = planes.x[p * 3 + c];
                                     sum[x * 3 + c] += w * value;
-                                    if better || (shortest && best_snr[x][group] < 0.0) {
+                                    if better || (!ghost && shortest && best_snr[x][group] < 0.0) {
                                         fallback[x][c] = value;
                                     }
                                 }
@@ -3405,6 +3482,52 @@ fn merge_in_bands(
                                     best_snr[x][group] = expected;
                                 }
                                 weights[x][group] += w;
+                            }
+                            // With ghost rejection, the fallback storage keeps
+                            // the brightest neutral-clipped sample of a pixel
+                            // that no frame seeded. The first best-SNR slot
+                            // keeps its blend weight `t`. The second slot is 1
+                            // where the reference raw samples of the pixel
+                            // saturate, else 0. The reference starts the
+                            // fallback. At a saturated reference pixel, a later
+                            // frame replaces it where saturation makes the frame
+                            // invalid and its neutral-clipped T is brighter. A
+                            // pixel outside the warp has an infinite `d_max`.
+                            if ghost {
+                                let sample = std::array::from_fn(|c| planes.x[p * 3 + c]);
+                                let d = planes.d_max[p];
+                                let margin = options.validity_margin;
+                                if i == 0 {
+                                    let (value, t, saturated) = if valid {
+                                        (sample, 0.0, false)
+                                    } else {
+                                        let q = (rows.start + y) * w + x;
+                                        let half = (rows.start + y) / 2
+                                            * frame.raw_half_width as usize
+                                            + x / 2;
+                                        let own = (0..3)
+                                            .map(|c| {
+                                                raw(&frame, c, if c == 2 { q } else { half })
+                                                    / ceiling[c]
+                                            })
+                                            .fold(f32::NEG_INFINITY, f32::max);
+                                        let (value, t) = neutral_clip(sample, neutral, d, margin);
+                                        (value, t, own >= cut)
+                                    };
+                                    fallback[x] = value;
+                                    best_snr[x] = [t, f32::from(u8::from(saturated))];
+                                } else if !valid
+                                    && seeded_var[p][1] == 0.0
+                                    && best_snr[x][1] == 1.0
+                                    && d.is_finite()
+                                    && d >= cut
+                                {
+                                    let (value, t) = neutral_clip(sample, neutral, d, margin);
+                                    if value[2] > fallback[x][2] {
+                                        fallback[x] = value;
+                                        best_snr[x][0] = t;
+                                    }
+                                }
                             }
                         }
                         Ok(())
@@ -3445,6 +3568,9 @@ fn merge_in_bands(
     for rows in bands(band.max(1)) {
         band_check(control)?;
         reserve.gather_fallback(rows.clone(), w, &mut scratch);
+        if ghost {
+            reserve.gather_var(rows.clone(), w, &mut scratch.estimate_var);
+        }
         let (fallback, best_snr) = (&scratch.fallback, &scratch.best_snr);
         for (y, row) in sum[rows.start * w * 3..rows.end * w * 3]
             .chunks_mut(w * 3)
@@ -3460,7 +3586,22 @@ fn merge_in_bands(
                 if !weight.is_finite() || !value.is_finite() {
                     return Err(Error::InvalidData("non-finite X3I accumulation".into()));
                 }
-                if weight >= options.w_min {
+                // With ghost rejection, a pixel with either weight sum below
+                // `w_min` takes the complete estimate pixel. An unseeded pixel
+                // takes the neutral-clipped reference sample.
+                let unseeded = ghost && scratch.estimate_var[local][1] == 0.0;
+                if ghost && c == 0 && unseeded {
+                    report.unseeded_pixels += 1;
+                    report.neutral_clipped += usize::from(best_snr[local][0] > 0.0);
+                }
+                if ghost && weights[p].iter().any(|&v| v < options.w_min) {
+                    *value = if unseeded {
+                        fallback[local][c]
+                    } else {
+                        estimate[p * 3 + c]
+                    };
+                    report.fallback_estimate += 1;
+                } else if weight >= options.w_min {
                     *value /= weight;
                 } else if best_snr[local][group] >= 0.0 {
                     *value = fallback[local][c];
@@ -6374,10 +6515,13 @@ mod tests {
             .iter()
             .all(|&n| n >= 50));
         assert!(scene.bmt.iter().all(|v| v.is_finite() && *v <= 1.0));
-        assert!(scene.report.fallback_shortest > 0);
+        // Ghost rejection replaces the old fallbacks with the estimate.
+        assert!(scene.report.fallback_estimate > 0);
+        assert!(scene.report.unseeded_pixels > 0 && scene.report.neutral_clipped > 0);
+        assert_eq!(scene.report.fallback_shortest, 0);
         assert_eq!(scene.report.fallback_best_snr, 0);
         assert_eq!(scene.report.fallback_zero, 0);
-        assert!(scene.report.fallback_shortest < scene.bmt.len());
+        assert!(scene.report.fallback_estimate < scene.bmt.len());
         assert_eq!(scene.report.ghost_fractions[0], 0.0);
         for (scale, nominal) in scene.report.scales.iter().zip(&scene.report.nominal_scales) {
             assert!((scale / nominal).log2().abs() <= 0.3);
@@ -6884,6 +7028,331 @@ mod tests {
         assert_eq!(clipped.report.warnings().len(), 1);
     }
 
+    /// `phase1_options` with ghost rejection.
+    fn ghost_options() -> MergeOptions {
+        MergeOptions {
+            ghost_rejection: true,
+            ..phase1_options()
+        }
+    }
+
+    /// A clipped reference with unequal planes, and a valid 1/4 exposure that
+    /// shows `level` in reference units in all planes.
+    fn clipped_reference_pair(level: f32) -> MergedScene {
+        merge(
+            2,
+            |i| {
+                let mut f = frame([1000, 250][i], 2.0);
+                if i == 0 {
+                    for pixel in f.bmt.chunks_mut(3) {
+                        pixel.copy_from_slice(&[0.6, 0.8, 1.0]);
+                    }
+                } else {
+                    f.bmt.fill(level / 4.0);
+                }
+                Ok(f)
+            },
+            &ghost_options(),
+            Control::none(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn darker_frame_does_not_seed_a_clipped_reference_pixel() {
+        let scene = clipped_reference_pair(0.2);
+        // The output is the neutral-clipped reference sample, not the dark frame.
+        assert!(
+            scene.bmt.iter().all(|v| (*v - 1.0).abs() < 1e-6),
+            "{:?}",
+            &scene.bmt[..3]
+        );
+        let report = &scene.report;
+        assert_eq!(report.ghost_fractions[1], 1.0);
+        assert_eq!((report.unseeded_pixels, report.neutral_clipped), (256, 256));
+        assert_eq!(report.fallback_estimate, 768);
+        assert_eq!(
+            report.fallback_best_snr + report.fallback_shortest + report.fallback_zero,
+            0
+        );
+        assert_eq!(report.minimum, 1.0);
+    }
+
+    #[test]
+    fn brighter_frame_seeds_a_clipped_reference_pixel() {
+        let scene = clipped_reference_pair(1.2);
+        assert!(
+            scene.bmt.iter().all(|v| (*v - 1.2).abs() < 1e-6),
+            "{:?}",
+            &scene.bmt[..3]
+        );
+        let report = &scene.report;
+        assert_eq!(report.ghost_fractions[1], 0.0);
+        assert_eq!(report.unseeded_pixels + report.fallback_estimate, 0);
+    }
+
+    #[test]
+    fn low_weight_sums_take_the_complete_estimate_pixel() {
+        let reference = [0.2f32, 0.25, 0.3];
+        let run = |w_min, sigma: [f32; 3]| {
+            let options = MergeOptions {
+                w_min,
+                noise_k: [0.0; 3],
+                ..ghost_options()
+            };
+            merge(
+                2,
+                |i| {
+                    let mut f = frame([1000, 500][i], 0.2);
+                    f.sigma = sigma;
+                    // Frame 1 has a slightly different colour, inside the T noise.
+                    let color = if i == 0 {
+                        reference
+                    } else {
+                        [0.101, 0.124, 0.151]
+                    };
+                    for pixel in f.bmt.chunks_mut(3) {
+                        pixel.copy_from_slice(&color);
+                    }
+                    Ok(f)
+                },
+                &options,
+                Control::none(),
+            )
+            .unwrap()
+        };
+        // Both weight sums below `w_min`.
+        let both = run(f32::MAX, [0.001; 3]);
+        // Chroma sums are at most about 62, luma sums about 1.2e4.
+        let chroma_only = run(1000.0, [0.1, 0.1, 0.01]);
+        for scene in [&both, &chroma_only] {
+            assert_eq!(scene.report.ghost_fractions[1], 0.0);
+            assert_eq!(scene.report.fallback_estimate, 768);
+            assert_eq!(scene.report.unseeded_pixels, 0);
+            for pixel in scene.bmt.chunks(3) {
+                assert_eq!(pixel, reference);
+            }
+        }
+        // With the default `w_min`, the same frames accumulate a mixed T value.
+        let mixed = run(1e-3, [0.1, 0.1, 0.01]);
+        assert_eq!(mixed.report.fallback_estimate, 0);
+        assert!(mixed.bmt[2] > reference[2]);
+    }
+
+    #[test]
+    fn neutral_clip_uses_the_footprint_and_keeps_valid_pixels() {
+        // Camera samples to RGB with a positive neutral.
+        let matrix = [1.6, -0.4, -0.1, -0.3, 1.5, -0.2, -0.1, -0.5, 1.7];
+        let gain = [1.5f32, 0.7, 1.2];
+        let load = |_| {
+            let mut f = frame(1000, 0.7);
+            f.camera_to_rgb = matrix;
+            f.gain = Some(gain.repeat(256));
+            for p in 0..256 {
+                // The left half clips in every plane; the right half is at 0.7.
+                let level = if p % 16 < 8 { 1.0 } else { 0.7 };
+                f.raw_top[p] = (level * 10000.0) as u16;
+                if p / 16 % 2 == 0 && p % 2 == 0 {
+                    let half = p / 32 * 8 + p % 16 / 2;
+                    f.raw_half[half * 2..half * 2 + 2].fill((level * 10000.0) as u16);
+                }
+                for c in 0..3 {
+                    // A processed sample that is no longer in raw units.
+                    f.bmt[p * 3 + c] = level * gain[c] * [0.9, 1.0, 1.1][c];
+                }
+            }
+            Ok(f)
+        };
+        let scene = merge(1, load, &ghost_options(), Control::none()).unwrap();
+        let input = load(0).unwrap().bmt;
+        let report = &scene.report;
+        // The footprint also makes the right-half pixels next to the clipped
+        // half invalid. Their processed samples are contaminated, so they
+        // become neutral too. Valid pixels stay unchanged.
+        assert!(report.unseeded_pixels > 128);
+        assert_eq!(report.neutral_clipped, report.unseeded_pixels);
+        let neutral = |x: &[f32]| {
+            let rgb: [f64; 3] =
+                std::array::from_fn(|r| (0..3).map(|c| matrix[r * 3 + c] * f64::from(x[c])).sum());
+            (rgb[0] - rgb[1]).abs() < 1e-5 && (rgb[1] - rgb[2]).abs() < 1e-5
+        };
+        let mut changed = 0;
+        for p in 0..256 {
+            let (x, before) = (&scene.bmt[p * 3..p * 3 + 3], &input[p * 3..p * 3 + 3]);
+            let unchanged = (0..3).all(|c| (x[c] - before[c]).abs() < 1e-6);
+            if p % 16 < 8 || !unchanged {
+                changed += 1;
+                assert!(neutral(x), "pixel {p}");
+                // The neutral does not raise the maximum plane.
+                let largest = before.iter().copied().fold(f32::MIN, f32::max);
+                assert!(x.iter().all(|&v| v <= largest * (1.0 + 1e-6)), "pixel {p}");
+                assert!(x.iter().any(|&v| v >= largest * (1.0 - 1e-6)), "pixel {p}");
+            }
+        }
+        assert_eq!(changed, report.unseeded_pixels);
+        assert!(report.minimum <= report.maximum && f64::from(report.maximum) <= scene.s);
+    }
+
+    #[test]
+    fn neutral_clip_handles_a_zero_margin_and_dark_samples() {
+        let n = Some([0.5f32, 1.0, 0.8]);
+        let x = [0.9f32, 0.6, 1.2];
+        // A zero margin is a step at one.
+        assert_eq!(neutral_clip(x, n, 0.999, 0.0), (x, 0.0));
+        let (value, t) = neutral_clip(x, n, 1.0, 0.0);
+        assert_eq!(t, 1.0);
+        // The level keeps the maximum plane: L = 1.2 / 1.0.
+        for (v, e) in value.iter().zip([0.6, 1.2, 0.96]) {
+            assert!((v - e).abs() < 1e-6, "{value:?}");
+        }
+        // Half way up the smooth step.
+        assert!((neutral_clip(x, n, 0.925, 0.15).1 - 0.5).abs() < 1e-5);
+        // No level, no finite d, or no neutral: no change.
+        assert_eq!(
+            neutral_clip([-0.1, 0.0, -0.2], n, 1.0, 0.15),
+            ([-0.1, 0.0, -0.2], 0.0)
+        );
+        assert_eq!(neutral_clip(x, n, f32::NAN, 0.15), (x, 0.0));
+        assert_eq!(neutral_clip(x, None, 1.0, 0.15), (x, 0.0));
+    }
+
+    /// Frames of `exposures` that clip in every plane, with unequal processed
+    /// planes `[0.6, 0.8, 1.0]` in their own units.
+    fn all_clipped(exposures: &[u32]) -> MergedScene {
+        merge(
+            exposures.len(),
+            |i| {
+                let mut f = frame(exposures[i], 16.0);
+                for pixel in f.bmt.chunks_mut(3) {
+                    pixel.copy_from_slice(&[0.6, 0.8, 1.0]);
+                }
+                Ok(f)
+            },
+            &ghost_options(),
+            Control::none(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn all_clipped_pixel_takes_the_brightest_lower_bound_as_neutral() {
+        // The 1/8 exposure gives the largest lower bound, T = 8. The longer
+        // frame (T = 0.5) is darker and does not replace it.
+        let scene = all_clipped(&[1000, 125, 2000]);
+        assert_eq!(scene.report.unseeded_pixels, 256);
+        assert_eq!(scene.report.neutral_clipped, 256);
+        for pixel in scene.bmt.chunks(3) {
+            // Neutral, not below the shortest frame's scaled T, and no plane
+            // above the largest input plane.
+            assert!(pixel.iter().all(|&v| (v - 8.0).abs() < 1e-5), "{pixel:?}");
+        }
+        assert!(scene.report.maximum <= 8.0 + 1e-5);
+    }
+
+    #[test]
+    fn darker_invalid_frame_does_not_replace_the_fallback() {
+        // The longer frame is invalid and darker (T = 0.5) than the
+        // neutral-clipped reference (T = 1).
+        let scene = all_clipped(&[1000, 2000]);
+        assert_eq!(scene.report.unseeded_pixels, 256);
+        assert!(
+            scene.bmt.iter().all(|&v| (v - 1.0).abs() < 1e-6),
+            "{:?}",
+            &scene.bmt[..3]
+        );
+    }
+
+    #[test]
+    fn saturated_later_frame_replaces_only_saturated_reference_pixels() {
+        let scene = merge(
+            2,
+            |i| {
+                let mut f = frame([1000, 2000][i], 0.5);
+                if i == 0 {
+                    // The left half saturates; the right half is a real 0.5.
+                    for p in (0..256).filter(|p| p % 16 < 8) {
+                        f.raw_top[p] = 10000;
+                        f.bmt[p * 3..p * 3 + 3].fill(1.0);
+                    }
+                    for h in (0..64).filter(|h| h % 8 < 4) {
+                        f.raw_half[h * 2..h * 2 + 2].fill(10000);
+                    }
+                } else {
+                    // A longer frame that saturates everywhere and is brighter
+                    // than the reference everywhere: 3 * 0.5 = 1.5.
+                    f.raw_top.fill(10000);
+                    f.raw_half.fill(10000);
+                    f.bmt.fill(3.0);
+                }
+                Ok(f)
+            },
+            &ghost_options(),
+            Control::none(),
+        )
+        .unwrap();
+        // The footprint makes right-half pixels next to the edge invalid.
+        assert!(scene.report.unseeded_pixels > 128);
+        for p in 0..256 {
+            let expected = if p % 16 < 8 { 1.5 } else { 0.5 };
+            let x = &scene.bmt[p * 3..p * 3 + 3];
+            assert!(
+                x.iter().all(|&v| (v - expected).abs() < 1e-5),
+                "pixel {p}: {x:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_compares_its_neutral_clipped_t() {
+        // The camera neutral is [1, 1, 0.5]; the reference sample is already
+        // neutral with T = 0.5.
+        let scene = merge(
+            2,
+            |i| {
+                let mut f = frame([1000, 2000][i], 16.0);
+                f.camera_to_rgb = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 2.0];
+                // The later frame has a higher input T (0.6) but a lower
+                // neutral-clipped T (0.3).
+                let color = if i == 0 {
+                    [1.0, 1.0, 0.5]
+                } else {
+                    [0.4, 0.4, 1.2]
+                };
+                for pixel in f.bmt.chunks_mut(3) {
+                    pixel.copy_from_slice(&color);
+                }
+                Ok(f)
+            },
+            &ghost_options(),
+            Control::none(),
+        )
+        .unwrap();
+        assert_eq!(scene.report.unseeded_pixels, 256);
+        for pixel in scene.bmt.chunks(3) {
+            for (v, e) in pixel.iter().zip([1.0, 1.0, 0.5]) {
+                assert!((v - e).abs() < 1e-6, "{pixel:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_ghost_mode_keeps_the_old_fallbacks() {
+        let clipped = merge(
+            3,
+            |i| Ok(frame([1000, 125, 2000][i], 16.0)),
+            &phase1_options(),
+            Control::none(),
+        )
+        .unwrap();
+        assert_eq!(clipped.bmt, vec![8.0; 768]);
+        let report = &clipped.report;
+        assert_eq!(report.fallback_shortest, 768);
+        assert_eq!(
+            report.fallback_estimate + report.unseeded_pixels + report.neutral_clipped,
+            0
+        );
+    }
+
     #[test]
     fn weights_use_measured_noise_gain_and_sigma_override() {
         for sigma_override in [None, Some(0.01)] {
@@ -7384,10 +7853,25 @@ mod tests {
                 assert!(report.calibration_blocks[1..].iter().all(|&n| n > 0));
                 assert!(report.exposure_fields[1..].iter().all(Option::is_some));
             }
-            assert!(report.fallback_shortest > 0);
+            assert!(report.fallback_estimate > 0 && report.unseeded_pixels > 0);
+            assert_eq!(report.fallback_shortest + report.fallback_best_snr, 0);
             if w_min > 1.0 {
-                assert!(report.fallback_best_snr > 0);
+                assert_eq!(report.fallback_estimate, whole.bmt.len());
             }
+            // Every frame clips the bottom rows. A later frame that is
+            // brighter there replaces the neutral reference fallback, so
+            // the band and layout comparisons cover later-frame writes.
+            let reference = band_frame(0, [256, 256], clip, gain).bmt;
+            let replaced = (256 * 248..256 * 256)
+                .filter(|&p| {
+                    let level = reference[p * 3..p * 3 + 3]
+                        .iter()
+                        .copied()
+                        .fold(f32::MIN, f32::max);
+                    (whole.bmt[p * 3 + 2] - level).abs() > 1e-6
+                })
+                .count();
+            assert!(replaced > 0, "clip {clip} w_min {w_min}");
             for (band, sparse) in [
                 (1, Some(true)),
                 (2, None),
