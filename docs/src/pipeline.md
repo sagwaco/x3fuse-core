@@ -432,7 +432,8 @@ maximum `d` over the exact expansion footprint and its 3x3 neighbourhood.
 An invalid contributing sample rejects the expanded output. The default knee
 is 0.75, width 0.02 and validity margin 0.15, relative to that ceiling.
 
-Phase 2 loads every frame twice through a repeatable loader. The statistics
+Phase 2 loads every frame twice through a repeatable loader (a dropped
+frame once). The statistics
 pass emits Decode events. It aligns each frame to reference T, with a
 whole-frame coarse stage before the tiles. A skipped alignment stays at the
 identity transform with a warning. If another frame shows camera motion, the

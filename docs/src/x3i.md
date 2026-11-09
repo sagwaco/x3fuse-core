@@ -228,7 +228,8 @@ Frames without a local field use the original global estimate.
 by half a tile step from the fitting grid. It is absent with fewer than six
 trusted tiles. This maximum includes subject motion, not only camera motion.
 The local search covers eight full-resolution pixels around
-the global transform; the global search still covers 64 pixels.
+the global transform; the tile search still covers 64 pixels around the
+coarse shift.
 The field uses tile-sized storage. The merge warps one band of output rows at
 a time, from the source rows that the taps of that band read.
 A scalar exposure fit uses the median of the two highest clean, supported bin
@@ -334,7 +335,8 @@ the minimum.
 Summary and alignment rows remain on stderr. Ratio and ghost bins are
 written only with `-x3i-report`.
 
-Every frame is prepared once in each pass, for `2n` merge-loader calls.
+Every frame is prepared once in each pass, for `2n` merge-loader calls. A
+dropped frame is prepared once.
 Decode events occur in statistics and Process events in accumulation.
 Statistics rasters are released before accumulation. See [Memory](#memory)
 for the measured peak memory, and the

@@ -14,13 +14,17 @@
 //! The hard cut excludes the compressed pile near 0.94 to 0.97 of the ceiling.
 //! Accept raw agreement within 1 percent per bin.
 //! For bins outside that tolerance, allow estimated weighted bias up to 0.2 percent.
-//! Ratio refinement accepts frame-wide exposure offsets within 0.3 EV.
+//! Ratio refinement accepts frame-wide exposure offsets within 0.5 EV.
 //! The zero clamp raises the mean near black. Short frames can then show a level
 //! trend without a response-curve change. Ratio fits and their bins require the
 //! integer-paired raw T sample above ten times that frame's read noise.
-//! Use the median of supported bin medians whose mean frame signal exceeds
-//! thirty read sigmas and whose reference is below the roll-off knee. Require
-//! two clean bins and apply the 2 percent trend gate only to these bins.
+//! A clean bin is a supported bin whose mean frame signal exceeds thirty read
+//! sigmas and whose reference is below the roll-off knee. The scale is the
+//! median of the two highest clean bins, or the one clean bin: these levels are
+//! nearest to the hand-off from the reference. With a trusted alignment, one
+//! clean bin is sufficient and a trend above 2 percent only gives a warning.
+//! Otherwise require two clean bins and keep the shutter ratio when their trend
+//! is above 2 percent.
 //! Near-black bias is nonlinear, so an affine fit can bend the slope. Keep
 //! its offset only as a diagnostic. It does not change the scale or pixels.
 //! Keep the nominal scale when clean support is too small.
@@ -47,6 +51,9 @@
 //! estimate. Fix c_ref at one and fit each c_i from at least 50 flat blocks
 //! with both raw T samples above ten read sigmas. Clamp c_i to [0.5, 4]
 //! by default. Weak alignment can use a separate ghost threshold.
+//! A coarse whole-frame phase correlation extends the alignment range to
+//! 320 pixels. If another frame shows camera motion, a frame with a skipped
+//! alignment is excluded from the merge.
 //! Below ten sigmas, use the untruncated model without correction. It overestimates
 //! near-black variance and conservatively under-rejects these samples.
 //! Flag calibration when the median reference model term exceeds eight times
@@ -54,6 +61,14 @@
 //! The raw model used for merge weights stays unchanged.
 //! The merge applies no signal-dependent dark weight. Unsigned DNG encoding
 //! clamps negative merged samples to zero.
+//! With ghost rejection, a frame seeds the estimate at a clipped reference
+//! pixel only if its T sample is not much darker than the reference sample. A
+//! pixel with a chroma or luma weight sum below `w_min` takes the complete
+//! estimate pixel. A pixel that no frame seeded keeps the reference sample,
+//! blended toward camera neutral by its saturation footprint. Where the
+//! reference raw samples saturate, a brighter saturated sample of another frame
+//! replaces it, so a pixel that clips in every frame takes the brightest lower
+//! bound.
 //!
 //! The expansion builds its half-resolution top sum from unrepaired samples.
 //! A defective top pixel can contaminate chroma in its 8x8 expanded block.
@@ -538,7 +553,8 @@ pub struct MergeReport {
     /// then replaces the three fallbacks above.
     pub fallback_estimate: usize,
     /// Pixels that no frame seeded: the reference is invalid there and every
-    /// valid frame failed the seed test. They keep the reference sample.
+    /// valid frame failed the seed test. They take the neutral-clipped
+    /// reference sample, or a brighter saturated sample of another frame.
     pub unseeded_pixels: usize,
     /// Unseeded pixels that the neutral clip changed (blend weight above zero).
     pub neutral_clipped: usize,
@@ -2847,7 +2863,8 @@ impl Reserve {
     }
 }
 
-/// Load each frame once for statistics and once for accumulation (2n calls).
+/// Load each frame once for statistics and once for accumulation (2n calls,
+/// less one for each dropped frame).
 /// Frame zero defines units. The loader must return the same data on both calls.
 /// Dimensions, exposure and a hash of the first raw top row detect common changes.
 /// The hash is a cheap check, not a check of every sample. Report stages once per index.
@@ -3618,7 +3635,7 @@ fn merge_in_bands(
                 }
                 // With ghost rejection, a pixel with either weight sum below
                 // `w_min` takes the complete estimate pixel. An unseeded pixel
-                // takes the neutral-clipped reference sample.
+                // takes its stored fallback.
                 let unseeded = ghost && scratch.estimate_var[local][1] == 0.0;
                 if ghost && c == 0 && unseeded {
                     report.unseeded_pixels += 1;
