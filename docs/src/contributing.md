@@ -436,7 +436,22 @@ container reporting, seven-frame DNG dispatch, cancellation cleanup and
 existing-output preservation. Scene tests check finite active-area RGB and
 extended highlight range. TIFF and PPM must use the merged raster.
 
-The phase 2 dp0 merged DNG has the intentional macOS aarch64 MD5 pin
+The dp0 merged DNG has the intentional macOS aarch64 MD5 pin
+`3bc2b1ccdd1b8bae53bee0adc5aca085` with `-dng -no-denoise`. It replaces
+`c6a5e36dcca767e66a4e2214f4daeeef`. The merge now keeps highlights consistent
+with the reference: a frame seeds a clipped reference pixel only if it is not
+much darker, a pixel without weight takes the ghost estimate, and a clipped
+pixel without a seed becomes neutral. The alignment and the exposure fields of
+dp0 do not change. The sd Quattro H merge pin is
+`00e9418f491947768c156c3b0a82b122`. It replaces
+`83e77601eef101a1a075b72d73831ecc`: frames 1 and 2 take their scalar from the
+two highest clean bins (0.19 and 0.11 percent lower). The current
+`X3F_X3I_NO_ALIGN=1` dp0 digest is `98d4850a95a0ea1fbab4352ed2962aa0`. The
+digests in the next paragraph are the history before this change. The
+settings named there reproduced them at that time; they do not reproduce them
+now.
+
+Before that, the phase 2 dp0 merged DNG had the pin
 `c6a5e36dcca767e66a4e2214f4daeeef` with `-dng -no-denoise`. The per-frame
 exposure field replaces the scalar ratio on all six dp0 frames, so samples,
 variances, the `k` fit, calibration and ghost residuals change. The flat-block
@@ -451,7 +466,7 @@ misregistration). That pin replaced `c6a5e36d`, and the least median of squares
 seed had replaced `9085649cc28faa01e8faa0c5e572cc13` from the trimmed
 least-squares fit; tiles far from the seed no longer bend the plane. The first
 field pin replaced `48fde3f0f196c1f22e9ecd26d2955dc8`, which
-`X3F_X3I_RATIO_FIELD=0` still reproduces. The sd Quattro H merge pin is
+`X3F_X3I_RATIO_FIELD=0` reproduced. The sd Quattro H merge pin was
 `83e77601eef101a1a075b72d73831ecc`; its fields pass both trend gates. It
 replaces `7e24e87f4c17b10bced3932b977c39a7` from the trimmed fit and
 `b6525a4b96af30644c5b4c5377681e2b` from before the field. Frames 3 to 6 use
@@ -464,8 +479,8 @@ change. Clean-bin scalar refinement and anchored effective-variance calibration
 had replaced the aligned pin `db749dee7d09a65817c2df39dcf235d7`. That earlier
 aligned pin, at commit `38bbeef`, replaced phase 1
 `494b455d3286dfdc1c5243ad60a31284`; at that commit, `X3F_X3I_NO_ALIGN=1`
-reproduces `302684ec51a01cddbd4ae76cc3e2bc29`. The current `X3F_X3I_NO_ALIGN=1`
-digest is `66a48b2ddc312babdd79d81a50741f85`. Without alignment, frames 2 to 6
+reproduces `302684ec51a01cddbd4ae76cc3e2bc29`. The `X3F_X3I_NO_ALIGN=1`
+digest was `66a48b2ddc312babdd79d81a50741f85`. Without alignment, frames 2 to 6
 use their fields, because flat blocks are not biased by misregistration
 (flat-block trend 0.43 percent or less, pixel-pair trend up to 371 percent).
 The unaligned research path can drop misregistered frames to the fallback: on

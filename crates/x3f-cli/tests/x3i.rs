@@ -321,7 +321,7 @@ fn corpus_dng_merge_writes_seven_frame_report() {
             let expected = common::file_md5(&dng);
             // This float output hash was recorded on macOS aarch64.
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            assert_eq!(expected, "c6a5e36dcca767e66a4e2214f4daeeef");
+            assert_eq!(expected, "3bc2b1ccdd1b8bae53bee0adc5aca085");
             let report_path = scratch.0.join(format!("{name}.x3i-report"));
             std::fs::remove_file(&report_path).unwrap();
             std::fs::create_dir(&report_path).unwrap();

@@ -6355,6 +6355,69 @@ mod tests {
     }
 
     #[test]
+    fn dropped_shortest_frame_gives_no_seed_and_no_fallback() {
+        // The reference and frame 1 clip. Frame 2 is the shortest and the only
+        // frame that is valid there, but its alignment is skipped in a stack
+        // that moved. If it took part, the output would be 2.
+        let moved = Alignment {
+            dx: 10.0,
+            peak: 1.0,
+            retained_tiles: 9,
+            ..Default::default()
+        };
+        let skipped = Alignment {
+            skipped: true,
+            ..Default::default()
+        };
+        let exposures = [1000, 2000, 250];
+        let run = |band: usize, sparse: Option<bool>| {
+            ALIGNMENTS.with(|a| {
+                *a.borrow_mut() = vec![Alignment::default(), moved.clone(), skipped.clone()]
+            });
+            let mut calls = [0usize; 3];
+            let options = MergeOptions {
+                ghost_maps: true,
+                ..Default::default()
+            };
+            let scene = merge_in_bands(
+                3,
+                |i| {
+                    calls[i] += 1;
+                    Ok(MergeFrame {
+                        frame_index: i,
+                        ..frame(exposures[i], 2.0)
+                    })
+                },
+                &options,
+                Control::none(),
+                band,
+                sparse,
+            );
+            ALIGNMENTS.with(|a| a.borrow_mut().clear());
+            (scene.unwrap(), calls)
+        };
+        let (whole, calls) = run(16, None);
+        assert_eq!(calls, [2, 2, 1]);
+        assert_eq!(whole.report.dropped, [false, false, true]);
+        assert_eq!(whole.report.frames_used, 2);
+        assert!(whole.ghost_maps.iter().all(|m| m.frame_index != 2));
+        assert!(
+            whole.bmt.iter().all(|v| (*v - 1.0).abs() < 1e-6),
+            "{:?}",
+            &whole.bmt[..3]
+        );
+        assert_eq!(whole.report.unseeded_pixels, 256);
+        for (band, sparse) in [
+            (1, Some(true)),
+            (1, Some(false)),
+            (5, Some(true)),
+            (5, Some(false)),
+        ] {
+            assert_eq!(run(band, sparse).0.bmt, whole.bmt, "band {band} {sparse:?}");
+        }
+    }
+
+    #[test]
     fn variance_ceiling_bounds_fits_and_low_support_fallbacks() {
         let block = CalibrationBlock {
             residual: [10.0; 3],
