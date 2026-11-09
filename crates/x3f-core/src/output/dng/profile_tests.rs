@@ -745,6 +745,7 @@ fn legacy_profiles_keep_the_as_shot_camera_white() {
             &wb,
             &calibration,
             1.0,
+            None,
             &mut Vec::new(),
             x3f_sys::Control::none(),
         )
@@ -1250,6 +1251,7 @@ fn color_mode_recovery_scale_is_restored_once() {
                     &wb,
                     &calibration,
                     scale,
+                    None,
                     &mut Vec::new(),
                     x3f_sys::Control::none(),
                 )
@@ -1327,6 +1329,7 @@ fn sd_quattro_digital_iso_gain_enters_mode_profiles_once() {
                 &wb,
                 &calibration,
                 1.0,
+                None,
                 &mut Vec::new(),
                 x3f_sys::Control::none(),
             )

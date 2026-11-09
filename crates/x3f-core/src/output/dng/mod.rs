@@ -199,6 +199,13 @@ pub(crate) fn write_prepared(
     let (out_rows, out_cols) = crop
         .map(|(_, _, r, c)| (r, c))
         .unwrap_or((image.rows, image.columns));
+    // A prebuilt raster adds its headroom to the serialized reference baseline
+    // without coarse EV rounding. The profiles cancel this same value.
+    let prebuilt_exposure = prebuilt.then(|| {
+        let reference = camera_baseline_exposure(reader, &calibration, 1.0).unwrap_or(0.0);
+        let reference = ((reference as f32 as f64) * 10_000.0).round() / 10_000.0;
+        reference + image.dng_highlight_scale.log2()
+    });
     let color_profiles = modes
         .map(|modes| {
             modes.finish(
@@ -206,6 +213,7 @@ pub(crate) fn write_prepared(
                 &wb,
                 &calibration,
                 image.dng_highlight_scale,
+                prebuilt_exposure,
                 warnings,
                 control,
             )
@@ -384,11 +392,7 @@ pub(crate) fn write_prepared(
         &mut ifd0,
         color_profiles.as_ref().map(|p| p.white_xy),
     );
-    if prebuilt {
-        // Add headroom to the serialized reference baseline without coarse EV rounding.
-        let reference = camera_baseline_exposure(reader, &calibration, 1.0).unwrap_or(0.0);
-        let reference = ((reference as f32 as f64) * 10_000.0).round() / 10_000.0;
-        let exposure = reference + highlight_scale.log2();
+    if let Some(exposure) = prebuilt_exposure {
         ifd0.add(
             tags::BASELINE_EXPOSURE,
             Value::SRational(vec![((exposure * 1_000_000.0).round() as i32, 1_000_000)]),

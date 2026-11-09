@@ -103,12 +103,14 @@ impl PreparedColorModes {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn finish(
         self,
         reader: &Reader,
         wb: &str,
         calibration: &ColorCalibration,
         highlight_scale: f64,
+        baseline: Option<f64>,
         _warnings: &mut Vec<String>,
         control: x3f_sys::Control<'_>,
     ) -> Result<ColorModeProfiles, Error> {
@@ -140,8 +142,10 @@ impl PreparedColorModes {
         if !count_scale.is_finite() || count_scale <= 0.0 {
             return Err(x3f_sys::Error::InvalidData("invalid native neutral count scale").into());
         }
-        let baseline =
-            super::camera_baseline_exposure(reader, calibration, highlight_scale).unwrap_or(0.0);
+        // A prebuilt raster gives the baseline that its primary tag stores.
+        let baseline = baseline.unwrap_or_else(|| {
+            super::camera_baseline_exposure(reader, calibration, highlight_scale).unwrap_or(0.0)
+        });
         let (exposure_offset, exposure) = profile_exposure(baseline as f32, 0.0)?;
         let mut extra_blob = Vec::new();
         let mut extra_offsets = Vec::new();
