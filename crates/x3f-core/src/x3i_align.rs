@@ -34,8 +34,12 @@ pub struct AlignOptions {
     pub mode: AlignMode,
     /// Reject tiles with a correlation peak below this value.
     pub min_peak: f32,
-    /// Largest shift the estimator searches, in full-resolution pixels.
+    /// Largest shift the tile estimator searches around the coarse shift,
+    /// in full-resolution pixels.
     pub max_shift_px: u32,
+    /// Largest whole-frame shift the coarse stage searches, in
+    /// full-resolution pixels. Zero disables the coarse stage.
+    pub coarse_shift_px: u32,
     /// Tiles per axis for the per-tile phase correlation.
     pub tile_grid: u32,
     /// Largest absolute fitted rotation, in degrees.
@@ -51,6 +55,7 @@ impl Default for AlignOptions {
             mode: AlignMode::Global,
             min_peak: 0.05,
             max_shift_px: 64,
+            coarse_shift_px: 320,
             tile_grid: 3,
             max_rotation_deg: 0.5,
             max_scale_deviation: 0.005,
@@ -113,6 +118,9 @@ pub struct Alignment {
     pub applied_residual: Option<f32>,
     /// Number of trusted tiles in the post-warp residual measurement.
     pub residual_tiles: u32,
+    /// Whole-frame shift with a clear correlation peak, in full-resolution
+    /// pixels. None when the coarse stage did not run or found no clear peak.
+    pub coarse: Option<[f32; 2]>,
 }
 
 impl Alignment {
@@ -480,13 +488,49 @@ fn tile_shift(
     range: i32,
     control: Control<'_>,
 ) -> Result<Tile, Error> {
-    tile_shift_around(reference, frame, origin, n, ([0.0; 2], range), control)
+    tile_shift_around(
+        reference,
+        frame,
+        origin,
+        origin,
+        n,
+        ([0.0; 2], range),
+        control,
+    )
 }
 
+/// Phase correlation of two `n` x `n` windows. The result replaces `a`.
+/// Index `(x, y)` modulo `n` holds the score of shift `(x, y)` from `b` to `a`.
+fn phase_correlation(
+    a: &mut [[f32; 2]],
+    b: &mut [[f32; 2]],
+    n: usize,
+    control: Control<'_>,
+) -> Result<(), Error> {
+    fft2(a, n, false, control)?;
+    fft2(b, n, false, control)?;
+    for (a, b) in a.iter_mut().zip(b.iter()) {
+        let re = a[0] * b[0] + a[1] * b[1];
+        let im = a[1] * b[0] - a[0] * b[1];
+        let norm = re.hypot(im);
+        *a = if norm > 1e-12 {
+            [re / norm, im / norm]
+        } else {
+            [0.0; 2]
+        };
+    }
+    fft2(a, n, true, control)
+}
+
+/// Shift of the frame window at `frame_origin` against the reference window
+/// at `origin`. The search covers `range` around the absolute `centre`, in
+/// half-resolution pixels. A frame window that starts at `origin - centre`
+/// keeps a large shift inside the unique interval of the FFT.
 fn tile_shift_around(
     reference: &Luma,
     frame: &Luma,
     origin: [usize; 2],
+    frame_origin: [usize; 2],
     n: usize,
     (centre, range): ([f32; 2], i32),
     control: Control<'_>,
@@ -498,7 +542,7 @@ fn tile_shift_around(
     let window: Vec<_> = (0..n)
         .map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / (n - 1) as f32).cos())
         .collect();
-    for (map, out) in [(reference, &mut a), (frame, &mut b)] {
+    for (map, [ox, oy], out) in [(reference, origin, &mut a), (frame, frame_origin, &mut b)] {
         let mut sum = 0.0;
         let mut count = 0;
         for y in 0..n {
@@ -519,20 +563,12 @@ fn tile_shift_around(
                 }
             }
         }
-        fft2(out, n, false, control)?;
     }
-    for (a, b) in a.iter_mut().zip(b) {
-        let re = a[0] * b[0] + a[1] * b[1];
-        let im = a[1] * b[0] - a[0] * b[1];
-        let norm = re.hypot(im);
-        *a = if norm > 1e-12 {
-            [re / norm, im / norm]
-        } else {
-            [0.0; 2]
-        };
-    }
-    fft2(&mut a, n, true, control)?;
+    phase_correlation(&mut a, &mut b, n, control)?;
+    // The window offset is the part of the shift that the windows already hold.
+    let [kx, ky] = [0, 1].map(|axis| origin[axis] as i32 - frame_origin[axis] as i32);
     let at = |x: i32, y: i32| {
+        let (x, y) = (x - kx, y - ky);
         a[y.rem_euclid(n as i32) as usize * n + x.rem_euclid(n as i32) as usize][0]
     };
     let (mut dx, mut dy, mut peak) = (0, 0, 0.0);
@@ -778,6 +814,7 @@ fn estimate_local(
                 reference,
                 frame,
                 [x * step[0], y * step[1]],
+                [x * step[0], y * step[1]],
                 n,
                 (shift, 4),
                 control,
@@ -968,17 +1005,181 @@ fn estimate_global(
     if range + 4 >= n / 2 {
         return Ok(skipped);
     }
+    let coarse = if options.coarse_shift_px > 0 {
+        coarse_shift(reference, frame, options.coarse_shift_px, control)?
+    } else {
+        None
+    };
+    let mut alignment = tiles_around(reference, frame, options, n, range, [0; 2], control)?;
+    // Keep the search around zero when it agrees with the coarse shift.
+    // Then a capture without motion keeps its result. When they disagree,
+    // the search around the coarse shift must retain more tiles to win, or
+    // as many tiles with a smaller largest residual.
+    if let Some(shift) = coarse {
+        let offset = shift.map(|v| (v * 0.5).round() as i32);
+        if offset != [0; 2]
+            && (alignment.skipped
+                || (alignment.dx - shift[0]).hypot(alignment.dy - shift[1]) > 16.0)
+        {
+            let moved = tiles_around(reference, frame, options, n, range, offset, control)?;
+            if !moved.skipped
+                && (moved.retained_tiles, -moved.max_tile_residual)
+                    > (alignment.retained_tiles, -alignment.max_tile_residual)
+            {
+                alignment = moved;
+            }
+        }
+    }
+    // One translation cannot hold tiles that disagree by more than 4 px.
+    // Without a similarity fit, such a frame cannot align.
+    if !alignment.skipped && alignment.similarity.is_none() && alignment.tile_spread > 4.0 {
+        alignment.skipped = true;
+    }
+    alignment.coarse = coarse;
+    Ok(alignment)
+}
+
+/// Whole-frame shift from a phase correlation of the luma maps reduced 4x
+/// (8x from full resolution), in full-resolution pixels. The search covers
+/// `max_shift_px`. Return None without a clear peak: the peak must be at
+/// least 0.05 and twice the best score outside its 5 x 5 neighbourhood.
+fn coarse_shift(
+    reference: &Luma,
+    frame: &Luma,
+    max_shift_px: u32,
+    control: Control<'_>,
+) -> Result<Option<[f32; 2]>, Error> {
+    const FACTOR: usize = 4;
+    let (w, h) = (reference.width as usize, reference.height as usize);
+    let (rw, rh) = (w / FACTOR, h / FACTOR);
+    let range = (max_shift_px as usize).div_ceil(2 * FACTOR) as i32;
+    if rw.min(rh) < 16 {
+        return Ok(None);
+    }
+    // The Hann window goes to zero at the edges, so the circular product
+    // gives no wrapped overlap inside half of the FFT size.
+    let n = rw.max(rh).next_power_of_two();
+    let range = range.min(n as i32 / 2 - 3);
+    let hann = |size: usize| -> Vec<f32> {
+        (0..size)
+            .map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / (size - 1) as f32).cos())
+            .collect()
+    };
+    let (wx, wy) = (hann(rw), hann(rh));
+    let reduce = |map: &Luma| {
+        let values = if map.log.is_empty() {
+            &map.data
+        } else {
+            &map.log
+        };
+        let mut blocks = vec![None; rw * rh];
+        let (mut sum, mut count) = (0.0f64, 0usize);
+        for y in 0..rh {
+            for x in 0..rw {
+                let (mut s, mut c) = (0.0f32, 0usize);
+                for j in 0..FACTOR {
+                    for i in 0..FACTOR {
+                        let p = (y * FACTOR + j) * w + x * FACTOR + i;
+                        if map.mask[p] != 0 {
+                            s += values[p];
+                            c += 1;
+                        }
+                    }
+                }
+                // Blocks with more than half of their pixels masked do not take part.
+                if c * 2 > FACTOR * FACTOR {
+                    blocks[y * rw + x] = Some(s / c as f32);
+                    sum += f64::from(s / c as f32);
+                    count += 1;
+                }
+            }
+        }
+        let mean = (sum / count.max(1) as f64) as f32;
+        let mut out = vec![[0.0f32; 2]; n * n];
+        for y in 0..rh {
+            for x in 0..rw {
+                if let Some(v) = blocks[y * rw + x] {
+                    out[y * n + x][0] = (v - mean) * wx[x] * wy[y];
+                }
+            }
+        }
+        out
+    };
+    let mut a = reduce(reference);
+    control.check()?;
+    let mut b = reduce(frame);
+    phase_correlation(&mut a, &mut b, n, control)?;
+    let at = |x: i32, y: i32| {
+        a[y.rem_euclid(n as i32) as usize * n + x.rem_euclid(n as i32) as usize][0]
+    };
+    let (mut dx, mut dy, mut peak) = (0, 0, 0.0f32);
+    for y in -range..=range {
+        for x in -range..=range {
+            if at(x, y) > peak {
+                (dx, dy, peak) = (x, y, at(x, y));
+            }
+        }
+    }
+    let mut second = 0.0f32;
+    for y in -range..=range {
+        for x in -range..=range {
+            if (x - dx).abs() > 2 || (y - dy).abs() > 2 {
+                second = second.max(at(x, y));
+            }
+        }
+    }
+    if peak < 0.05 || peak < 2.0 * second {
+        return Ok(None);
+    }
+    let shift = [
+        dx as f32 + parabola(at(dx - 1, dy), peak, at(dx + 1, dy)),
+        dy as f32 + parabola(at(dx, dy - 1), peak, at(dx, dy + 1)),
+    ];
+    Ok(Some(shift.map(|v| v * (2 * FACTOR) as f32)))
+}
+
+/// Tile estimate with the frame windows offset by `offset` half-resolution
+/// pixels. The tiles search `range` around that offset.
+fn tiles_around(
+    reference: &Luma,
+    frame: &Luma,
+    options: &AlignOptions,
+    n: usize,
+    range: usize,
+    offset: [i32; 2],
+    control: Control<'_>,
+) -> Result<Alignment, Error> {
+    let skipped = Alignment {
+        skipped: true,
+        ..Default::default()
+    };
+    // Both windows must stay inside the map: the reference origin is in `lo..=hi`.
+    let size = [reference.width as i32, reference.height as i32];
+    let lo = offset.map(|c| c.max(0));
+    let hi = [0, 1].map(|axis| size[axis] - n as i32 + offset[axis].min(0));
+    if hi[0] < lo[0] || hi[1] < lo[1] {
+        return Ok(skipped);
+    }
     let grid = options.tile_grid as usize;
     let mut tiles = Vec::new();
     let mut peaks = Vec::new();
     for y in 0..grid {
         for x in 0..grid {
             control.check()?;
-            let origin = [
-                (reference.width as usize - n) * (2 * x + 1) / (2 * grid),
-                (reference.height as usize - n) * (2 * y + 1) / (2 * grid),
-            ];
-            let tile = tile_shift(reference, frame, origin, n, range as i32, control)?;
+            let place = [x, y].map(|i| i * 2 + 1);
+            let origin = [0, 1].map(|axis| {
+                lo[axis] as usize + (hi[axis] - lo[axis]) as usize * place[axis] / (2 * grid)
+            });
+            let frame_origin = [0, 1].map(|axis| (origin[axis] as i32 - offset[axis]) as usize);
+            let tile = tile_shift_around(
+                reference,
+                frame,
+                origin,
+                frame_origin,
+                n,
+                (offset.map(|v| v as f32), range as i32),
+                control,
+            )?;
             peaks.push(tile.peak);
             if tile.peak >= options.min_peak && tile.peak > 0.0 {
                 tiles.push(tile);
@@ -1674,6 +1875,174 @@ mod tests {
             );
             assert!((found.dx - dx).abs() < 0.1 && (found.dy - dy).abs() < 0.1);
         }
+    }
+
+    #[test]
+    fn coarse_stage_finds_large_shifts_without_wrap() {
+        // `texture` repeats along lines in frequency space, so a large shift
+        // has false matches. Smooth value noise has one match only.
+        fn lattice(x: f32, y: f32, period: f32, salt: u32) -> f32 {
+            let (u, v) = (x / period, y / period);
+            let (i, j) = (u.floor(), v.floor());
+            let smooth = |t: f32| t * t * (3.0 - 2.0 * t);
+            let (fu, fv) = (smooth(u - i), smooth(v - j));
+            let hash = |a: f32, b: f32| {
+                let mut h = (a as i32 as u32).wrapping_mul(0x9E37_79B1)
+                    ^ (b as i32 as u32).wrapping_mul(0x85EB_CA77)
+                    ^ salt;
+                h ^= h >> 15;
+                h = h.wrapping_mul(0x2C1B_3C6D);
+                h ^= h >> 12;
+                (h >> 8) as f32 / 16_777_216.0
+            };
+            let top = hash(i, j) * (1.0 - fu) + hash(i + 1.0, j) * fu;
+            let bottom = hash(i, j + 1.0) * (1.0 - fu) + hash(i + 1.0, j + 1.0) * fu;
+            top * (1.0 - fv) + bottom * fv
+        }
+        let make = |w: usize, h: usize, dx: f32, dy: f32| {
+            let mut p = synthetic(w, h, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+            for y in 0..h {
+                for x in 0..w {
+                    let (u, v) = (x as f32 + dx, y as f32 + dy);
+                    let value = lattice(u, v, 61.0, 1)
+                        + 0.7 * lattice(u, v, 23.0, 2)
+                        + 0.5 * lattice(u, v, 9.0, 3);
+                    p.x[(y * w + x) * 3..(y * w + x) * 3 + 3].fill(0.05 * (2.0 * value).exp());
+                }
+            }
+            p
+        };
+        let (w, h) = (1536, 1024);
+        let reference = luma(&make(w, h, 0.0, 0.0), 0.85, Control::none()).unwrap();
+        for (dx, dy) in [
+            (-120.0, 80.0),
+            (250.3, 249.6),
+            (-250.3, -249.6),
+            (250.3, -249.6),
+            (-250.3, 249.6),
+        ] {
+            let frame = luma(&make(w, h, dx, dy), 0.85, Control::none()).unwrap();
+            let found = estimate(
+                &reference,
+                &frame,
+                &AlignOptions::default(),
+                Control::none(),
+            )
+            .unwrap();
+            eprintln!("coarse shift ({dx},{dy}): {found:?}");
+            assert!(!found.skipped && found.coarse.is_some());
+            assert!((found.dx - dx).abs() < 0.1 && (found.dy - dy).abs() < 0.1);
+            // The tile search alone covers 64 px and cannot find this shift.
+            let tiles_only = estimate(
+                &reference,
+                &frame,
+                &AlignOptions {
+                    coarse_shift_px: 0,
+                    ..Default::default()
+                },
+                Control::none(),
+            )
+            .unwrap();
+            assert!(tiles_only.skipped || (tiles_only.dx - dx).abs() > 1.0);
+        }
+    }
+
+    #[test]
+    fn repeated_texture_keeps_the_small_shift_and_gives_no_false_motion() {
+        // Cosines with periods of 64 and 67 px (8 and 8.4 px in the coarse map)
+        // give repeated correlation peaks.
+        let make = |w: usize, h: usize, dx: f32, dy: f32| {
+            let mut p = synthetic(w, h, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+            for y in 0..h {
+                for x in 0..w {
+                    let (u, v) = (x as f32 + dx, y as f32 + dy);
+                    let phase = |t: f32, period: f32| (std::f32::consts::TAU * t / period).cos();
+                    let value = phase(u, 64.0) + phase(v, 67.0) + 0.5 * phase(u + v, 67.0);
+                    p.x[(y * w + x) * 3..(y * w + x) * 3 + 3].fill(0.1 * (0.5 * value).exp());
+                }
+            }
+            p
+        };
+        let (w, h) = (1536, 1024);
+        let reference = luma(&make(w, h, 0.0, 0.0), 0.85, Control::none()).unwrap();
+        for (dx, dy) in [(5.3, -3.7), (0.6, -0.4)] {
+            let frame = luma(&make(w, h, dx, dy), 0.85, Control::none()).unwrap();
+            let found = estimate(
+                &reference,
+                &frame,
+                &AlignOptions::default(),
+                Control::none(),
+            )
+            .unwrap();
+            let tiles_only = estimate(
+                &reference,
+                &frame,
+                &AlignOptions {
+                    coarse_shift_px: 0,
+                    ..Default::default()
+                },
+                Control::none(),
+            )
+            .unwrap();
+            eprintln!("repeated ({dx},{dy}): {found:?}");
+            assert!(!found.skipped);
+            assert!((found.dx - dx).abs() < 0.1 && (found.dy - dy).abs() < 0.1);
+            assert_eq!(
+                Alignment {
+                    coarse: None,
+                    ..found.clone()
+                },
+                tiles_only
+            );
+            // The repeated texture puts the coarse peak near zero, which is
+            // wrong for the 5.3 px shift. A weak, wrong 10 px estimate with
+            // this coarse result is not motion.
+            {
+                let [x, y] = found.coarse.expect("repeated texture gives a coarse peak");
+                assert!(x.hypot(y) <= 2.0, "coarse ({x}, {y})");
+                let weak = Alignment {
+                    dx: 10.0,
+                    dy: 0.0,
+                    ..found.clone()
+                };
+                let skipped = Alignment {
+                    skipped: true,
+                    ..Default::default()
+                };
+                let stack = [Alignment::default(), weak, skipped];
+                assert_eq!(
+                    crate::x3i_merge::dropped_frames(&stack, &[false, true, true], true),
+                    [false; 3]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coarse_stage_without_common_signal_skips() {
+        let (w, h) = (1536, 1024);
+        let reference = luma(
+            &synthetic(w, h, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            0.85,
+            Control::none(),
+        )
+        .unwrap();
+        let mut noise = synthetic(w, h, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        let mut seed = 5u32;
+        for rgb in noise.x.as_chunks_mut::<3>().0 {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            rgb.fill(0.05 + (seed >> 8) as f32 / 16777216.0);
+        }
+        let frame = luma(&noise, 0.85, Control::none()).unwrap();
+        let found = estimate(
+            &reference,
+            &frame,
+            &AlignOptions::default(),
+            Control::none(),
+        )
+        .unwrap();
+        eprintln!("no common signal: {found:?}");
+        assert!(found.skipped && found.coarse.is_none());
     }
 
     #[test]

@@ -433,8 +433,10 @@ An invalid contributing sample rejects the expanded output. The default knee
 is 0.75, width 0.02 and validity margin 0.15, relative to that ceiling.
 
 Phase 2 loads every frame twice through a repeatable loader. The statistics
-pass emits Decode events. It aligns each frame to reference T and keeps a
-skipped alignment at the identity transform with a warning. Ratio refinement
+pass emits Decode events. It aligns each frame to reference T, with a
+whole-frame coarse stage before the tiles. A skipped alignment stays at the
+identity transform with a warning. If another frame shows camera motion, the
+skipped frame is excluded from the merge instead. Ratio refinement
 uses the median of the two highest clean, supported level-bin medians, or the
 one clean bin if only one qualifies. An affine fit supplies
 a black-offset diagnostic only. Near-black bias is nonlinear, so its fitted

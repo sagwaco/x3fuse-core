@@ -192,8 +192,23 @@ use the phase 1 merge and do not establish a useful default strength.
 
 ## Phase 2 statistics
 
-The statistics pass aligns each frame to frame 0. A skipped alignment keeps
-that frame at its original position and reports possible misregistration.
+The statistics pass aligns each frame to frame 0. A coarse stage first finds
+one whole-frame translation by phase correlation of the luma reduced 8x. It
+searches 320 pixels and accepts only a clear peak: at least 0.05 and twice
+the next peak. The tile estimator then searches 64 pixels around zero. If that
+result is skipped or is more than 16 pixels from the coarse shift, the tiles
+search again around the coarse shift. The result with more retained tiles
+wins; with the same count, the smaller largest tile residual wins. Without a
+clear peak, the tiles search around zero only. A result without a similarity
+fit whose retained tiles spread more than 4 pixels is skipped: one
+translation cannot register that frame.
+A frame shows camera motion when its alignment is not skipped, its translation
+is more than 2 pixels, and its tile estimate is not weak or its coarse shift
+is more than 2 pixels and within 16 pixels of the translation. In a stack
+with such a frame, a frame with a skipped
+alignment is excluded from the merge with a warning, and its report line has
+`dropped=true`. In a stack without motion, a skipped alignment keeps that frame
+at its original position and reports possible misregistration.
 Global alignment uses one translation or bounded similarity transform.
 `X3F_X3I_ALIGN=local` adds a smooth displacement field from 256-pixel tiles
 at half resolution. The estimator rejects weak peaks and shifts that disagree

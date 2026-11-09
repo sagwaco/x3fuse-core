@@ -516,6 +516,9 @@ pub struct MergeReport {
     pub ghost_sigmas: Vec<f32>,
     /// True when alignment ran and its result was weak or skipped.
     pub weak_alignments: Vec<bool>,
+    /// True when the merge excluded the frame: its alignment is skipped in a
+    /// stack that moved.
+    pub dropped: Vec<bool>,
     /// Transforms in source order. Frame zero and disabled alignment use identity.
     pub alignments: Vec<Alignment>,
     /// Rejected ratio fits and alignment estimates.
@@ -569,9 +572,9 @@ impl MergeReport {
             }
             let a = &self.alignments[i];
             lines.push(format!(
-                "X3I frame {}: alignment dx={:.6} dy={:.6} peak={:.6} tile_spread={:.6} similarity={:?} retained_tiles={} max_tile_residual={:.6} weak={} skipped={}",
+                "X3I frame {}: alignment dx={:.6} dy={:.6} peak={:.6} tile_spread={:.6} similarity={:?} retained_tiles={} max_tile_residual={:.6} weak={} skipped={} coarse={:?} dropped={}",
                 self.frame_indices[i], a.dx, a.dy, a.peak, a.tile_spread, a.similarity, a.retained_tiles, a.max_tile_residual,
-                self.weak_alignments[i], a.skipped
+                self.weak_alignments[i], a.skipped, a.coarse, self.dropped.get(i).copied().unwrap_or(false)
             ));
             lines.push(format!(
                 "X3I frame {}: alignment-field mode={} local_tiles={} field_range={:?} local_max_residual={:.6} fallback={:?} post_warp_residual={:?} post_warp_tiles={} applied_residual={:?} residual_tiles={}",
@@ -645,6 +648,23 @@ pub struct GhostMap {
     pub height: u32,
     /// Final weights after the 3x3 minimum, one byte per pixel in row order.
     pub data: Vec<u8>,
+}
+
+/// Frames that the merge excludes: a skipped alignment in a stack that moved.
+/// A frame shows camera motion when its alignment is not skipped, its
+/// translation is more than 2 px, and its tile estimate is not weak or its
+/// coarse shift is more than 2 px and within 16 px of that translation. A
+/// weak tile estimate alone is not evidence: moving leaves on a tripod can
+/// give one.
+pub(crate) fn dropped_frames(alignments: &[Alignment], weak: &[bool], enabled: bool) -> Vec<bool> {
+    let moved = enabled
+        && alignments.iter().zip(weak).any(|(a, &weak)| {
+            let coarse = a
+                .coarse
+                .is_some_and(|[x, y]| x.hypot(y) > 2.0 && (x - a.dx).hypot(y - a.dy) <= 16.0);
+            !a.skipped && a.dx.hypot(a.dy) > 2.0 && (!weak || coarse)
+        });
+    alignments.iter().map(|a| moved && a.skipped).collect()
 }
 
 /// Use post-warp consensus for local fields and the global fit otherwise.
@@ -2878,6 +2898,10 @@ fn merge_in_bands(
                 ..Default::default()
             },
         };
+        #[cfg(test)]
+        if let Some(injected) = tests::ALIGNMENTS.with(|a| a.borrow().get(i).cloned()) {
+            alignment = injected;
+        }
         let ratios = if alignment.skipped {
             [None; 3]
         } else {
@@ -2994,11 +3018,6 @@ fn merge_in_bands(
             width,
             height,
         );
-        if alignment.skipped {
-            report.fit_warnings.push(format!(
-                "X3I alignment warning: frame={i} skipped; merge with identity, range may be misregistered"
-            ));
-        }
         if options.fit_noise
             && !noise_fitted
             && !alignment.skipped
@@ -3091,6 +3110,18 @@ fn merge_in_bands(
         report.alignments.push(alignment);
     }
     drop(reference_luma);
+    report.dropped = dropped_frames(
+        &report.alignments,
+        &report.weak_alignments,
+        options.align.enabled,
+    );
+    for i in (0..frame_count).filter(|&i| report.alignments[i].skipped) {
+        report.fit_warnings.push(if report.dropped[i] {
+            format!("X3I alignment warning: frame={i} skipped in a stack that moved; frame excluded")
+        } else {
+            format!("X3I alignment warning: frame={i} skipped; merge with identity, range may be misregistered")
+        });
+    }
     report.calibration_blocks = calibration.iter().map(Vec::len).collect();
     report.weak_calibration = calibration
         .iter()
@@ -3199,6 +3230,9 @@ fn merge_in_bands(
     let mut ghost_maps = Vec::new();
     for i in order {
         control.check()?;
+        if report.dropped[i] {
+            continue;
+        }
         let mut frame = load(i)?;
         if (frame.width, frame.height, frame.shutter_us) != (width, height, report.exposure_us[i])
             || raw_row_hash(&frame) != hashes[i]
@@ -3546,6 +3580,9 @@ mod tests {
         /// Band checks left before `band_check` cancels the merge; None never cancels.
         pub(super) static BAND_CHECKS: std::cell::Cell<Option<usize>> =
             const { std::cell::Cell::new(None) };
+        /// Alignments that replace the estimate of frame `i`; empty keeps the estimate.
+        pub(super) static ALIGNMENTS: std::cell::RefCell<Vec<Alignment>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
 
     fn frame(exposure: u32, truth: f32) -> MergeFrame {
@@ -5982,6 +6019,151 @@ mod tests {
         options.ghost_rejection = false;
         let no_ghost = merge(2, load, &options, Control::none()).unwrap();
         assert_eq!(no_ghost.report.ghost_sigmas, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn skipped_frame_is_dropped_only_in_a_stack_that_moved() {
+        let skipped = Alignment {
+            skipped: true,
+            ..Default::default()
+        };
+        let moved = Alignment {
+            dx: 10.0,
+            ..Default::default()
+        };
+        let still = Alignment {
+            dx: 1.0,
+            ..Default::default()
+        };
+        let reference = Alignment::default();
+        let stack = [reference.clone(), moved.clone(), skipped.clone()];
+        assert_eq!(
+            dropped_frames(&stack, &[false, false, true], true),
+            [false, false, true]
+        );
+        assert_eq!(
+            dropped_frames(&stack, &[false, false, true], false),
+            [false; 3]
+        );
+        let tripod = [reference.clone(), still, skipped.clone()];
+        assert_eq!(
+            dropped_frames(&tripod, &[false, false, true], true),
+            [false; 3]
+        );
+        // A weak 10 px estimate is evidence only with a coarse peak.
+        let weak = [reference, moved, skipped];
+        assert_eq!(
+            dropped_frames(&weak, &[false, true, true], true),
+            [false; 3]
+        );
+        let mut coarse = weak.clone();
+        coarse[1].coarse = Some([10.0, 0.0]);
+        assert_eq!(
+            dropped_frames(&coarse, &[false, true, true], true),
+            [false, false, true]
+        );
+        // A clear coarse peak at zero does not confirm a weak 10 px estimate.
+        coarse[1].coarse = Some([0.0, 0.0]);
+        assert_eq!(
+            dropped_frames(&coarse, &[false, true, true], true),
+            [false; 3]
+        );
+        // Nor does a coarse shift that disagrees with the translation.
+        coarse[1].coarse = Some([40.0, 0.0]);
+        assert_eq!(
+            dropped_frames(&coarse, &[false, true, true], true),
+            [false; 3]
+        );
+    }
+
+    #[test]
+    fn merge_skips_loading_and_weighting_a_dropped_frame() {
+        let moved = Alignment {
+            dx: 10.0,
+            peak: 1.0,
+            retained_tiles: 9,
+            ..Default::default()
+        };
+        let skipped = Alignment {
+            skipped: true,
+            ..Default::default()
+        };
+        ALIGNMENTS.with(|a| *a.borrow_mut() = vec![Alignment::default(), moved, skipped]);
+        let mut calls = [0usize; 3];
+        let exposures = [1000, 500, 2000];
+        let options = MergeOptions {
+            ghost_maps: true,
+            ..Default::default()
+        };
+        let scene = merge(
+            3,
+            |i| {
+                calls[i] += 1;
+                Ok(MergeFrame {
+                    frame_index: i,
+                    ..frame(exposures[i], 0.1)
+                })
+            },
+            &options,
+            Control::none(),
+        );
+        ALIGNMENTS.with(|a| a.borrow_mut().clear());
+        let scene = scene.unwrap();
+        assert!(scene.ghost_maps.iter().all(|m| m.frame_index != 2));
+        assert!(scene.ghost_maps.iter().any(|m| m.frame_index == 1));
+        let report = scene.report;
+        assert_eq!(calls, [2, 2, 1]);
+        assert_eq!(report.dropped, [false, false, true]);
+        assert_eq!(report.frames_used, 2);
+        assert_eq!(report.alignments.len(), 3);
+        assert_eq!(report.weak_alignments.len(), 3);
+        assert_eq!(report.scales.len(), 3);
+        assert_eq!(report.ghost_fractions.len(), 3);
+        assert_eq!(report.ghost_sigmas.len(), 3);
+        assert_eq!(report.frame_indices.len(), 3);
+        let warnings: Vec<_> = report
+            .fit_warnings
+            .iter()
+            .filter(|w| w.contains("frame=2 skipped"))
+            .collect();
+        assert_eq!(
+            warnings,
+            ["X3I alignment warning: frame=2 skipped in a stack that moved; frame excluded"]
+        );
+        // The same stack without the moved frame keeps the skipped frame.
+        ALIGNMENTS.with(|a| {
+            *a.borrow_mut() = vec![
+                Alignment::default(),
+                Alignment::default(),
+                Alignment {
+                    skipped: true,
+                    ..Default::default()
+                },
+            ]
+        });
+        let mut calls = [0usize; 3];
+        let still = merge(
+            3,
+            |i| {
+                calls[i] += 1;
+                Ok(MergeFrame {
+                    frame_index: i,
+                    ..frame(exposures[i], 0.1)
+                })
+            },
+            &options,
+            Control::none(),
+        );
+        ALIGNMENTS.with(|a| a.borrow_mut().clear());
+        let still = still.unwrap();
+        assert_eq!(calls, [2, 2, 2]);
+        assert_eq!(still.report.frames_used, 3);
+        assert!(still
+            .report
+            .fit_warnings
+            .iter()
+            .any(|w| w.contains("frame=2 skipped; merge with identity")));
+        assert!(still.ghost_maps.iter().any(|m| m.frame_index == 2));
     }
 
     #[test]
