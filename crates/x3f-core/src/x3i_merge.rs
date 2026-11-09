@@ -994,6 +994,54 @@ fn ratio_fit(
     Ok(result)
 }
 
+/// Largest distance in EV between a scalar fit and the shutter ratio. Frames
+/// are 1 EV apart, so this bound cannot select a wrong frame.
+const SCALAR_EV_LIMIT: f64 = 0.5;
+
+/// Return the scalar scale of frame `i` and an optional warning. Fixed ratios
+/// and a skipped alignment keep the shutter ratio. A misregistered frame gives
+/// a biased ratio. Without a trusted alignment (enabled and not weak), the
+/// scalar needs two clean bins and a trend within `ratio_trend_limit`.
+fn scalar_scale(
+    i: usize,
+    fit: &RatioFit,
+    nominal: f64,
+    alignment: &Alignment,
+    options: &MergeOptions,
+) -> (f64, Option<String>) {
+    if options.fixed_ratios || alignment.skipped {
+        return (nominal, None);
+    }
+    let trusted = options.align.enabled && !weak_alignment(alignment);
+    let trend = fit
+        .level_trend
+        .filter(|&trend| trend > options.ratio_trend_limit);
+    let warning = if let (false, Some(trend)) = (trusted, trend) {
+        format!("X3I ratio warning: frame={i} accepted level bins differ by {:.3} percent (limit {:.3}); keep shutter ratio {nominal:.6}", trend * 100.0, options.ratio_trend_limit * 100.0)
+    } else if fit.pairs >= fit.minimum_pairs && fit.bin_pairs.iter().all(|&n| n < fit.minimum_pairs)
+    {
+        format!("X3I ratio warning: frame={i} no supported level bin ({} total pairs, {} required per bin); keep shutter ratio {nominal:.6}", fit.pairs, fit.minimum_pairs)
+    } else if let Some(multiplier) = fit
+        .multiplier
+        .filter(|_| trusted || fit.level_trend.is_some())
+    {
+        let ratio = nominal * f64::from(multiplier);
+        if (ratio / nominal).log2().abs() > SCALAR_EV_LIMIT {
+            format!("X3I ratio warning: frame={i} fit {ratio:.6} exceeds {SCALAR_EV_LIMIT} EV; keep shutter ratio {nominal:.6}")
+        } else {
+            return (ratio, trend.map(|trend| format!("X3I ratio warning: frame={i} accepted level bins differ by {:.3} percent (limit {:.3}); apply measured scale {ratio:.6}", trend * 100.0, options.ratio_trend_limit * 100.0)));
+        }
+    } else {
+        format!(
+            "X3I ratio warning: frame={i} {} or too few pairs ({}/{}); keep shutter ratio {nominal:.6}",
+            if trusted { "no clean supported bin" } else { "fewer than two clean supported bins" },
+            fit.pairs,
+            fit.minimum_pairs
+        )
+    };
+    (nominal, Some(warning))
+}
+
 /// A shared T scale fit and its reference-level bins.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RatioFit {
@@ -1153,8 +1201,11 @@ impl RatioSamples {
             let low = clean.iter().copied().fold(f32::INFINITY, f32::min);
             let high = clean.iter().copied().fold(0.0f32, f32::max);
             fit.level_trend = Some(high / low - 1.0);
-            fit.multiplier = median(&mut clean);
         }
+        // The ratio can rise with level. The two highest clean bins are nearest
+        // to the hand-off from the reference, so the scale comes from them.
+        let top = clean.len().saturating_sub(2);
+        fit.multiplier = median(&mut clean[top..]);
         if self.trend_only {
             return fit;
         }
@@ -2893,31 +2944,7 @@ fn merge_in_bands(
             }
         }
         let fit = samples.fit(pixels);
-        let mut scale = nominal;
-        let mut scalar_warning = None;
-        if !options.fixed_ratios && !alignment.skipped {
-            if fit
-                .level_trend
-                .is_some_and(|trend| trend > options.ratio_trend_limit)
-            {
-                scalar_warning = Some(format!("X3I ratio warning: frame={i} accepted level bins differ by {:.3} percent (limit {:.3}); keep shutter ratio {nominal:.6}", fit.level_trend.unwrap() * 100.0, options.ratio_trend_limit * 100.0));
-            } else if fit.pairs >= fit.minimum_pairs
-                && fit.bin_pairs.iter().all(|&n| n < fit.minimum_pairs)
-            {
-                scalar_warning = Some(format!("X3I ratio warning: frame={i} no supported level bin ({} total pairs, {} required per bin); keep shutter ratio {nominal:.6}", fit.pairs, fit.minimum_pairs));
-            } else if let Some(multiplier) = fit.multiplier {
-                let ratio = nominal * f64::from(multiplier);
-                if (ratio / nominal).log2().abs() <= 0.3 {
-                    scale = ratio;
-                } else {
-                    scalar_warning = Some(format!("X3I ratio warning: frame={i} fit {ratio:.6} exceeds 0.3 EV; keep shutter ratio {nominal:.6}"));
-                }
-            } else {
-                scalar_warning = Some(format!(
-                    "X3I ratio warning: frame={i} fewer than two clean supported bins or too few pairs ({}/{}); keep shutter ratio {nominal:.6}", fit.pairs, fit.minimum_pairs
-                ));
-            }
-        }
+        let (mut scale, scalar_warning) = scalar_scale(i, &fit, nominal, &alignment, options);
         let scalar = scale;
         let mut source = if scale == nominal {
             ScaleSource::Shutter
@@ -3709,7 +3736,7 @@ mod tests {
             .report
             .warnings()
             .iter()
-            .any(|s| s.contains("0.3 EV")));
+            .any(|s| s.contains("0.5 EV")));
     }
 
     /// Exposure-field truth for the synthetic pairs: B/M and T multipliers.
@@ -5534,7 +5561,8 @@ mod tests {
         )
         .unwrap();
         let mut clean: Vec<_> = fit.bins.iter().flatten().copied().collect();
-        assert_eq!(fit.multiplier, median(&mut clean));
+        let top = clean.len() - 2;
+        assert_eq!(fit.multiplier, median(&mut clean[top..]));
         assert!((fit.black_offset.unwrap() - 0.003).abs() < 1e-5);
         assert!(fit.level_trend.unwrap() > 0.02);
         frame.sigma[2] = 0.01;
@@ -5550,12 +5578,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dark.clean_bins.iter().filter(|&&v| v).count(), 1);
-        assert_eq!(dark.multiplier, None);
+        let only = dark.clean_bins.iter().position(|&v| v).unwrap();
+        assert_eq!(dark.multiplier, dark.bins[only]);
+        assert_eq!(dark.level_trend, None);
     }
 
     #[test]
     fn ratio_support_and_level_trend_are_reported() {
-        let options = MergeOptions::default();
+        // Without a trusted alignment, the trend rejects the scalar.
+        let options = MergeOptions {
+            align: AlignOptions {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let mut reference = frame(1000, 0.1);
         let mut other = frame(2000, 0.1);
         let a = materialise(&mut reference, 1.0, &options, Control::none()).unwrap();
@@ -5634,6 +5671,178 @@ mod tests {
             .warnings()
             .iter()
             .any(|w| w.contains("level bins differ")));
+    }
+
+    /// Two frames with T levels `levels` in row bands. Frame 1 has shutter
+    /// ratio 0.5 and gets `response(level)` times its nominal signal.
+    fn banded_frame(i: usize, levels: &[f32], response: fn(f32) -> f32) -> MergeFrame {
+        let mut f = noisy_frame(
+            i,
+            if i == 0 { 1.0 } else { 0.5 },
+            [0.0; 3],
+            [0.0; 3],
+            1.0,
+            0.0,
+        );
+        for p in 0..f.raw_top.len() {
+            let level = levels[p * levels.len() / f.raw_top.len()];
+            let value = if i == 0 {
+                level
+            } else {
+                level * 2.0 * response(level)
+            };
+            f.raw_top[p] = (5000.0 + value * 50000.0) as u16;
+            f.bmt[p * 3..p * 3 + 3].fill(value);
+        }
+        f
+    }
+
+    #[test]
+    fn trusted_alignment_takes_the_measured_scale_from_the_top_bins() {
+        // Real ratio 0.32 EV from nominal. The lowest bin is 7 percent off.
+        let response = |level: f32| 2f32.powf(-0.32) * if level < 0.1 { 1.07 } else { 1.0 };
+        let levels = [0.06, 0.13, 0.19];
+        let options = MergeOptions::default();
+        let scene = merge(
+            2,
+            |i| Ok(banded_frame(i, &levels, response)),
+            &options,
+            Control::none(),
+        )
+        .unwrap();
+        assert!(!scene.report.weak_alignments[1]);
+        let fit = &scene.report.aligned_ratios[1];
+        assert!((fit.level_trend.unwrap() - 0.07).abs() < 0.01, "{fit:?}");
+        let expected = 0.5 * 2f64.powf(0.32);
+        assert!(
+            (scene.report.scales[1] / expected - 1.0).abs() < 0.005,
+            "{:?}",
+            scene.report.scales
+        );
+        assert_eq!(scene.report.scale_sources[1], ScaleSource::Scalar);
+        assert!(scene
+            .report
+            .warnings()
+            .iter()
+            .any(|w| w.contains("level bins differ") && w.contains("apply measured scale")));
+
+        // Without a trusted alignment, the same frame keeps the shutter ratio.
+        let untrusted = merge(
+            2,
+            |i| Ok(banded_frame(i, &levels, response)),
+            &MergeOptions {
+                align: AlignOptions {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..options.clone()
+            },
+            Control::none(),
+        )
+        .unwrap();
+        assert_eq!(untrusted.report.scales[1], 0.5);
+        assert_eq!(untrusted.report.scale_sources[1], ScaleSource::Shutter);
+
+        // A fit more than 0.5 EV from nominal keeps the shutter ratio.
+        let far = merge(
+            2,
+            |i| Ok(banded_frame(i, &levels, |_| 2f32.powf(-0.6))),
+            &options,
+            Control::none(),
+        )
+        .unwrap();
+        assert!(!far.report.weak_alignments[1]);
+        assert_eq!(far.report.scales[1], 0.5);
+        assert!(far.report.warnings().iter().any(|w| w.contains("0.5 EV")));
+    }
+
+    #[test]
+    fn one_clean_bin_sets_the_multiplier() {
+        let options = MergeOptions::default();
+        let response = |_| 1.0 / 1.04;
+        let mut reference = banded_frame(0, &[0.13], response);
+        let mut other = banded_frame(1, &[0.13], response);
+        let a = materialise(&mut reference, 1.0, &options, Control::none()).unwrap();
+        let b = materialise(&mut other, 0.5, &options, Control::none()).unwrap();
+        let fit = refined_ratio(
+            (&reference, &other),
+            &a,
+            &b,
+            &Alignment::default(),
+            0.5,
+            None,
+            &options,
+            Control::none(),
+        )
+        .unwrap();
+        assert_eq!(fit.clean_bins.iter().filter(|&&v| v).count(), 1);
+        assert_eq!(fit.level_trend, None);
+        assert!((fit.multiplier.unwrap() - 1.04).abs() < 0.002, "{fit:?}");
+
+        // Through the scalar chain: only a trusted frame takes one clean bin.
+        let (good, weak) = alignments();
+        let (scale, warning) = scalar_scale(1, &fit, 0.5, &good, &options);
+        assert_eq!(scale, 0.5 * f64::from(fit.multiplier.unwrap()));
+        assert_eq!(warning, None);
+        let (scale, warning) = scalar_scale(1, &fit, 0.5, &weak, &options);
+        assert_eq!(scale, 0.5);
+        assert!(warning
+            .unwrap()
+            .contains("fewer than two clean supported bins"));
+    }
+
+    /// A trusted and a weak (not skipped) global alignment.
+    fn alignments() -> (Alignment, Alignment) {
+        let good = Alignment {
+            retained_tiles: 5,
+            max_tile_residual: 0.5,
+            ..Default::default()
+        };
+        let weak = Alignment {
+            retained_tiles: 4,
+            ..good.clone()
+        };
+        assert!(!weak_alignment(&good) && weak_alignment(&weak) && !weak.skipped);
+        (good, weak)
+    }
+
+    #[test]
+    fn scalar_scale_needs_a_trusted_alignment() {
+        // Real ratio 0.32 EV from nominal with a 7 percent level trend.
+        let mut clean_bins = [false; 8];
+        clean_bins[..2].fill(true);
+        let fit = RatioFit {
+            multiplier: Some(2f32.powf(0.32)),
+            pairs: 4000,
+            minimum_pairs: 1000,
+            bin_pairs: [2000, 2000, 0, 0, 0, 0, 0, 0],
+            clean_bins,
+            level_trend: Some(0.07),
+            ..Default::default()
+        };
+        let options = MergeOptions::default();
+        assert!(options.align.enabled);
+        let (good, weak) = alignments();
+        let (scale, warning) = scalar_scale(1, &fit, 0.5, &good, &options);
+        assert_eq!(scale, 0.5 * f64::from(fit.multiplier.unwrap()));
+        assert!(warning.unwrap().contains("apply measured scale"));
+        let disabled = MergeOptions {
+            align: AlignOptions {
+                enabled: false,
+                ..Default::default()
+            },
+            ..options.clone()
+        };
+        for (alignment, options) in [(&weak, &options), (&good, &disabled)] {
+            let (scale, warning) = scalar_scale(1, &fit, 0.5, alignment, options);
+            assert_eq!(scale, 0.5);
+            assert!(warning.unwrap().contains("keep shutter ratio"));
+        }
+        let skipped = Alignment {
+            skipped: true,
+            ..good
+        };
+        assert_eq!(scalar_scale(1, &fit, 0.5, &skipped, &options), (0.5, None));
     }
 
     fn phase1_options() -> MergeOptions {

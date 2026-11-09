@@ -435,7 +435,8 @@ is 0.75, width 0.02 and validity margin 0.15, relative to that ceiling.
 Phase 2 loads every frame twice through a repeatable loader. The statistics
 pass emits Decode events. It aligns each frame to reference T and keeps a
 skipped alignment at the identity transform with a warning. Ratio refinement
-uses the median of clean, supported level-bin medians. An affine fit supplies
+uses the median of the two highest clean, supported level-bin medians, or the
+one clean bin if only one qualifies. An affine fit supplies
 a black-offset diagnostic only. Near-black bias is nonlinear, so its fitted
 slope must not set the scale. Reference levels are 5 to 60 percent
 of the ceiling for short exposures, or 5 to 25 percent for long exposures,
@@ -443,9 +444,12 @@ whose own level must also stay below 40 percent. Frame T must exceed ten of
 its own read sigmas. Each supported bin needs at least 1000 pairs or 0.1
 percent of pixels, whichever is larger. A clean bin also needs a mean frame
 signal above thirty read sigmas, with reference samples below the roll-off
-knee. At least two clean bins are required. Keep the shutter ratio if the
-trend across clean bins exceeds 2 percent or the fitted scale differs by
-more than 0.3 EV.
+knee. A frame with a skipped alignment keeps the shutter ratio. A frame with
+a trusted alignment (enabled, not weak) needs one clean bin; a trend above 2
+percent across clean bins only gives a warning. A frame with a weak or
+disabled alignment needs two clean bins and keeps the shutter ratio if the
+trend exceeds 2 percent. Keep the shutter ratio if the fitted scale differs by
+more than 0.5 EV.
 
 An exposure field comes before this scalar. For each frame, fit `ratio * (a +
 b*u + c*v)` in the frame's own coordinates, shared by B and M and separate for

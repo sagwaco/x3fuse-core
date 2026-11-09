@@ -216,15 +216,22 @@ The local search covers eight full-resolution pixels around
 the global transform; the global search still covers 64 pixels.
 The field uses tile-sized storage. The merge warps one band of output rows at
 a time, from the source rows that the taps of that band read.
-A scalar exposure fit uses the median of clean, supported bin medians.
+A scalar exposure fit uses the median of the two highest clean, supported bin
+medians, or the one clean bin if only one qualifies. The ratio can rise with
+level, and the highest bins are nearest to the hand-off from the reference.
 An affine fit supplies a black-offset diagnostic only. Near-black bias is
 nonlinear, so using the affine slope would bias the scale. Short exposures
 use reference levels from 5 to 60 percent of the ceiling. Long exposures use 5 to 25 percent and must stay below 40 percent
 of their own ceiling. Frame T must exceed ten read sigmas. A bin needs at
 least 1000 pairs or 0.1 percent of pixels. A clean bin also needs a mean frame
 signal above thirty read sigmas, with reference samples below the roll-off
-knee. At least two clean bins must qualify. A trend above 2 percent across
-those bins, or a scale change above 0.3 EV, keeps the nominal shutter ratio.
+knee. A skipped alignment always keeps the nominal shutter ratio. With a
+trusted alignment (enabled and not weak), one clean bin is sufficient, and a
+trend above 2 percent across the clean bins only gives a warning. With a weak
+or disabled alignment, at least two clean bins must qualify, and a trend above
+2 percent keeps the nominal shutter ratio. A misregistered frame gives a
+biased ratio. A scale change above 0.5 EV always keeps the nominal shutter
+ratio.
 
 Before the scalar, the statistics pass fits an exposure field for each frame:
 `scale = ratio * (a + b*u + c*v)`, with `u` and `v` from -1 to 1 across the
@@ -350,7 +357,7 @@ does not correct it.
 | `X3F_X3I_WEAK_GHOST_SIGMA=value` | Set the positive finite weak-alignment threshold in sigma. Default: GHOST_SIGMA; bounded by GHOST_SIGMA. |
 | `X3F_X3I_C_MAX=value` | Set the effective-variance upper clamp. Default: `4`; must be finite and at least C_MIN. Caps of one or more have no effect on the two measured samples. |
 | `X3F_X3I_C_MIN=value` | Set the effective-variance calibration floor. Default: `0.5`; range: above zero through one. |
-| `X3F_X3I_RATIO_TREND=value` | Set the maximum relative trend across clean supported ratio bins. Default: `0.02` (2 percent). Larger trends keep the nominal ratio. |
+| `X3F_X3I_RATIO_TREND=value` | Set the maximum relative trend across clean supported ratio bins. Default: `0.02` (2 percent). A larger trend rejects the exposure field. It keeps the nominal ratio only for a frame with a weak or disabled alignment; with a trusted alignment it gives a warning. |
 | `X3F_X3I_DENOISE_SCALE=value` | Enable experimental post-merge denoise when positive. Unset or zero disables it. |
 
 See the [merge stage](./pipeline.md#x3i-merge-stage) for weighting, validity,
