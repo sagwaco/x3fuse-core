@@ -2428,8 +2428,31 @@ fn band_check(control: Control<'_>) -> Result<(), Error> {
 
 /// Noise tolerance of the seed test, in standard deviations of the frame T sample.
 const SEED_SIGMAS: f32 = 3.0;
-/// Relative tolerance of the seed test, as a fraction of the reference T sample.
+/// Smallest relative tolerance of the seed test, as a fraction of the
+/// reference T sample.
 const SEED_FRACTION: f32 = 0.05;
+/// Largest relative tolerance of the seed test.
+const SEED_FRACTION_LIMIT: f32 = 0.25;
+
+/// Relative tolerance of the seed test for one frame. The ratio of a frame to
+/// the reference can change with level: on a measured static capture, the
+/// short frames read 6 to 12 percent below the reference near its ceiling.
+/// The level trend of the clean ratio bins measures this change below the
+/// hand-off, and it can be as large again between those bins and the ceiling.
+/// So a frame with a trusted alignment gets two times its trend, within the
+/// two limits. Other frames keep the smallest tolerance, because their darker
+/// samples are more likely other content.
+fn seed_fraction(trusted: bool, level_trend: Option<f32>) -> f32 {
+    let measured = if trusted {
+        2.0 * level_trend.unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    if measured.is_nan() {
+        return SEED_FRACTION;
+    }
+    measured.clamp(SEED_FRACTION, SEED_FRACTION_LIMIT)
+}
 
 /// Seed the ghost estimate of the pixels of `planes` that no earlier frame
 /// covered. Seeding again from the same planes writes the same values, so a
@@ -2437,7 +2460,8 @@ const SEED_FRACTION: f32 = 0.05;
 ///
 /// With `copy`, `estimate` holds the clipped reference sample at an unseeded
 /// pixel. That sample is a lower bound of the true value, so a frame seeds
-/// the pixel only if its T sample is not much darker.
+/// the pixel only if its T sample is not much darker: `fraction` is the
+/// relative tolerance of this frame (see `seed_fraction`).
 fn seed(
     planes: &FramePlanes,
     estimate: &mut [f32],
@@ -2445,13 +2469,14 @@ fn seed(
     correction: [f32; 2],
     above_black: &[u8],
     copy: bool,
+    fraction: f32,
 ) {
     for p in 0..planes.valid.len() {
         if estimate_var[p][1] == 0.0 && planes.valid[p] != 0 {
             if copy {
                 let reference = estimate[p * 3 + 2];
                 let tolerance =
-                    (SEED_SIGMAS * planes.var[p * 2 + 1].sqrt()).max(SEED_FRACTION * reference);
+                    (SEED_SIGMAS * planes.var[p * 2 + 1].sqrt()).max(fraction * reference);
                 if planes.x[p * 3 + 2] < reference - tolerance {
                     continue;
                 }
@@ -3340,6 +3365,10 @@ fn merge_in_bands(
         // The 3x3 ghost minimum reads one row above and below each band.
         let halo = usize::from(ghost && i != 0);
         let correction = [report.chroma_variance[i], report.effective_variance[i]];
+        let fraction = seed_fraction(
+            options.align.enabled && !report.weak_alignments[i],
+            report.aligned_ratios[i].level_trend,
+        );
         let shortest = report.exposure_us[i] < shortest_us;
         let mut window = Window::default();
         let mut map = (options.ghost_maps && i != 0).then(|| Vec::with_capacity(pixels));
@@ -3385,6 +3414,7 @@ fn merge_in_bands(
                     correction,
                     &above_black,
                     i != 0,
+                    fraction,
                 );
                 if i == 0 {
                     // The reference estimate is the complete reference plane.
@@ -7351,6 +7381,48 @@ mod tests {
             report.fallback_estimate + report.unseeded_pixels + report.neutral_clipped,
             0
         );
+    }
+
+    #[test]
+    fn seed_tolerance_follows_a_trusted_measured_trend() {
+        // Without a trusted alignment or a measured trend, the tolerance is 5 percent.
+        assert_eq!(seed_fraction(false, Some(0.2)), 0.05);
+        assert_eq!(seed_fraction(true, None), 0.05);
+        assert_eq!(seed_fraction(true, Some(0.01)), 0.05);
+        assert_eq!(seed_fraction(true, Some(f32::NAN)), 0.05);
+        // A trusted frame gets two times its trend, up to 25 percent.
+        assert_eq!(seed_fraction(true, Some(0.08)), 0.16);
+        assert_eq!(seed_fraction(true, Some(0.2)), 0.25);
+        // One unseeded pixel with a reference T of 1.
+        let run = |level: f32, fraction: f32| {
+            let planes = FramePlanes {
+                width: 1,
+                height: 1,
+                x: vec![level; 3],
+                var: vec![1e-8; 2],
+                d_max: vec![0.0],
+                valid: vec![1],
+            };
+            let mut estimate = vec![0.6, 0.8, 1.0];
+            let mut estimate_var = vec![[0.0; 2]];
+            seed(
+                &planes,
+                &mut estimate,
+                &mut estimate_var,
+                [1.0; 2],
+                &[1],
+                true,
+                fraction,
+            );
+            (estimate_var[0][1] != 0.0, estimate)
+        };
+        // A static frame that reads 12 percent low seeds only with its measured tolerance.
+        assert_eq!(run(0.88, 0.05), (false, vec![0.6, 0.8, 1.0]));
+        assert_eq!(run(0.88, 0.16), (true, vec![0.88; 3]));
+        // Accepted limit: other content that is 20 percent darker passes only
+        // at the largest tolerance.
+        assert!(!run(0.8, 0.16).0);
+        assert!(run(0.8, 0.25).0);
     }
 
     #[test]

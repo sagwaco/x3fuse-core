@@ -491,7 +491,10 @@ loader changes. Ghost weights use the maximum channel squared residual `z²`,
 `exp(-z²/9)`, and a 3x3 minimum. The estimate starts from the reference.
 Outside reference coverage, the clipped reference sample is a lower bound.
 There, the shortest valid frame whose T sample is not darker than the
-reference T by more than `max(3 sigma, 5 %)` seeds the estimate. A valid
+reference T by more than `max(3 sigma, f)` seeds the estimate. The fraction
+`f` is 5 percent. For a frame with a trusted alignment it is two times the
+level trend of its clean ratio bins, limited to the range of 5 to 25 percent,
+because the ratio to the reference can change with level. A valid
 frame at a pixel that stays unseeded gets ghost weight zero. Reports count
 valid ghost weights below 0.1. Bin diagnostics go only to the `-x3i-report` file.
 
