@@ -156,6 +156,11 @@ pub struct MergeOptions {
     pub w_min: f32,
     /// Optional safety limit in reference units. None preserves all headroom.
     pub max_s: Option<f32>,
+    /// Active image area of the expanded raster: top, left, bottom, right in
+    /// pixels, bottom and right exclusive. A warped frame does not use source
+    /// pixels that are more than 4 pixels outside it. None, or an area that
+    /// does not fit, uses all pixels.
+    pub active: Option<[u32; 4]>,
 }
 
 impl Default for MergeOptions {
@@ -183,6 +188,7 @@ impl Default for MergeOptions {
             noise_sigma: None,
             w_min: 1e-3,
             max_s: None,
+            active: None,
         }
     }
 }
@@ -242,6 +248,25 @@ impl MergeOptions {
         if let Some(saturation) = self.saturation {
             return Ok(saturation);
         }
+        Ok(self.saturation_and_size(container, control, warnings)?.0)
+    }
+
+    /// Return the raw ceilings and the `[width, height]` of the expanded raster.
+    /// With a saturation override, load frame 0 only for its size.
+    pub(crate) fn saturation_and_size(
+        &self,
+        container: &crate::X3iContainer,
+        control: Control<'_>,
+        warnings: &mut Vec<String>,
+    ) -> Result<([f32; 3], [u32; 2]), Error> {
+        control.check()?;
+        self.validate()?;
+        let mut options = self.process.clone();
+        options.denoise_intensity = 0;
+        if let Some(saturation) = self.saturation {
+            let frame = container.open_frame(0)?.merge_frame(&options, control)?;
+            return Ok((saturation, [frame.width, frame.height]));
+        }
         let mut longest = (0, 0);
         for i in 0..container.frames().len() {
             control.check()?;
@@ -250,12 +275,11 @@ impl MergeOptions {
                 longest = (i, exposure);
             }
         }
-        let mut options = self.process.clone();
-        options.denoise_intensity = 0;
         let frame = container
             .open_frame(longest.0)?
             .merge_frame(&options, control)?;
-        estimate_saturation(&frame, longest.0, control, warnings)
+        let saturation = estimate_saturation(&frame, longest.0, control, warnings)?;
+        Ok((saturation, [frame.width, frame.height]))
     }
 
     fn parse_env(
@@ -2076,6 +2100,34 @@ fn band_planes(
         return make(rows);
     };
     let (width, height) = (frame.width as usize, frame.height as usize);
+    // A warp moves the masked sensor border into the image. Make source pixels
+    // more than `ACTIVE_MARGIN` outside the active area invalid, so that no
+    // warp tap uses them.
+    let [top, left, bottom, right] =
+        crate::x3i_output::bounds(frame.height, frame.width, options.active).map(|v| v as usize);
+    let [top, left] = [top, left].map(|v| v.saturating_sub(ACTIVE_MARGIN));
+    let (bottom, right) = (
+        (bottom + ACTIVE_MARGIN).min(height),
+        (right + ACTIVE_MARGIN).min(width),
+    );
+    let make = |r: Range<usize>| -> Result<FramePlanes, Error> {
+        let mut planes = make(r.clone())?;
+        if [top, left, bottom, right] != [0, 0, height, width] {
+            for (y, (d_max, valid)) in r.zip(
+                planes
+                    .d_max
+                    .chunks_mut(width)
+                    .zip(planes.valid.chunks_mut(width)),
+            ) {
+                for x in 0..width {
+                    if !(top..bottom).contains(&y) || !(left..right).contains(&x) {
+                        (d_max[x], valid[x]) = (f32::INFINITY, 0);
+                    }
+                }
+            }
+        }
+        Ok(planes)
+    };
     // An empty source range still gives the window the frame width.
     let source = x3i_align::source_rows(alignment, rows.clone(), width, height);
     window.cover(source, make)?;
@@ -2422,6 +2474,14 @@ fn ghost_weights(
 ) -> Result<Vec<f32>, Error> {
     ghost_weights_masked(frame, estimate, estimate_var, correction, &[], 3.0, control)
 }
+
+/// Pixels outside the active area that a warped frame can still use. The
+/// sensor records real image data outside the active area: at least 6 px left
+/// and right and 16 px top and bottom on the sd Quattro H, and at least 4 px
+/// top and bottom on the dp0. The masked black border starts farther out.
+/// Without this margin, a bicubic warp of a small shift removes all warped
+/// frames from the outermost pixels of the picture.
+const ACTIVE_MARGIN: usize = 4;
 
 /// Output rows per merge band. The derived planes of one band, its halo rows
 /// and its warp source rows stay in memory instead of full-frame planes.
@@ -6870,7 +6930,7 @@ mod tests {
             }
             let explicit = MergeOptions {
                 saturation: Some([0.4, 0.5, 0.6]),
-                ..options
+                ..options.clone()
             };
             assert_eq!(
                 explicit
@@ -6878,6 +6938,16 @@ mod tests {
                     .unwrap(),
                 [0.4, 0.5, 0.6]
             );
+            // The estimate and the override give the same raster size.
+            let (estimated, size) = options
+                .saturation_and_size(&container, Control::none(), &mut Vec::new())
+                .unwrap();
+            assert_eq!(estimated, ceilings);
+            let (_, override_size) = explicit
+                .saturation_and_size(&container, Control::none(), &mut Vec::new())
+                .unwrap();
+            assert_eq!(override_size, size);
+            assert!(size[0] > 1000 && size[1] > 1000, "{size:?}");
         }
     }
 
@@ -8083,6 +8153,87 @@ mod tests {
             f.raw_top[..(width as f32 * height as f32 * clip) as usize].fill(55000);
         }
         f
+    }
+
+    #[test]
+    fn warp_taps_outside_the_active_area_are_invalid() {
+        let frame = band_frame(1, [64, 64], 0.05, 1.0);
+        let factors = validate_frame(&frame, Control::none()).unwrap();
+        let (dx, dy) = (2.5, -1.5);
+        let alignment = Alignment {
+            dx,
+            dy,
+            ..Default::default()
+        };
+        let run = |active, warp| {
+            let options = MergeOptions {
+                active,
+                ..Default::default()
+            };
+            band_planes(
+                &frame,
+                factors,
+                1.0.into(),
+                &options,
+                warp,
+                0..64,
+                true,
+                &mut Window::default(),
+                Control::none(),
+            )
+            .unwrap()
+        };
+        let area = [12, 10, 50, 54];
+        let same = |a: &FramePlanes, b: &FramePlanes| {
+            assert_eq!(bits(&a.x), bits(&b.x));
+            assert_eq!(bits(&a.var), bits(&b.var));
+            assert_eq!(bits(&a.d_max), bits(&b.d_max));
+            assert_eq!(a.valid, b.valid);
+        };
+        // `None`, an area that does not fit, and the reference or an unwarped
+        // frame keep all source pixels.
+        let full = run(None, Some(&alignment));
+        same(&full, &run(Some([0, 0, 65, 64]), Some(&alignment)));
+        same(&run(None, None), &run(Some(area), None));
+        let whole = materialise_rows(
+            &frame,
+            factors,
+            1.0.into(),
+            &MergeOptions::default(),
+            0..64,
+            true,
+            Control::none(),
+        )
+        .unwrap();
+        same(
+            &full,
+            &x3i_align::warp(whole, &alignment, Control::none()).unwrap(),
+        );
+        let masked = run(Some(area), Some(&alignment));
+        assert_eq!(bits(&masked.x), bits(&full.x));
+        let (mut kept, mut dropped) = (0, 0);
+        for y in 0..64 {
+            for x in 0..64 {
+                let i = y * 64 + x;
+                // All 16 taps, `floor(s) - 1..=floor(s) + 2`, must be at most
+                // `ACTIVE_MARGIN` pixels outside the area.
+                let (sx, sy) = ((x as f32 - dx).floor(), (y as f32 - dy).floor());
+                let m = ACTIVE_MARGIN as f32;
+                let inside = sx - 1.0 >= area[1] as f32 - m
+                    && sx + 2.0 < area[3] as f32 + m
+                    && sy - 1.0 >= area[0] as f32 - m
+                    && sy + 2.0 < area[2] as f32 + m;
+                if inside {
+                    assert_eq!(masked.valid[i], full.valid[i], "{x} {y}");
+                    assert_eq!(masked.d_max[i].to_bits(), full.d_max[i].to_bits());
+                    kept += usize::from(full.valid[i] != 0);
+                } else {
+                    assert_eq!(masked.valid[i], 0, "{x} {y}");
+                    dropped += usize::from(full.valid[i] != 0);
+                }
+            }
+        }
+        assert!(kept > 1000 && dropped > 100, "{kept} {dropped}");
     }
 
     #[test]

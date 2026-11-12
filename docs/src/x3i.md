@@ -214,8 +214,9 @@ Global alignment uses one translation or bounded similarity transform.
 at half resolution. The estimator rejects weak peaks and shifts that disagree
 with nearby tiles or the global transform. It fills missing tiles by neighbour
 regularisation. Bilinear interpolation evaluates the field between tile centres;
-Catmull-Rom still samples the image. All 16 source taps must be valid, and
-their maximum saturation value remains the roll-off input.
+Catmull-Rom still samples the image. All 16 source taps must be valid, and no
+tap can be more than 4 pixels outside the active image area of the frame.
+Their maximum saturation value remains the roll-off input.
 The local field has a bounded gradient to prevent folds. A weak local estimate
 keeps the global transform and reports the reason. Global remains the default
 because local does not improve every frame on both tested samples.

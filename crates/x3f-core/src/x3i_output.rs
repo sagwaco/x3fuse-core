@@ -20,8 +20,10 @@ pub(crate) fn merge_frames(
     merge_options.process = options.clone();
     merge_options.ghost_maps = options.x3i_ghost_maps;
     merge_options.process.denoise_intensity = 0;
-    merge_options.saturation =
-        Some(merge_options.saturation_for_with_warnings(container, control, warnings)?);
+    let (saturation, [width, height]) =
+        merge_options.saturation_and_size(container, control, warnings)?;
+    merge_options.saturation = Some(saturation);
+    merge_options.active = frame0.dng_active_area_for_size(height, width);
     let mut reported = vec![false; container.frames().len()];
     let mut scene = x3i_merge::merge(
         container.frames().len(),
