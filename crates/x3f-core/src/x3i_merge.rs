@@ -62,13 +62,17 @@
 //! The merge applies no signal-dependent dark weight. Unsigned DNG encoding
 //! clamps negative merged samples to zero.
 //! With ghost rejection, a frame seeds the estimate at a clipped reference
-//! pixel only if its T sample is not much darker than the reference sample. A
+//! pixel only if its T sample is not much darker than the reference sample.
+//! Where the reference T sample is not saturated, it is a measurement, so the
+//! frame T sample must also not be much brighter. A
 //! pixel with a chroma or luma weight sum below `w_min` takes the complete
 //! estimate pixel. A pixel that no frame seeded keeps the reference sample,
 //! blended toward camera neutral by its saturation footprint. Where the
 //! reference raw samples saturate, a brighter saturated sample of another frame
 //! replaces it, so a pixel that clips in every frame takes the brightest lower
 //! bound.
+//! A warped frame does not use source pixels of the masked sensor border. The
+//! reference keeps its full raster; the output mask removes its border.
 //!
 //! The expansion builds its half-resolution top sum from unrepaired samples.
 //! A defective top pixel can contaminate chroma in its 8x8 expanded block.
