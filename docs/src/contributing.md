@@ -437,16 +437,18 @@ existing-output preservation. Scene tests check finite active-area RGB and
 extended highlight range. TIFF and PPM must use the merged raster.
 
 The dp0 merged DNG has the intentional macOS aarch64 MD5 pin
-`3bc2b1ccdd1b8bae53bee0adc5aca085` with `-dng -no-denoise`. It replaces
+`929dd4fcbcabe9ed30758d7195fb9e33` with `-dng -no-denoise`. It replaces
 `c6a5e36dcca767e66a4e2214f4daeeef`. The merge now keeps highlights consistent
 with the reference: a frame seeds a clipped reference pixel only if it is not
-much darker, a pixel without weight takes the ghost estimate, and a clipped
-pixel without a seed becomes neutral. The alignment and the exposure fields of
-dp0 do not change. The sd Quattro H merge pin is
-`00e9418f491947768c156c3b0a82b122`. It replaces
+much darker and, where the reference T sample is not saturated, not much
+brighter. A pixel without weight takes the ghost estimate, and a clipped
+pixel without a seed becomes neutral. A warped frame does not use source
+pixels that are more than 4 pixels outside the active area. The alignment and
+the exposure fields of dp0 do not change. The sd Quattro H merge pin is
+`d81237d03633159e0be572fe7685f07d`. It replaces
 `83e77601eef101a1a075b72d73831ecc`: frames 1 and 2 take their scalar from the
 two highest clean bins (0.19 and 0.11 percent lower). The current
-`X3F_X3I_NO_ALIGN=1` dp0 digest is `98d4850a95a0ea1fbab4352ed2962aa0`. The
+`X3F_X3I_NO_ALIGN=1` dp0 digest is `af601bad5d6721bfe74349e8a6d452cc`. The
 digests in the next paragraph are the history before this change. The
 settings named there reproduced them at that time; they do not reproduce them
 now.
