@@ -1296,6 +1296,104 @@ pub fn denoise_u16(
     Ok(())
 }
 
+/// Denoise merged X3I samples with the Quattro profile at the native code scale.
+/// `bmt` holds interleaved B, M and T samples, row by row, `width * height * 3` long.
+/// The native code of a sample is `value * span[c] + bias[c]`, rounded and limited
+/// to `0..=16383`. Use the white-balanced Quattro codes: only at that scale are the
+/// YUV planes chroma. Scale multiplies `DenoiseOptions::strength`, as for one frame.
+/// This is a post-merge approximation of the single-frame Quattro denoise. Its half
+/// pass works on planes that come from the expanded samples, not from the sensor
+/// planes.
+/// The NLM path runs a half-resolution pass on U and V only, then a full-resolution
+/// pass with `{h, h, 2h}`. The BM3D path runs one full-resolution pass.
+/// The expanded raster has even sizes. An odd size works, but its half pass uses a
+/// different resampling ratio.
+/// A pixel changes only if all three of its codes are in `1..=16382`. The function
+/// then adds the code change divided by `span[c]` to each sample. Other pixels keep
+/// their exact values. The filter input uses the limited codes of out-of-range
+/// samples, so the chroma of in-range pixels near them can move toward neutral.
+/// Zero scale or disabled luminance and chroma leaves the data unchanged.
+/// Cancellation returns `Error::Cancelled`. Any error leaves the data unchanged.
+/// Zero dimensions, a wrong slice length, a nonfinite `span` or `bias`, a `span`
+/// that is not positive, a negative or nonfinite scale, or invalid denoise options
+/// returns `Error::InvalidData`.
+pub fn denoise_merged(
+    bmt: &mut [f32],
+    width: u32,
+    height: u32,
+    span: [f32; 3],
+    bias: [f32; 3],
+    scale: f32,
+    control: Control<'_>,
+) -> crate::Result<()> {
+    control.check()?;
+    let length = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(3));
+    if width == 0
+        || height == 0
+        || length != Some(bmt.len())
+        || !span.iter().all(|s| s.is_finite() && *s > 0.0)
+        || !bias.iter().all(|b| b.is_finite())
+        || !scale.is_finite()
+        || scale < 0.0
+    {
+        return Err(crate::Error::InvalidData("invalid merged denoise raster"));
+    }
+    let options = control.denoise_options;
+    options.validate().map_err(crate::Error::InvalidData)?;
+    if scale == 0.0 || (!options.luminance && !options.chroma) {
+        return Ok(());
+    }
+    let before: Vec<u16> = bmt
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (v * span[i % 3] + bias[i % 3]).round().clamp(0.0, 16383.0) as u16)
+        .collect();
+    let dt = DType::Yis4T;
+    let h = dt.base_h() * scale as f64 * options.strength as f64;
+    let mut img = Img3 {
+        rows: height as usize,
+        cols: width as usize,
+        data: before.clone(),
+    };
+    // SAFETY: `img.area()` covers the packed, owned buffer of `img`.
+    unsafe { bmt_to_yuv(&mut img.area(), dt) };
+    let mut out = if options.algorithm == DenoiseAlgorithm::Bm3d {
+        denoise_bm3d(&img, scale, control)?
+    } else {
+        let (half_rows, half_cols) = (img.rows / 2, img.cols / 2);
+        if half_rows > 0 && half_cols > 0 {
+            let half = resize_area(&img, half_rows, half_cols);
+            let mut half_dn = half.clone();
+            denoise_nlm(&mut half_dn, h, control)?;
+            let mut res = subtract_to_i16(&half, &half_dn);
+            // Only U and V take the half-pass correction. In the single-frame path,
+            // expansion replaces Y after this pass, so Y gets only the full pass.
+            for px in res.data.chunks_exact_mut(3) {
+                px[0] = 0;
+            }
+            let res = resize_cubic_i16(&res, img.rows, img.cols);
+            subtract_u16_inplace(&mut img, &res);
+        }
+        configured_nlm(&img, [h, h, 2.0 * h], control)?
+    };
+    // SAFETY: `out.area()` covers the packed, owned buffer of `out`.
+    unsafe { yuv_to_bmt(&mut out.area(), dt) };
+    control.check()?;
+    for (px, (new, old)) in bmt
+        .chunks_exact_mut(3)
+        .zip(out.data.chunks_exact(3).zip(before.chunks_exact(3)))
+    {
+        if old.iter().all(|&c| (1..=16382).contains(&c)) {
+            for c in 0..3 {
+                px[c] += (f32::from(new[c]) - f32::from(old[c])) / span[c];
+            }
+        }
+    }
+    Ok(())
+}
+
 /// BMT→YUV, full `denoise_nlm`, YUV→BMT (was the OpenCV `x3f_denoise`).
 ///
 /// # Safety
@@ -1412,6 +1510,214 @@ pub(crate) unsafe fn denoise_active_area(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MERGED_SPAN: [f32; 3] = [16368.0, 15754.0, 7567.0];
+    const MERGED_BIAS: [f32; 3] = [15.0; 3];
+
+    /// A flat field of codes B 4000, M 4000, T 2000. Each plane gets uniform noise
+    /// with the half width `noise[c]` in codes (104 gives a std of about 60).
+    fn merged_field(width: usize, height: usize, noise: [f32; 3]) -> Vec<f32> {
+        let mut state = 0x2545_f491_u32;
+        let mut uniform = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+        };
+        (0..width * height * 3)
+            .map(|i| {
+                let c = i % 3;
+                let code = [4000.0, 4000.0, 2000.0][c] + noise[c] * uniform();
+                (code - MERGED_BIAS[c]) / MERGED_SPAN[c]
+            })
+            .collect()
+    }
+
+    /// A 64x48 flat field with about 60 codes of noise in B and M only.
+    fn merged_speckle() -> Vec<f32> {
+        merged_field(64, 48, [104.0, 104.0, 0.0])
+    }
+
+    fn merged_code(data: &[f32], i: usize) -> f32 {
+        data[i] * MERGED_SPAN[i % 3] + MERGED_BIAS[i % 3]
+    }
+
+    fn merged_control(
+        luminance: bool,
+        chroma: bool,
+        algorithm: DenoiseAlgorithm,
+    ) -> Control<'static> {
+        Control::none()
+            .with_denoise_backend(DenoiseBackend::Cpu)
+            .with_denoise_options(DenoiseOptions {
+                luminance,
+                chroma,
+                algorithm,
+                ..Default::default()
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn merged_bridge_filters_luminance_and_chroma() {
+        let control = merged_control(true, true, DenoiseAlgorithm::Nlm);
+        let source = merged_field(64, 48, [104.0; 3]);
+        let mut data = source.clone();
+        denoise_merged(&mut data, 64, 48, MERGED_SPAN, MERGED_BIAS, 1.0, control).unwrap();
+        assert!(plane_std(&data, 2) < plane_std(&source, 2));
+        for c in 0..2 {
+            assert!(plane_std(&data, c) < 0.5 * plane_std(&source, c));
+        }
+    }
+
+    #[test]
+    fn merged_bridge_luminance_only_keeps_chroma() {
+        let control = merged_control(true, false, DenoiseAlgorithm::Nlm);
+        let source = merged_field(32, 24, [0.0, 0.0, 104.0]);
+        let mut data = source.clone();
+        denoise_merged(&mut data, 32, 24, MERGED_SPAN, MERGED_BIAS, 1.0, control).unwrap();
+        assert!(plane_std(&data, 2) < plane_std(&source, 2));
+        for p in (0..data.len()).step_by(3) {
+            for c in 0..2 {
+                let before = merged_code(&source, p + c) - merged_code(&source, p + 2);
+                let after = merged_code(&data, p + c) - merged_code(&data, p + 2);
+                assert!((after - before).abs() <= 1.0, "pixel {p} plane {c}");
+            }
+        }
+    }
+
+    #[test]
+    fn merged_bridge_bm3d_and_odd_size_run() {
+        let bm3d = merged_control(false, true, DenoiseAlgorithm::Bm3d);
+        let source = merged_field(32, 32, [104.0, 104.0, 0.0]);
+        let mut data = source.clone();
+        denoise_merged(&mut data, 32, 32, MERGED_SPAN, MERGED_BIAS, 1.0, bm3d).unwrap();
+        assert_ne!(data, source);
+        let nlm = merged_control(false, true, DenoiseAlgorithm::Nlm);
+        let source = merged_field(33, 21, [104.0, 104.0, 0.0]);
+        let mut data = source.clone();
+        denoise_merged(&mut data, 33, 21, MERGED_SPAN, MERGED_BIAS, 1.0, nlm).unwrap();
+        assert_ne!(data, source);
+    }
+
+    #[test]
+    fn merged_bridge_keeps_bright_block_and_filters_far_pixels() {
+        let control = Control::none().with_denoise_backend(DenoiseBackend::Cpu);
+        let (rows, cols) = (20..28, 28..36);
+        let mut source = merged_speckle();
+        for r in rows.clone() {
+            for c in cols.clone() {
+                source[(r * 64 + c) * 3..][..3].fill(1.5);
+            }
+        }
+        let mut data = source.clone();
+        denoise_merged(&mut data, 64, 48, MERGED_SPAN, MERGED_BIAS, 1.0, control).unwrap();
+        let mut far = (Vec::new(), Vec::new());
+        for r in 0..48 {
+            for c in 0..64 {
+                let p = (r * 64 + c) * 3;
+                if rows.contains(&r) && cols.contains(&c) {
+                    for i in p..p + 3 {
+                        assert_eq!(data[i].to_bits(), source[i].to_bits());
+                    }
+                }
+                let dr = (rows.start as i32 - r as i32).max(r as i32 - rows.end as i32 + 1);
+                let dc = (cols.start as i32 - c as i32).max(c as i32 - cols.end as i32 + 1);
+                if dr.max(dc) >= 12 {
+                    far.0.extend_from_slice(&source[p..p + 3]);
+                    far.1.extend_from_slice(&data[p..p + 3]);
+                }
+            }
+        }
+        assert!(plane_std(&far.1, 0) < 0.5 * plane_std(&far.0, 0));
+    }
+
+    fn plane_std(data: &[f32], c: usize) -> f64 {
+        let values: Vec<f64> = data.iter().skip(c).step_by(3).map(|&v| v as f64).collect();
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        (values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64).sqrt()
+    }
+
+    #[test]
+    fn merged_bridge_removes_chroma_speckle() {
+        let control = Control::none().with_denoise_backend(DenoiseBackend::Cpu);
+        let source = merged_speckle();
+        let mut data = source.clone();
+        denoise_merged(&mut data, 64, 48, MERGED_SPAN, MERGED_BIAS, 1.0, control).unwrap();
+        for c in 0..2 {
+            assert!(plane_std(&data, c) < 0.5 * plane_std(&source, c));
+        }
+        for (after, before) in data.iter().zip(&source).skip(2).step_by(3) {
+            assert_eq!(after.to_bits(), before.to_bits());
+        }
+    }
+
+    #[test]
+    fn merged_bridge_keeps_out_of_range_pixels() {
+        let control = Control::none().with_denoise_backend(DenoiseBackend::Cpu);
+        let mut source = merged_speckle();
+        let (high, zero) = ((10 * 64 + 10) * 3, (30 * 64 + 40) * 3);
+        source[high] = 1.2;
+        source[zero + 1] = -1.0;
+        let mut data = source.clone();
+        denoise_merged(&mut data, 64, 48, MERGED_SPAN, MERGED_BIAS, 1.0, control).unwrap();
+        assert_ne!(data, source);
+        for p in [high, zero] {
+            for c in 0..3 {
+                assert_eq!(data[p + c].to_bits(), source[p + c].to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn merged_bridge_validates_and_preserves_off_or_cancelled_input() {
+        use std::sync::atomic::AtomicBool;
+        let control = Control::none().with_denoise_backend(DenoiseBackend::Cpu);
+        let source = merged_speckle();
+        let same = |data: &[f32]| {
+            data.iter()
+                .zip(&source)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        };
+        let mut data = source.clone();
+        denoise_merged(&mut data, 64, 48, MERGED_SPAN, MERGED_BIAS, 0.0, control).unwrap();
+        assert!(same(&data));
+        let off = control
+            .with_denoise_options(DenoiseOptions {
+                luminance: false,
+                chroma: false,
+                ..Default::default()
+            })
+            .unwrap();
+        denoise_merged(&mut data, 64, 48, MERGED_SPAN, MERGED_BIAS, 1.0, off).unwrap();
+        assert!(same(&data));
+        let cancel = AtomicBool::new(true);
+        assert!(matches!(
+            denoise_merged(
+                &mut data,
+                64,
+                48,
+                MERGED_SPAN,
+                MERGED_BIAS,
+                1.0,
+                Control::new(&cancel)
+            ),
+            Err(crate::Error::Cancelled)
+        ));
+        assert!(same(&data));
+        let nan_bias = [15.0, f32::NAN, 15.0];
+        for (width, length, span, bias, scale) in [
+            (64, 64 * 48 * 3 - 1, MERGED_SPAN, MERGED_BIAS, 1.0),
+            (0, 0, MERGED_SPAN, MERGED_BIAS, 1.0),
+            (64, 64 * 48 * 3, [16368.0, 0.0, 7567.0], MERGED_BIAS, 1.0),
+            (64, 64 * 48 * 3, MERGED_SPAN, nan_bias, 1.0),
+            (64, 64 * 48 * 3, MERGED_SPAN, MERGED_BIAS, -1.0),
+        ] {
+            let mut invalid = source[..length].to_vec();
+            assert!(matches!(
+                denoise_merged(&mut invalid, width, 48, span, bias, scale, control),
+                Err(crate::Error::InvalidData(_))
+            ));
+        }
+    }
 
     #[test]
     fn u16_bridge_validates_and_preserves_cancelled_or_disabled_input() {
