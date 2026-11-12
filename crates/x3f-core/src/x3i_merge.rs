@@ -2475,15 +2475,21 @@ fn seed_fraction(trusted: bool, level_trend: Option<f32>) -> f32 {
 /// halo row can be seeded before its own band.
 ///
 /// With `copy`, `estimate` holds the clipped reference sample at an unseeded
-/// pixel. That sample is a lower bound of the true value, so a frame seeds
-/// the pixel only if its T sample is not much darker: `fraction` is the
-/// relative tolerance of this frame (see `seed_fraction`).
+/// pixel. A saturated reference T sample is a lower bound of the true value,
+/// so a frame seeds the pixel only if its T sample is not much darker. An
+/// unsaturated reference T sample is a measurement, so the frame T sample
+/// must also not be much brighter. `fraction` is the relative tolerance of
+/// this frame (see `seed_fraction`). `saturated` has one entry for each pixel
+/// of `planes`: 1 where the reference T sample is saturated, else 0. An empty
+/// slice means that all reference T samples are saturated.
+#[allow(clippy::too_many_arguments)]
 fn seed(
     planes: &FramePlanes,
     estimate: &mut [f32],
     estimate_var: &mut [[f32; 2]],
     correction: [f32; 2],
     above_black: &[u8],
+    saturated: &[u8],
     copy: bool,
     fraction: f32,
 ) {
@@ -2493,7 +2499,10 @@ fn seed(
                 let reference = estimate[p * 3 + 2];
                 let tolerance =
                     (SEED_SIGMAS * planes.var[p * 2 + 1].sqrt()).max(fraction * reference);
-                if planes.x[p * 3 + 2] < reference - tolerance {
+                let x = planes.x[p * 3 + 2];
+                if x < reference - tolerance
+                    || (saturated.get(p) == Some(&0) && x > reference + tolerance)
+                {
                     continue;
                 }
                 estimate[p * 3..p * 3 + 3].copy_from_slice(&planes.x[p * 3..p * 3 + 3]);
@@ -3344,6 +3353,7 @@ fn merge_in_bands(
     order.sort_by_key(|&i| report.exposure_us[i]);
     order.insert(0, 0);
     let mut reference_bins = Vec::new();
+    let mut reference_saturated = Vec::new();
     let mut ghost_maps = Vec::new();
     for i in order {
         control.check()?;
@@ -3371,6 +3381,10 @@ fn merge_in_bands(
                         .map_or(255, |b| b as u8)
                 })
                 .collect::<Vec<_>>();
+            // 1 where the reference T sample is saturated, else 0.
+            reference_saturated = (0..pixels)
+                .map(|p| u8::from(raw(&frame, 2, p) / ceiling >= cut))
+                .collect();
         }
         let alignment = &report.alignments[i].clone();
         let cutoff = 10.0 * options.noise_sigma.unwrap_or(frame.sigma[2]);
@@ -3430,6 +3444,11 @@ fn merge_in_bands(
                     &mut scratch.estimate_var,
                     correction,
                     &above_black,
+                    if i == 0 {
+                        &[]
+                    } else {
+                        &reference_saturated[outer.start * w..outer.end * w]
+                    },
                     i != 0,
                     fraction,
                 );
@@ -6418,6 +6437,38 @@ mod tests {
     }
 
     #[test]
+    fn brighter_frame_does_not_seed_where_the_reference_t_sample_is_not_saturated() {
+        // The reference clips one B and M sample, so the footprint around it
+        // is invalid, but its T samples read 0.5 and are not saturated. The
+        // short frame reads 2.5 in reference units in that area.
+        let bright = |p: usize| (4..12).contains(&(p % 16)) && (4..12).contains(&(p / 16));
+        let scene = merge(
+            2,
+            |i| {
+                let mut f = frame([1000, 250][i], 0.5);
+                f.frame_index = i;
+                if i == 0 {
+                    f.raw_half[(4 * 8 + 4) * 2..(4 * 8 + 4) * 2 + 2].fill(10000);
+                } else {
+                    for p in (0..256).filter(|&p| bright(p)) {
+                        f.bmt[p * 3..p * 3 + 3].fill(0.625);
+                        f.raw_top[p] = 6250;
+                    }
+                }
+                Ok(f)
+            },
+            &MergeOptions::default(),
+            Control::none(),
+        )
+        .unwrap();
+        assert!(scene.report.unseeded_pixels > 0);
+        let t = (0..256)
+            .map(|p| scene.bmt[p * 3 + 2])
+            .fold(0.0f32, f32::max);
+        assert!(t < 1.0, "largest merged T sample {t}");
+    }
+
+    #[test]
     fn variance_ceiling_bounds_fits_and_low_support_fallbacks() {
         let block = CalibrationBlock {
             residual: [10.0; 3],
@@ -7491,6 +7542,7 @@ mod tests {
                 &mut estimate_var,
                 [1.0; 2],
                 &[1],
+                &[],
                 true,
                 fraction,
             );
@@ -7503,6 +7555,60 @@ mod tests {
         // at the largest tolerance.
         assert!(!run(0.8, 0.16).0);
         assert!(run(0.8, 0.25).0);
+    }
+
+    #[test]
+    fn seed_is_two_sided_where_the_reference_t_sample_is_not_saturated() {
+        // Unseeded pixels with a reference T of 1 and a 5 percent tolerance.
+        // `levels` are the frame T samples, `saturated` is the reference map.
+        let run =
+            |levels: &[f32], estimate: &mut Vec<f32>, var: &mut Vec<[f32; 2]>, saturated: &[u8]| {
+                let planes = FramePlanes {
+                    width: levels.len() as u32,
+                    height: 1,
+                    x: levels.iter().flat_map(|&v| [v; 3]).collect(),
+                    var: vec![1e-8; levels.len() * 2],
+                    d_max: vec![0.0; levels.len()],
+                    valid: vec![1; levels.len()],
+                };
+                seed(
+                    &planes,
+                    estimate,
+                    var,
+                    [1.0; 2],
+                    &vec![1; levels.len()],
+                    saturated,
+                    true,
+                    0.05,
+                );
+            };
+        let fresh = |n: usize| ([0.6, 0.8, 1.0].repeat(n), vec![[0.0; 2]; n]);
+        // Unsaturated reference: a brighter sample does not seed, a close one does.
+        let (mut estimate, mut var) = fresh(2);
+        run(&[1.5, 1.04], &mut estimate, &mut var, &[0, 0]);
+        assert_eq!(var[0][1], 0.0);
+        assert_eq!(estimate[..3], [0.6, 0.8, 1.0]);
+        assert_ne!(var[1][1], 0.0);
+        assert_eq!(estimate[3..], [1.04; 3]);
+        // Saturated reference: a much brighter sample seeds, a darker one does not.
+        let (mut estimate, mut var) = fresh(2);
+        run(&[5.0, 0.9], &mut estimate, &mut var, &[1, 1]);
+        assert_eq!(estimate[..3], [5.0; 3]);
+        assert_eq!(var[1][1], 0.0);
+        assert_eq!(estimate[3..], [0.6, 0.8, 1.0]);
+        // A later frame inside the tolerance seeds a pixel that an earlier frame failed.
+        let (mut estimate, mut var) = fresh(1);
+        run(&[1.5], &mut estimate, &mut var, &[0]);
+        assert_eq!(var[0][1], 0.0);
+        run(&[0.98], &mut estimate, &mut var, &[0]);
+        assert_eq!(estimate, [0.98; 3]);
+        // A map slice that starts at row 1 of a 2x2 raster (a band with a halo
+        // row) applies entry `p` of the slice to pixel `p` of the planes.
+        let map = [1u8, 1, 0, 1];
+        let (mut estimate, mut var) = fresh(2);
+        run(&[2.0, 2.0], &mut estimate, &mut var, &map[2..4]);
+        assert_eq!(var[0][1], 0.0);
+        assert_eq!(estimate[3..], [2.0; 3]);
     }
 
     #[test]

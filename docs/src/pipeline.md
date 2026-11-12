@@ -490,9 +490,11 @@ Release all statistics rasters before the accumulation pass reloads frame 0.
 This pass emits Process events. A hash of each first raw T row detects common
 loader changes. Ghost weights use the maximum channel squared residual `z²`,
 `exp(-z²/9)`, and a 3x3 minimum. The estimate starts from the reference.
-Outside reference coverage, the clipped reference sample is a lower bound.
+Outside reference coverage, a saturated reference T sample is a lower bound.
 There, the shortest valid frame whose T sample is not darker than the
-reference T by more than `max(3 sigma, f)` seeds the estimate. The fraction
+reference T by more than `max(3 sigma, f)` seeds the estimate. An unsaturated
+reference T sample is a measurement, so the frame T sample must also not be
+brighter by more than the same tolerance. The fraction
 `f` is 5 percent. For a frame with a trusted alignment it is two times the
 level trend of its clean ratio bins, limited to the range of 5 to 25 percent,
 because the ratio to the reference can change with level. A valid

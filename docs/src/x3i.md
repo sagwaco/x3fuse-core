@@ -318,8 +318,9 @@ variance after the intermediate zero clamp and conservatively under-rejects dark
 The accumulation pass compares each frame with the reference estimate.
 Ghost weights are `exp(-max_channel(z²)/sigma²)`, followed by a 3x3 minimum.
 Where the reference is clipped, a frame seeds the estimate only if its T
-sample is not much darker than the clipped reference sample; a valid frame
-that fails gets weight zero there. A pixel with too little weight takes the
+sample is not much darker than the clipped reference sample. Where the
+reference T sample itself is not saturated, the frame T sample must also not
+be much brighter. A valid frame that fails gets weight zero there. A pixel with too little weight takes the
 complete estimate pixel. A pixel that no frame seeded takes the brightest
 neutral-clipped sample: the reference sample, or, where the reference raw
 samples saturate, a brighter saturated sample of a later frame.
