@@ -97,10 +97,10 @@ These options add memory (measured on the dp0 sample):
 
 | Option | Peak RSS |
 | --- | ---: |
-| Default | 2.0 GB |
+| `-no-denoise` | 2.0 GB |
 | `-sgain` (spatial gain, off by default on Quattro) | 3.5 GB |
 | `-color-mode Vivid` | 2.1 GB |
-| `X3F_X3I_DENOISE_SCALE=0.3` with `-denoise-backend cpu` | 2.4 GB |
+| Default (post-merge denoise on, Auto backend) | 2.1 GB |
 
 Spatial gain keeps 12 bytes of gain per pixel with each frame that the
 producer prepares. `-x3i-ghost-map`
@@ -160,35 +160,17 @@ cancelled file conversion removes its reserved output and preserves any
 existing destination. Scene preparation writes no output. X3I support is
 currently in the native Rust API and CLI; the C ABI and WASM have no X3I entry.
 
-## Experimental denoise
+## Denoise
 
-Each frame is prepared with denoise off. Post-merge denoise is also off unless
-`X3F_X3I_DENOISE_SCALE` is set above zero. The CLI's default denoise intensity
-alone does not enable it. To evaluate the research strength:
-
-```sh
-X3F_X3I_DENOISE_SCALE=0.3 x3f_extract -dng -denoise-backend cpu capture.X3I
-```
-
-The selected NLM or BM3D runs once on the encoded merged camera raster.
-The effective strength is override times intensity/10, divided by the shared
-DNG encoding scale `S`. The bridge compresses all channels by four to keep
-the Quattro YUV transform in range. It adds the filtered residual to the
-original codes in multiples of four. This preserves full-range highlights,
-but deep shadows can show bands. At `S=11.4`, one encoded code is about
-0.00017 reference units and can be close to one noise standard deviation.
-Denoised scene preparation uses this unsigned quantized raster and loses
-negative camera samples. `-no-denoise` skips this pass and keeps the previous
-X3I DNG bytes. Keep the override unset for normal use.
-
-The research strength was 0.3. The dark dp0 patch was 64x64 pixels at
-(5120,2240). Its B/M code noise increased from 1.095/1.241 to 1.771/1.861.
-The sd Quattro H patch at (4928,3904) increased it from
-1.662/1.524 to 3.041/3.172. T was unchanged with default luma denoise off.
-These are detrended population standard deviations at S=11.3862 and S=2.7893.
-All residual changes were multiples of four. Adobe DNG SDK 1.7.1 renders
-show stronger chroma variation in the denoised patches. These measurements
-use the phase 1 merge and do not establish a useful default strength.
+Each frame is prepared with denoise off. After the merge, the selected NLM or
+BM3D runs once on the merged scene, with the normal denoise options. It is on
+by default; `-no-denoise` turns it off. DNG, TIFF, PPM and scene preparation
+all use the filtered scene. The filter works at the native code scale of
+frame 0, so the chroma noise of the reference frame gets the same strength as
+in a single-frame conversion. Pixels with a code at 0 or above 16382, such
+as extended highlights, keep their merged values. No sample goes above `S`.
+The strength is intensity/10 times `X3F_X3I_DENOISE_SCALE` (default 1; `0`
+turns the filter off).
 
 ## Phase 2 statistics
 
@@ -387,7 +369,7 @@ does not correct it.
 | `X3F_X3I_C_MAX=value` | Set the effective-variance upper clamp. Default: `4`; must be finite and at least C_MIN. Caps of one or more have no effect on the two measured samples. |
 | `X3F_X3I_C_MIN=value` | Set the effective-variance calibration floor. Default: `0.5`; range: above zero through one. |
 | `X3F_X3I_RATIO_TREND=value` | Set the maximum relative trend across clean supported ratio bins. Default: `0.02` (2 percent). A larger trend rejects the exposure field. It keeps the nominal ratio only for a frame with a weak or disabled alignment; with a trusted alignment it gives a warning. |
-| `X3F_X3I_DENOISE_SCALE=value` | Enable experimental post-merge denoise when positive. Unset or zero disables it. |
+| `X3F_X3I_DENOISE_SCALE=value` | Multiply the post-merge denoise strength. Default: `1`; `0` turns the filter off. |
 
 See the [merge stage](./pipeline.md#x3i-merge-stage) for weighting, validity,
 fallbacks and the DNG scale. See the [corpus checks](./contributing.md#x3i-corpus-checks)

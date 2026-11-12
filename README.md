@@ -121,11 +121,10 @@ A few `X3F_*` environment variables tune specific stages, e.g. `X3F_CINEON_SCALE
 
 X3I merges support DNG, TIFF and PPM. DNG preserves extended highlight range.
 TIFF and PPM clip output above one and skip the RGB chroma LUT and single-frame
-highlight recovery. X3I post-merge denoise stays off unless
-`X3F_X3I_DENOISE_SCALE` is positive, even with the default CLI denoise intensity.
-Residual quantization can cause deep-shadow bands.
-See [X3I merge and outputs](docs/src/x3i.md) and the
-[denoise measurements](docs/src/x3i.md#experimental-denoise).
+highlight recovery. X3I merges denoise the merged scene with the normal denoise
+options; `-no-denoise` turns it off.
+See [X3I merge and outputs](docs/src/x3i.md) and
+[X3I denoise](docs/src/x3i.md#denoise).
 A merge of the tested Quattro captures needs 2 to 3 GB of memory; see
 [X3I memory](docs/src/x3i.md#memory).
 
@@ -143,7 +142,7 @@ A merge of the tested Quattro captures needs 2 to 3 GB of memory; see
 | `X3F_X3I_C_MAX=value` | Set the finite effective-variance upper clamp. Default: `4`; at least C_MIN. |
 | `X3F_X3I_C_MIN=value` | Set the effective-variance calibration floor. Default: `0.5`; range: above zero through one. |
 | `X3F_X3I_RATIO_TREND=value` | Set the maximum relative trend across clean supported ratio bins. Default: `0.02` (2 percent). Larger trends keep the nominal ratio. |
-| `X3F_X3I_DENOISE_SCALE=value` | Positive enables experimental post-merge NLM or BM3D; unset or zero disables it. |
+| `X3F_X3I_DENOISE_SCALE=value` | Multiply the post-merge denoise strength. Default: `1`; `0` turns it off. |
 
 ### Examples
 

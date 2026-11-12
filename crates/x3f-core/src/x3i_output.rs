@@ -55,7 +55,7 @@ pub(crate) fn merge_frames(
 
 fn denoise_scale(value: Option<&str>, intensity: u8) -> Result<f32, Error> {
     let scale: f32 = value
-        .unwrap_or("0")
+        .unwrap_or("1")
         .parse()
         .map_err(|_| Error::InvalidData("invalid X3F_X3I_DENOISE_SCALE".into()))?;
     if !scale.is_finite() || scale < 0.0 {
@@ -66,65 +66,83 @@ fn denoise_scale(value: Option<&str>, intensity: u8) -> Result<f32, Error> {
     Ok((f64::from(scale) * f64::from(intensity.min(10)) / 10.0) as f32)
 }
 
-pub(crate) fn read_denoise_scale(
-    intensity: u8,
-    options: sys::DenoiseOptions,
-) -> Result<f32, Error> {
-    if intensity == 0 || (!options.luminance && !options.chroma) {
+/// Return the post-merge denoise strength: `intensity / 10` times
+/// `X3F_X3I_DENOISE_SCALE` (unset is 1). Return 0 when the intensity is 0 or
+/// luminance and chroma are both off. Call it before the merge, so that an
+/// invalid value fails early.
+pub(crate) fn read_denoise_scale(options: &ProcessOptions) -> Result<f32, Error> {
+    if options.denoise_intensity == 0
+        || (!options.denoise_options.luminance && !options.denoise_options.chroma)
+    {
         return Ok(0.0);
     }
     denoise_scale(
         std::env::var("X3F_X3I_DENOISE_SCALE").ok().as_deref(),
-        intensity,
+        options.denoise_intensity,
     )
 }
 
+/// Denoise the merged samples at the native code scale of the reference frame,
+/// with the strength from `read_denoise_scale`.
+/// The filter uses only the samples in `active` (`[top, left, bottom, right]`,
+/// bottom and right exclusive, checked by `bounds`). Samples outside it do not
+/// change, and the filter does not see them.
+/// Return `false` and change nothing when `scale` is 0. An error changes nothing.
+/// After the filter, no sample in `active` is above `scene.s`.
 pub(crate) fn denoise(
-    image: &mut Image,
+    scene: &mut MergedScene,
     options: &ProcessOptions,
     scale: f32,
+    [top, left, bottom, right]: [u32; 4],
     control: Control<'_>,
 ) -> Result<bool, Error> {
-    if options.denoise_intensity == 0
-        || (!options.denoise_options.luminance && !options.denoise_options.chroma)
-    {
-        return Ok(false);
-    }
-    let scale = (f64::from(scale) / image.dng_highlight_scale) as f32;
     if scale == 0.0 {
         return Ok(false);
     }
     let control = control
         .with_denoise_backend(options.denoise_backend)
         .with_denoise_options(options.denoise_options)?;
-    sys::denoise_u16(
-        &mut image.data,
-        image.columns,
-        image.rows,
-        image.channels,
-        image.row_stride,
+    let stride = scene.width as usize * 3;
+    let columns = left as usize * 3..right as usize * 3;
+    let rows = top as usize..bottom as usize;
+    let whole = rows.len() == scene.height as usize && columns.len() == stride;
+    let mut area = if whole {
+        std::mem::take(&mut scene.bmt)
+    } else {
+        rows.clone()
+            .flat_map(|row| &scene.bmt[row * stride..][columns.clone()])
+            .copied()
+            .collect()
+    };
+    let result = sys::denoise_merged(
+        &mut area,
+        right - left,
+        bottom - top,
+        scene.native_span,
+        scene.native_bias,
         scale,
         control,
-    )?;
-    Ok(true)
-}
-
-pub(crate) fn restore_denoised(
-    scene: &mut MergedScene,
-    image: &Image,
-    control: Control<'_>,
-) -> Result<(), Error> {
-    for (row, codes) in scene
-        .bmt
-        .chunks_exact_mut(scene.width as usize * 3)
-        .zip(image.data.chunks_exact(image.row_stride as usize))
-    {
-        control.check()?;
-        for (value, code) in row.iter_mut().zip(codes) {
-            *value = (f64::from(*code) * scene.s / 65535.0) as f32;
+    );
+    if whole {
+        scene.bmt = area;
+        result?;
+        let limit = scene.s as f32;
+        for value in &mut scene.bmt {
+            *value = value.min(limit);
+        }
+    } else {
+        result?;
+        let limit = scene.s as f32;
+        for (row, filtered) in rows.zip(area.chunks_exact(columns.len())) {
+            for (value, filtered) in scene.bmt[row * stride..][columns.clone()]
+                .iter_mut()
+                .zip(filtered)
+            {
+                *value = filtered.min(limit);
+            }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn bounds(height: u32, width: u32, active: Option<[u32; 4]>) -> [u32; 4] {
@@ -364,12 +382,14 @@ mod tests {
         let input = std::env::temp_dir().join(format!("x3i-render-{}.x3f", std::process::id()));
         std::fs::write(&input, &bytes).unwrap();
         let reader = Reader::open(&input).unwrap();
-        let scene = MergedScene {
+        let mut scene = MergedScene {
             bmt: vec![0.25, 0.25, 1.0, -1.0, 2.0, 3.0],
             width: 2,
             height: 1,
             s: 3.0,
             camera_to_rgb: [2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.5],
+            native_span: [16383.0; 3],
+            native_bias: [0.0; 3],
             report: Default::default(),
             ghost_maps: Vec::new(),
         };
@@ -381,7 +401,7 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        let mut image = rendering.render(&scene, &reader, false, control).unwrap();
+        let image = rendering.render(&scene, &reader, false, control).unwrap();
         let encode =
             |value: f64| ((1.055 * value.powf(1.0 / 2.4) - 0.055) * 65535.0).round() as u16;
         assert_eq!(
@@ -396,9 +416,10 @@ mod tests {
             },
             ..Default::default()
         };
-        let unchanged = image.data.clone();
-        assert!(!denoise(&mut image, &disabled, 0.3, control).unwrap());
-        assert_eq!(image.data, unchanged);
+        let unchanged = scene.bmt.clone();
+        let scale = read_denoise_scale(&disabled).unwrap();
+        assert!(!denoise(&mut scene, &disabled, scale, [0, 0, 1, 2], control).unwrap());
+        assert_eq!(scene.bmt, unchanged);
         let options = ProcessOptions {
             color_encoding: ColorEncoding::None,
             ..Default::default()
@@ -421,49 +442,103 @@ mod tests {
     }
 
     #[test]
-    fn enabled_denoise_restores_reference_codes_and_preserves_black_margins() {
-        let mut scene = MergedScene {
-            bmt: vec![0.0; 8 * 8 * 3],
-            width: 8,
-            height: 8,
-            s: 3.0,
+    fn denoise_reduces_merged_chroma_noise_and_keeps_samples_below_s() {
+        let (width, height) = (64u32, 64u32);
+        let mut seed = 1u32;
+        let mut noise = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        let bmt = (0..width * height)
+            .flat_map(|_| [0.3 + 0.02 * noise(), 0.3 + 0.02 * noise(), 0.3])
+            .collect::<Vec<_>>();
+        // A scale at the raster maximum lets the filter push samples above it.
+        let s = bmt.iter().fold(0.0f32, |m, v| m.max(*v));
+        let scene = MergedScene {
+            bmt,
+            width,
+            height,
+            s: f64::from(s),
             camera_to_rgb: [0.0; 9],
+            native_span: [16368.0 - 15.0, 15754.0 - 15.0, 7567.0 - 15.0],
+            native_bias: [15.0; 3],
             report: Default::default(),
             ghost_maps: Vec::new(),
         };
-        for row in 1..7 {
-            for col in 0..8 {
-                let offset = (row * 8 + col) * 3;
-                scene.bmt[offset..offset + 3].copy_from_slice(&[
-                    0.3 + (col % 3) as f32 * 0.001,
-                    0.3 - (col % 2) as f32 * 0.001,
-                    0.3,
-                ]);
-            }
-        }
-        let mut image = x3i_merge::to_image(&scene).unwrap();
+        let deviation = |bmt: &[f32]| {
+            let b = bmt.iter().step_by(3).map(|v| f64::from(*v));
+            let n = (bmt.len() / 3) as f64;
+            let mean = b.clone().sum::<f64>() / n;
+            (b.map(|v| (v - mean).powi(2)).sum::<f64>() / n).sqrt()
+        };
         let options = ProcessOptions {
             denoise_backend: sys::DenoiseBackend::Cpu,
             ..Default::default()
         };
-        assert!(denoise(
-            &mut image,
-            &options,
-            denoise_scale(Some("0.3"), 10).unwrap(),
-            Control::none()
-        )
-        .unwrap());
-        restore_denoised(&mut scene, &image, Control::none()).unwrap();
-        for (value, code) in scene.bmt.iter().zip(&image.data) {
-            assert!((f64::from(*value) * 65535.0 / scene.s - f64::from(*code)).abs() <= 1.0);
+        let mut filtered = scene.clone();
+        let scale = denoise_scale(None, options.denoise_intensity).unwrap();
+        let whole = [0, 0, height, width];
+        assert!(denoise(&mut filtered, &options, scale, whole, Control::none()).unwrap());
+        assert!(deviation(&filtered.bmt) < 0.5 * deviation(&scene.bmt));
+        assert!(filtered.bmt.iter().all(|v| f64::from(*v) <= filtered.s));
+        assert_eq!(filtered.s, scene.s);
+        // Zero samples outside the active area stay zero and do not feed the filter.
+        let (top, left, bottom, right) = (8usize, 4usize, 56usize, 60usize);
+        let inside = |i: usize| {
+            let (row, col) = (i / 3 / width as usize, i / 3 % width as usize);
+            (top..bottom).contains(&row) && (left..right).contains(&col)
+        };
+        let mut masked = scene.clone();
+        for (i, value) in masked.bmt.iter_mut().enumerate() {
+            if !inside(i) {
+                *value = 0.0;
+            }
         }
-        assert!(scene.bmt[..8 * 3].iter().all(|v| *v == 0.0));
-        assert!(scene.bmt[7 * 8 * 3..].iter().all(|v| *v == 0.0));
+        let area = |bmt: &[f32]| -> Vec<f32> {
+            (0..bmt.len())
+                .filter(|i| inside(*i))
+                .map(|i| bmt[i])
+                .collect()
+        };
+        let mut filtered = masked.clone();
+        let active = [top as u32, left as u32, bottom as u32, right as u32];
+        assert!(denoise(&mut filtered, &options, scale, active, Control::none()).unwrap());
+        assert!(filtered
+            .bmt
+            .iter()
+            .enumerate()
+            .all(|(i, v)| inside(i) || v.to_bits() == 0));
+        assert!(deviation(&area(&filtered.bmt)) < 0.5 * deviation(&area(&masked.bmt)));
+        for options in [
+            ProcessOptions {
+                denoise_intensity: 0,
+                ..options.clone()
+            },
+            ProcessOptions {
+                denoise_options: sys::DenoiseOptions {
+                    luminance: false,
+                    chroma: false,
+                    ..options.denoise_options
+                },
+                ..options.clone()
+            },
+        ] {
+            let mut unchanged = scene.clone();
+            let scale = read_denoise_scale(&options).unwrap();
+            assert_eq!(scale, 0.0);
+            assert!(!denoise(&mut unchanged, &options, scale, whole, Control::none()).unwrap());
+            assert!(unchanged
+                .bmt
+                .iter()
+                .zip(&scene.bmt)
+                .all(|(a, b)| a.to_bits() == b.to_bits()));
+        }
     }
 
     #[test]
     fn reduced_denoise_strength_tracks_intensity() {
-        assert_eq!(denoise_scale(None, 10).unwrap(), 0.0);
+        assert_eq!(denoise_scale(None, 10).unwrap(), 1.0);
+        assert_eq!(denoise_scale(None, 5).unwrap(), 0.5);
         assert_eq!(denoise_scale(Some("0.3"), 5).unwrap(), 0.3 * 0.5);
         assert_eq!(denoise_scale(Some("0"), 10).unwrap(), 0.0);
         for invalid in ["-1", "NaN", "inf", "bad"] {

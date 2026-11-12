@@ -14,7 +14,7 @@ pub struct SceneLinearOptions {
     /// Lens shading; None uses the existing camera-specific default.
     pub apply_sgain: Option<bool>,
     /// Sensor denoising intensity, 0 through 10 (default 10).
-    /// X3I merge denoise also requires a positive `X3F_X3I_DENOISE_SCALE`.
+    /// X3I merges use it on the merged scene; `X3F_X3I_DENOISE_SCALE` multiplies it.
     pub denoise_intensity: u8,
     /// Select GPU acceleration or portable CPU execution (default: Auto).
     pub denoise_backend: crate::DenoiseBackend,
@@ -178,8 +178,17 @@ pub fn prepare_scene_linear(
         }
         _ => None,
     };
+    let process = crate::ProcessOptions {
+        fix_bad: options.fix_bad,
+        apply_sgain: options.apply_sgain,
+        denoise_intensity: options.denoise_intensity,
+        denoise_backend: options.denoise_backend,
+        denoise_options: options.denoise_options,
+        ..Default::default()
+    };
+    // Read the merge denoise strength before the merge, so that an invalid value fails early.
     let denoise_scale = if container.is_some() && middle.is_none() {
-        crate::x3i_output::read_denoise_scale(options.denoise_intensity, options.denoise_options)?
+        crate::x3i_output::read_denoise_scale(&process)?
     } else {
         0.0
     };
@@ -233,14 +242,6 @@ pub fn prepare_scene_linear(
     if let Some(container) = container {
         // Each frame must carry its own input window through preparation.
         let merge_control = Control::new(cancel);
-        let process = crate::ProcessOptions {
-            fix_bad: options.fix_bad,
-            apply_sgain: options.apply_sgain,
-            denoise_intensity: options.denoise_intensity,
-            denoise_backend: options.denoise_backend,
-            denoise_options: options.denoise_options,
-            ..Default::default()
-        };
         let mut merged = crate::x3i_output::merge_frames(
             &container,
             &reader,
@@ -249,18 +250,14 @@ pub fn prepare_scene_linear(
             &mut on_stage,
             &mut Vec::new(),
         )?;
-        if denoise_scale > 0.0 {
-            let mut image = crate::x3i_merge::to_image(&merged)?;
-            if crate::x3i_output::denoise(&mut image, &process, denoise_scale, merge_control)? {
-                crate::x3i_output::restore_denoised(&mut merged, &image, merge_control)?;
-            }
-        }
-        validate_matrix(&merged.camera_to_rgb)?;
-        let [top, left, bottom, right] = crate::x3i_output::bounds(
+        let active = crate::x3i_output::bounds(
             merged.height,
             merged.width,
             reader.dng_active_area_for_size(merged.height, merged.width),
         );
+        crate::x3i_output::denoise(&mut merged, &process, denoise_scale, active, merge_control)?;
+        validate_matrix(&merged.camera_to_rgb)?;
+        let [top, left, bottom, right] = active;
         let mut data = Vec::with_capacity((bottom - top) as usize * (right - left) as usize * 3);
         for row in top..bottom {
             merge_control.check()?;

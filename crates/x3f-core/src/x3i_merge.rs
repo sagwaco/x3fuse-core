@@ -773,6 +773,11 @@ pub struct MergedScene {
     pub s: f64,
     /// Reference-frame camera-to-RGB matrix, row-major.
     pub camera_to_rgb: [f64; 9],
+    /// Native code span per channel of the reference frame: `raw_white - raw_black`.
+    /// The native code of a sample is `value * native_span[c] + native_bias[c]`.
+    pub native_span: [f32; 3],
+    /// Native code bias per channel of the reference frame: `raw_black`.
+    pub native_bias: [f32; 3],
     /// Exposure and range statistics for this raster.
     pub report: MergeReport,
     /// Research ghost maps. Empty unless requested in MergeOptions.
@@ -2982,6 +2987,9 @@ fn merge_in_bands(
     let mut hashes = vec![raw_row_hash(&reference)];
     let (width, height) = (reference.width, reference.height);
     let camera_to_rgb = reference.camera_to_rgb;
+    let native_span =
+        std::array::from_fn(|c| (reference.raw_white[c] - reference.raw_black[c]) as f32);
+    let native_bias = reference.raw_black.map(|v| v as f32);
     let reference_us = reference.shutter_us;
     let pixels = reference.raw_top.len();
     let (w, h) = (width as usize, height as usize);
@@ -3764,6 +3772,8 @@ fn merge_in_bands(
         height,
         s: report.s,
         camera_to_rgb,
+        native_span,
+        native_bias,
         report,
         ghost_maps,
     })

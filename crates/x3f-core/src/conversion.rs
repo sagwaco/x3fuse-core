@@ -234,8 +234,7 @@ fn convert_x3i(
 ) -> Result<ConversionReport, Error> {
     use crate::{output::dng, x3i_output, X3iContainer};
 
-    let denoise_scale =
-        x3i_output::read_denoise_scale(options.denoise_intensity, options.denoise_options)?;
+    let denoise_scale = x3i_output::read_denoise_scale(options)?;
     let container = X3iContainer::open(input)?;
     let frame0 = container.open_frame(0)?;
     let mut report = ConversionReport::default();
@@ -310,20 +309,16 @@ fn convert_x3i(
     report.ghost_maps = std::mem::take(&mut scene.ghost_maps);
     report.warnings.extend(scene.report.statistics());
     report.warnings.extend(scene.report.warnings());
-    let mut image = crate::x3i_merge::to_image(&scene)?;
-    let denoised = x3i_output::denoise(&mut image, options, denoise_scale, control)?;
-    if options.denoise_intensity > 0
-        && (options.denoise_options.luminance || options.denoise_options.chroma)
-        && !denoised
-    {
-        report.warnings.push("X3I denoise is off; set X3F_X3I_DENOISE_SCALE=0.3 to enable the experimental post-merge filter".into());
-    }
-    if let Some(rendering) = rendering {
-        if denoised {
-            x3i_output::restore_denoised(&mut scene, &image, control)?;
-        }
-        image = rendering.render(&scene, &frame0, options.crop, control)?;
-    }
+    let active = x3i_output::bounds(
+        scene.height,
+        scene.width,
+        frame0.dng_active_area_for_size(scene.height, scene.width),
+    );
+    x3i_output::denoise(&mut scene, options, denoise_scale, active, control)?;
+    let image = match rendering {
+        Some(rendering) => rendering.render(&scene, &frame0, options.crop, control)?,
+        None => crate::x3i_merge::to_image(&scene)?,
+    };
     drop(scene);
     on_stage(ConversionStage::Write);
     control.check()?;

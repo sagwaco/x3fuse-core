@@ -543,8 +543,8 @@ Its `BaselineExposure` is frame 0's baseline plus `log2(S)`. Metadata and
 preview use frame 0, and preview spatial gain is disabled because the merge
 already applied it. An explicit safety cap reports samples clipped at the cap.
 
-[Post-merge denoise](./x3i.md#experimental-denoise) is experimental and disabled
-by default. TIFF and PPM use frame 0's color transform, output transfer and
+[Post-merge denoise](./x3i.md#denoise) filters the merged scene by default;
+`-no-denoise` turns it off. TIFF and PPM use frame 0's color transform, output transfer and
 optional active-area crop. They clip extended highlights at one. They do not
 run the RGB chroma LUT or single-frame highlight recovery. Scene preparation
 keeps extended-linear RGB for an editor. See [X3I merge and outputs](./x3i.md)

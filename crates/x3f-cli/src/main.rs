@@ -1181,7 +1181,6 @@ mod tests {
                 "X3I merge: frames=7 s=1",
                 "X3I fallback samples: shortest exposure 1",
                 "X3I saturation warning: frame=6 plane=B falls back to 1.0",
-                "X3I denoise is off; set X3F_X3I_DENOISE_SCALE=0.3 to enable the experimental post-merge filter",
                 "-dng-highlight-mapping has no effect on X3I merges",
             ] {
                 assert!(show_x3i_warning(&args, line));

@@ -510,9 +510,8 @@ shadow and highlight crops. Check Lightroom, RawTherapee, Apple and Capture One
 separately. A valid file structure does not prove those readers restore the
 large encoding scale correctly. Record each reader and version actually tested.
 
-See the [experimental denoise measurements](./x3i.md#experimental-denoise).
-Before proposing a default, repeat the fixed dark-patch comparison. Record
-noise in reference units, distinct-code spacing and rendered crops. Do not
-change the default from an assumed noise gain.
+See [X3I denoise](./x3i.md#denoise). Before a change of its default strength,
+repeat the fixed dark-patch comparison. Record noise in reference units and
+rendered crops. Do not change the default from an assumed noise gain.
 The [X3I evidence archive](https://github.com/sagwaco/x3f-docs/tree/main/spp-rgb-trace/followup-x3i-sfd)
 contains container corrections and merge observations.
