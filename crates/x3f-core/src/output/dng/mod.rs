@@ -915,8 +915,8 @@ mod tests {
         equalize_levels(&mut img);
         assert_eq!(img.levels.black, [0.0; 3]);
         assert_eq!(img.levels.white, [65535; 3]);
-        for c in 0..3 {
-            let v = img.data[c] as f64 / 65535.0;
+        for (c, &sample) in img.data[..3].iter().enumerate() {
+            let v = sample as f64 / 65535.0;
             assert!(
                 (v - 0.5).abs() < 1e-3,
                 "channel {c} normalized to {v}, want 0.5"

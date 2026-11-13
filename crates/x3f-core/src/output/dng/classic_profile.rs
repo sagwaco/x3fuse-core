@@ -444,8 +444,8 @@ mod tests {
         }
         let curve = ToneCurve::fit(|x| (2.0 * x).min(1.0)).unwrap();
         assert_eq!(curve.knots.len(), 8194);
-        for i in 0..=4096 {
-            assert_eq!(curve.table[i], ((2.0 * i as f64 / 4096.0).min(1.0)) as f32);
+        for (i, &value) in curve.table[..=4096].iter().enumerate() {
+            assert_eq!(value, ((2.0 * i as f64 / 4096.0).min(1.0)) as f32);
         }
         assert!(ToneCurve::from_knots(vec![0.0, 0.0, 0.0, 1.0]).is_err());
         assert!(ToneCurve::from_knots(vec![0.0, 0.5, 1.0, 0.0]).is_err());
@@ -467,14 +467,14 @@ mod tests {
             .collect();
         assert!(ToneCurve::from_knots(raw).is_err());
         let curve = ToneCurve::fit(sample).unwrap();
-        for i in 0..=4096 {
+        for (i, &value) in curve.table[..=4096].iter().enumerate() {
             let expected = match i {
                 1 => 0.0,
                 2048 => 2047.0 / 4096.0,
                 4095 => 1.0,
                 _ => i as f32 / 4096.0,
             };
-            assert_eq!(curve.table[i], expected);
+            assert_eq!(value, expected);
         }
         assert!((curve.inverse(0.5) - 0.5).abs() < 1.0 / 4096.0);
     }

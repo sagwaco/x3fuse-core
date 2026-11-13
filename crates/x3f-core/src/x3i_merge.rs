@@ -4836,8 +4836,8 @@ mod tests {
             let pair_chroma = scene.report.chroma_variance[0] + scene.report.chroma_variance[i];
             let pair_t = scene.report.effective_variance[0] + scene.report.effective_variance[i];
             assert!((pair_chroma / pair_t - 2.0).abs() < 0.3);
-            for c in 0..3 {
-                assert!((scene.report.median_z_squared[i][c].unwrap() - 0.455).abs() < 0.12);
+            for z in scene.report.median_z_squared[i] {
+                assert!((z.unwrap() - 0.455).abs() < 0.12);
             }
         }
     }
@@ -5398,9 +5398,8 @@ mod tests {
             if name == "_DQH0978.X3I" {
                 for i in 1..=3 {
                     let fit = &scene.report.aligned_ratios[i];
-                    for bin in 3..=5 {
-                        let clean =
-                            f64::from(fit.bins[bin].unwrap()) * scene.report.nominal_scales[i];
+                    for (bin, ratio) in fit.bins[..=5].iter().enumerate().skip(3) {
+                        let clean = f64::from(ratio.unwrap()) * scene.report.nominal_scales[i];
                         if (scene.report.scalar_scales[i] / clean - 1.0).abs() >= 0.003 {
                             failures.push(format!(
                                 "H frame {i} bin {} scale={} clean={clean}",
