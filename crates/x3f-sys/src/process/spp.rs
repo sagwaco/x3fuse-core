@@ -730,6 +730,24 @@ pub(super) unsafe fn render(
         .ok_or(crate::Error::InvalidData("unsupported SPP request gains"))?;
     let exif = unsafe { merrill_exif(x3f, control) }?;
     let noise = unsafe { noise_params(x3f, gain, &exif) }?;
+    if mode.is_none() && unsafe { header_monochrome(x3f) } {
+        return unsafe {
+            render_monochrome(
+                x3f,
+                image,
+                levels,
+                encoding,
+                crop,
+                fix_bad,
+                apply_sgain,
+                wb,
+                control,
+                gain,
+                &exif,
+                &noise,
+            )
+        };
+    }
     let matrix = unsafe { selected_color_matrix(x3f, wb, noise.iso_gain, mode) }?;
     let sensor = unsafe { typed_scalar(x3f, c"SensorISO", 3, 0.) } as f32;
     let sensor_scale = if sensor == 0. { 1. } else { sensor / 100. };
@@ -748,7 +766,7 @@ pub(super) unsafe fn render(
     unsafe {
         x3f_get_camf_unsigned(x3f, c"SkipStepFlags".as_ptr().cast_mut(), &mut skip);
     }
-    if skip & (1 << 23) != 0 || noise.fpn_suppression != 0 {
+    if !denoise_mode_supported(skip, noise.fpn_suppression) {
         return Err(crate::Error::InvalidData(
             "unsupported SPP denoise bypass or FPN mode",
         ));
@@ -847,6 +865,239 @@ pub(super) unsafe fn render(
     control.check()
 }
 
+/// Whether the header's color mode is "Monochrome" (as shot; Sepia stays
+/// unsupported: its toning gains come from SPP and are unknown).
+unsafe fn header_monochrome(x3f: *mut x3f_t) -> bool {
+    let mode = unsafe { (*x3f).header.color_mode.map(|b| b as u8) };
+    let end = mode.iter().position(|&b| b == 0).unwrap_or(mode.len());
+    &mode[..end] == b"Monochrome"
+}
+
+/// `NoiseParams+0x28` in monochrome: native `SetUpNoiseParamsF20`
+/// (0xadf9c..0xae3f0) sets 1.0 at HI resolution, then scales it by the
+/// estimated-ISO interpolation of column 2 (the neutral luminance slider,
+/// `fcvtzu(0.5, #2)`) of a per-process table: 0xbff78 for DP Merrill
+/// (process 2.1.x), 0xc00e0 for SD1 Merrill (2.0.x). ISO knots at 0xc0248.
+/// Row 9 is past each 9-row table, as natively (above ISO 12800).
+fn mono_noise_scaling(sd1: bool, iso: f32) -> crate::Result<f32> {
+    const KNOTS: [u32; 10] = [
+        0,
+        0x42c8_0000,
+        0x4348_0000,
+        0x43c8_0000,
+        0x4448_0000,
+        0x44c8_0000,
+        0x4548_0000,
+        0x45c8_0000,
+        0x4648_0000,
+        0x476e_694d,
+    ];
+    const DP: [u64; 10] = [
+        0x3fd3_3333_3333_3333,
+        0x3fd3_3333_3333_3333,
+        0x3fd3_3333_3333_3333,
+        0x3fd3_3333_3333_3333,
+        0x3fd3_3333_3333_3333,
+        0x3fdc_cccc_cccc_cccd,
+        0x3fe4_cccc_cccc_cccd,
+        0x3ff0_0000_0000_0000,
+        0x3ff8_0000_0000_0000,
+        0x3fe4_cccc_cccc_cccd,
+    ];
+    const SD1: [u64; 10] = [
+        0x3fe4_cccc_cccc_cccd,
+        0x3fe4_cccc_cccc_cccd,
+        0x3fe4_cccc_cccc_cccd,
+        0x3fe4_cccc_cccc_cccd,
+        0x3fe4_cccc_cccc_cccd,
+        0x3fe4_cccc_cccc_cccd,
+        0x3fe4_cccc_cccc_cccd,
+        0x3fe4_cccc_cccc_cccd,
+        0x3ff0_0000_0000_0000,
+        0x44c8_0000_4448_0000,
+    ];
+    if !(iso > 0.0) {
+        // Native indexes row -1 here.
+        return Err(crate::Error::InvalidData("invalid SPP monochrome ISO"));
+    }
+    let bucket = (1..9)
+        .find(|&b| iso <= f32::from_bits(KNOTS[b]))
+        .unwrap_or(9);
+    let k = |i: usize| f32::from_bits(KNOTS[i]);
+    let t = |i: usize| f64::from_bits(if sd1 { SD1[i] } else { DP[i] });
+    let below = f64::from(iso - k(bucket - 1));
+    let above = f64::from(k(bucket) - iso);
+    let value =
+        t(bucket).mul_add(below, t(bucket - 1) * above) as f32 / (k(bucket) - k(bucket - 1));
+    Ok(1.0 * value)
+}
+
+/// `NoiseParams+0x1a8..0x1b8` from native `GatherParams` (0xb2cb0): the
+/// white balance gains over their minimum, times the F-number, temperature
+/// and sensor factors (in that order, f64).
+fn mono_white_balance(parts: &super::MerrillGainParts) -> [f64; 3] {
+    let wb = parts.white_balance;
+    let gb = if wb[2] <= wb[1] { wb[2] } else { wb[1] };
+    let min = if gb <= wb[0] { gb } else { wb[0] };
+    std::array::from_fn(|c| {
+        ((parts.fnumber[c] * parts.temperature[c]) * parts.sensor[c]) * (wb[c] / min)
+    })
+}
+
+/// Monochrome SPP render: native Stage2 `MonochromeDenoise`, Stage2B
+/// `ApplySharpLBnW` and the Stage4 monochrome output with the BnW tone curve.
+#[allow(clippy::too_many_arguments)]
+unsafe fn render_monochrome(
+    x3f: *mut x3f_t,
+    image: *mut x3f_area16_t,
+    levels: *mut x3f_image_levels_t,
+    encoding: x3f_color_encoding_t,
+    crop: bool,
+    fix_bad: bool,
+    apply_sgain: bool,
+    wb: *mut libc::c_char,
+    control: Control<'_>,
+    gain: [f64; 3],
+    exif: &crate::jpeg_exif::JpegExif,
+    noise: &NoiseParams,
+) -> crate::Result<()> {
+    use crate::spp_denoise::mono::{self, sharpen_bnw};
+    let mut skip = 0;
+    unsafe {
+        x3f_get_camf_unsigned(x3f, c"SkipStepFlags".as_ptr().cast_mut(), &mut skip);
+    }
+    if skip & (1 << 23) != 0 {
+        return Err(crate::Error::InvalidData(
+            "unsupported SPP denoise bypass or FPN mode",
+        ));
+    }
+    let parts = unsafe { super::merrill_gain_parts(x3f, wb, control) }
+        .ok_or(crate::Error::InvalidData("unsupported SPP request gains"))?;
+    let mono_noise = mono::MonoNoise {
+        iso: noise.iso,
+        noise_scaling: mono_noise_scaling(parts.divide, noise.iso)?,
+        iso_gain: noise.iso_gain,
+        column_noise_scale: noise.column_noise_scale,
+        // The neutral banding slider: filter size 27, threshold index 2.
+        bcs_filter_size: 27,
+        bcs_scale_index: 2,
+        // m_ColorMixing: the B/N mixer SPP passes by default, R 33 %, G 33 %,
+        // B 34 % (measured: 82 dB against SPP 6.9 on _SDI0130; zero weights,
+        // which the engine turns into 1,1,1, give 26 dB).
+        color_mixing: [0.33, 0.33, 0.34],
+        white_balance: mono_white_balance(&parts),
+    };
+    let luts = unsafe { super::make_merrill_mono_render_luts(x3f, encoding, exif, control) }?;
+    let mut area = x3f_area16_t::default();
+    if unsafe { x3f_image_area(x3f, &mut area) } == 0 {
+        return Err(crate::Error::InvalidData("missing SPP image"));
+    }
+    let size = [area.columns as usize, area.rows as usize];
+    let (active, keep, _) = unsafe { merrill_rects(x3f) }?;
+    let active = active_in_keep(active, keep, size)?;
+    let mut observe = |_: &'static str, _: &[f32], _: String| {};
+    let prepared = unsafe {
+        merrill_prepare_float(
+            x3f,
+            wb,
+            apply_sgain,
+            fix_bad,
+            Some(noise.despeckle),
+            control,
+            &mut observe,
+        )
+    }?;
+    let stride = prepared.row_stride;
+    // Stage2 output image: only its outer 9 columns and rows keep this
+    // content, and the active area lies further inside.
+    let mut work = prepared.data.clone();
+    let mut sharp: Vec<i16> = zeroed(size[0] * size[1])?;
+    mono::monochrome_denoise(
+        &mut work,
+        stride,
+        &prepared.data,
+        stride,
+        &mut sharp,
+        size[0],
+        size,
+        &mono_noise,
+        mono::MonoDenoiseArgs {
+            gains: gain,
+            noise_divisors: [1.0, 1.0],
+            adjust_noise: false,
+        },
+        control,
+    )?;
+    drop(prepared);
+    // Stage2B: ComputeSharpenAmount with the fixed monochrome base 1.25.
+    sharpen_bnw::apply_sharp_l_bnw(&mut work, stride, &sharp, size[0], size, 1.25)?;
+    sharpen_bnw::copy_channel0_to_channel2(&mut work, stride, size)?;
+    drop(sharp);
+    control.check()?;
+    let rect = if crop {
+        active
+    } else {
+        [0, 0, size[0], size[1]]
+    };
+    let width = rect[2] - rect[0];
+    let height = rect[3] - rect[1];
+    let out_stride = width.checked_mul(3).ok_or(crate::Error::Allocation)?;
+    let samples = out_stride
+        .checked_mul(height)
+        .ok_or(crate::Error::Allocation)?;
+    let bytes = samples
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or(crate::Error::Allocation)?;
+    let buffer = unsafe { libc::malloc(bytes) };
+    if buffer.is_null() {
+        return Err(crate::Error::Allocation);
+    }
+    // The controlled caller owns this allocation and frees it on any error.
+    unsafe {
+        *image = x3f_area16_t {
+            data: buffer.cast(),
+            buf: buffer,
+            rows: height as u32,
+            columns: width as u32,
+            channels: 3,
+            row_stride: out_stride as u32,
+        };
+    }
+    let output = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u16>(), samples) };
+    for y in 0..height {
+        control.check()?;
+        let from = (rect[1] + y) * stride + rect[0] * 3;
+        for (out, input) in output[y * out_stride..][..out_stride]
+            .chunks_exact_mut(3)
+            .zip(work[from..][..out_stride].chunks_exact(3))
+        {
+            out.copy_from_slice(&luts.render(input.try_into().unwrap()));
+        }
+    }
+    if !levels.is_null() {
+        unsafe {
+            *levels = x3f_image_levels_t {
+                black: [0.; 3],
+                white: [65535; 3],
+            };
+        }
+    }
+    control.check()
+}
+
+/// Whether the ported denoise covers this SkipStepFlags / FPNSuppression pair.
+///
+/// SkipStepFlags bit 23 bypasses the denoise, which is unported. The native
+/// engine reads NoiseParams.FPNSuppression (+0x180) in two places,
+/// TiledDenoise @0x7fd28 and ProcessTiles @0x7cc24, and both branch only on
+/// `(fpn | 4) == 7`, i.e. values 3 and 7. Every other value, such as the 1
+/// written by DP Merrill cameras with FPN Suppression on, takes the ordinary
+/// path this port implements. (Preprocess also reads it, @0xa5a64, only for
+/// MED/LOW resolution dark shields, which SPP rendering rejects anyway.)
+fn denoise_mode_supported(skip_step_flags: u32, fpn_suppression: u32) -> bool {
+    skip_step_flags & (1 << 23) == 0 && (fpn_suppression | 4) != 7
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -922,6 +1173,18 @@ mod tests {
         if checked == 0 {
             eprintln!("SPP noise setup: skipped, reference corpus is absent");
         }
+    }
+
+    #[test]
+    fn denoise_mode_follows_native_fpn_gate() {
+        for fpn in [0, 1, 2, 4, 5, 6] {
+            assert!(denoise_mode_supported(0, fpn), "FPNSuppression {fpn}");
+        }
+        for fpn in [3, 7] {
+            assert!(!denoise_mode_supported(0, fpn), "FPNSuppression {fpn}");
+        }
+        assert!(!denoise_mode_supported(1 << 23, 0));
+        assert!(denoise_mode_supported(!(1 << 23), 1));
     }
 
     #[test]

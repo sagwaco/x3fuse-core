@@ -43,8 +43,10 @@ Rust callers set `ProcessOptions::spp_denoise = true`. The default is false.
 The option supports full-resolution HI color output from the supported SD1
 Merrill and DP Merrill models at X3F versions 2.3 and 3.0. TIFF, PPM and native
 histograms accept sRGB, Adobe RGB or ProPhoto RGB. It uses CPU execution for
-`Auto` and `Cpu`. DNG, Cineon, monochrome/sepia, MED/LOW, other cameras, forced
-`Gpu`, and denoise intensity other than 10 return an error. Unsupported
+`Auto` and `Cpu`. As-shot Monochrome files take the native monochrome branch
+described below. DNG, Cineon, Sepia, a Color Mode override of a Monochrome file,
+MED/LOW, other cameras, forced `Gpu`, and denoise intensity other than 10 return
+an error. Unsupported
 calibration also returns an error.
 `DenoiseOptions` must keep its default values. BM3D and custom NLM controls
 return an error because this path uses Sigma's separate filter pipeline.
@@ -93,7 +95,8 @@ Research environment overrides are cleared.
 
 The 53-file Merrill smoke check produces 50 color exports with the expected
 dimensions, ICC profile and orientation. The three monochrome files return the
-documented unsupported-mode error. No export selects a fallback. Source hashes
+documented unsupported-mode error at that checkpoint; they now take the
+monochrome branch below. No export selects a fallback. Source hashes
 are unchanged. All six documented no-denoise DNG/TIFF hashes also remain
 unchanged. Error and cancellation tests check that no output is published;
 histogram validation errors preserve an existing destination.
@@ -102,6 +105,72 @@ The [production evidence](https://github.com/sagwaco/x3f-docs/tree/main/spp-rgb-
 records binary hashes, commands, output hashes, measurements and the independent
 review. The archive verifier checks the native recordings and matching Rust
 fixtures. No native library or non-redistributable input image ships in the core.
+
+## Monochrome and FPN Suppression
+
+Two further native branches are ported from the same library and verified
+against it. Native function addresses are given at image base 0 of the arm64
+slice.
+
+**FPN Suppression.** `NoiseParams.FPNSuppression` (+0x180) is read only by
+`TiledDenoise` (0x7fd28) and `ProcessTiles` (0x7cc24), and both gate it on
+`(fpn | 4) == 7`. DP Merrill files record 1, which takes the ordinary tile
+pipeline, so those files now run through `-spp-pipeline` unchanged. The values
+3 and 7 still return an error.
+
+**Monochrome.** When the header color mode is Monochrome, native Stage2 skips
+chromatic-aberration correction and calls `MonochromeDenoise` (0x2fd3c) in place
+of `TiledDenoise`. The port lives in `spp_denoise/mono` and `merrill_mono.rs`:
+
+- `DoHNMixing` → `Sigma_HN` (0x42434), RGB to one intensity plane;
+- `DoMonoBCS` → the mono `MatchColOffsets` (0x2f284) with `DirectionalFastBF`;
+- `DoFastBilateralFilter` → `ApplyHistBilateralFilter` (0x3301c);
+- `DoDespSharp` → `Despeckle3` (0x2ed50) and `SharpenBnW` (0x81768);
+- Stage2B `ApplySharpLBnW` (0x810b0) with base amount 1.25;
+- Stage4 mono output (row template 0x4e9d0) with the black-and-white tone curve
+  and YCbCr toning gains of zero.
+
+The workers run over the native `DoThreadedPix` row bands: up to eight, fewer
+while a band would hold under 80 rows, never fewer than two.
+`SetUpNoiseParamsF20` scales `NoiseParams+0x28` in monochrome by an
+estimated-ISO interpolation over separate DP and SD1 tables. The mixer weights
+(+0x188) are normalised sequentially, as native does, then scaled by white
+balance over gain.
+
+SIGMA Photo Pro passes the B/W mixer R 0.33, G 0.33, B 0.34 to the engine.
+That value is fixed in the export. Zero weights select the engine's own 1,1,1
+and render 0.34 EV brighter than the application's export.
+
+Each kernel matches native output bit for bit on synthetic fixtures:
+
+| Kernel | Cases |
+| --- | --- |
+| HN mixing | 133 |
+| Mono BCS | 48 |
+| Histogram bilateral | 630 |
+| Despeckle and sharpen | 629 |
+| Whole `MonochromeDenoise` | 6 |
+| Mono output row and tone LUT | 83 lines |
+
+The `MonochromeDenoise` cases include white balance, mixer weights, noise
+adjustment and eight-band heights. The fixtures are in
+`crates/x3f-sys/tests/fixtures/spp-mono-*-native.txt` and
+`merrill-mono-output-native.txt`.
+
+End-to-end comparisons use Sigma's original-size TIFF16 exports with default
+settings and no color fitting. All three files are DP2 Merrill. The SD1
+monochrome noise table is ported from the same function but has no image
+reference yet.
+
+| File | Mode | sRGB PSNR | ProPhoto PSNR | MAE |
+| --- | --- | --- | --- | --- |
+| Monochrome A | Monochrome, FPN 0 | 81.96 dB | 84.5 dB | 0.001/255 |
+| Monochrome B | Monochrome, FPN 0 | 83.69 dB | 85.7 dB | 0.001/255 |
+| Standard | Standard, FPN 1 | 77.97 dB | 80.0 dB | 0.001/255 |
+
+Before these changes the default renderer scored 26.19 dB, 33.09 dB and
+31.01 dB on the same three files. Sepia still returns an error, because its
+toning gains are chosen by the application and not recorded in the file.
 
 ## Default renderer alignment
 
@@ -369,7 +438,7 @@ unchanged; no new image-quality or full-pipeline parity result is claimed.
   and optional scene-derived highlight LUT. The SPP option selects the float
   path and camera-based highlight restoration.
 - Nonzero retinex, creative saturation, chromatic-aberration correction,
-  defringe, grain, monochrome/sepia and MED/LOW processing are outside this
+  defringe, grain, sepia and MED/LOW processing are outside this
   neutral color export. Unsupported camera modes return an error.
 - Native row/column correction can overlap worker ranges. The Rust solver uses
   deterministic accumulation. Some native results depend on worker order;
