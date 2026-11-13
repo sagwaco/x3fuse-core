@@ -33,12 +33,15 @@ fn main() {
         .write_to_file(&header_out);
 
     // Also publish to <profile>/include/x3f.h so downstream tooling that
-    // doesn't know about OUT_DIR can find it. profile_dir = OUT_DIR /../../..
-    // (build/x3f-ffi-c-XYZ/out → target/<profile>).
+    // doesn't know about OUT_DIR can find it. profile_dir is the parent of
+    // Cargo's `build` directory. The depth of OUT_DIR below `build` depends
+    // on the Cargo version (build/x3f-ffi-c-XYZ/out, or
+    // build/x3f-ffi-c/XYZ/out since Cargo 1.100).
     let profile_dir = out_dir
         .ancestors()
-        .nth(3)
-        .expect("OUT_DIR depth")
+        .find(|dir| dir.file_name().is_some_and(|name| name == "build"))
+        .and_then(|build| build.parent())
+        .expect("OUT_DIR is below a build directory")
         .to_path_buf();
     let pub_include = profile_dir.join("include");
     std::fs::create_dir_all(&pub_include).ok();
