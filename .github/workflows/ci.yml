@@ -41,7 +41,7 @@ jobs:
         include:
           - os: ubuntu-latest
             asset: x3f_extract-linux-x86_64
-          - os: macos-14
+          - os: macos-15
             asset: x3f_extract-macos-arm64
           - os: macos-15-intel
             asset: x3f_extract-macos-x86_64
@@ -89,11 +89,11 @@ jobs:
   # M8b: cross-compile x3f-ffi-c for iOS device + simulator and build the
   # xcframework. Validates that the cbindgen header and the bindgen iOS
   # cross-compile (clang --target + -isysroot) hang together under a
-  # non-host toolchain. Runs on macos-14 because iOS cross-builds need an
+  # non-host toolchain. Runs on macos-15 because iOS cross-builds need an
   # Apple host with Xcode.
   ios-xcframework:
-    name: iOS xcframework (macos-14)
-    runs-on: macos-14
+    name: iOS xcframework (macos-15)
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
