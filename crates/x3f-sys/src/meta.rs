@@ -354,6 +354,25 @@ pub unsafe extern "C" fn x3f_get_prop_entry(
     0
 }
 
+/// Name of a Quattro CAMF `WhiteBalance` code, spelled like the preset names in the
+/// CAMF lists `WhiteBalanceGains` / `WhiteBalanceColorCorrections` (Sunlight, Shade,
+/// Overcast, Incandescent, Fluorescent, Flash, Auto, AutoLSP, Custom), so that the
+/// gains lookup finds them. Codes without a list entry (9 Monochrome, 11 ColorTemp,
+/// unknown) fall back to Auto instead of failing the conversion.
+fn quattro_wb_name(code: u32) -> &'static CStr {
+    match code {
+        2 => c"Sunlight",
+        3 => c"Shade",
+        4 => c"Overcast",
+        5 => c"Incandescent",
+        6 => c"Fluorescent",
+        7 => c"Flash",
+        8 => c"Custom",
+        10 => c"AutoLSP",
+        _ => c"Auto",
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn x3f_get_wb(x3f: *mut x3f_t) -> *mut c_char {
     let mut wb_code: u32 = 0;
@@ -362,19 +381,7 @@ pub unsafe extern "C" fn x3f_get_wb(x3f: *mut x3f_t) -> *mut c_char {
         // Quattro: WhiteBalance is a numeric code mapping to a string.
         // Strings live in static storage; cast the byte literal to *mut c_char
         // because the C signature returns *mut. Callers do not free.
-        let s: &'static [u8] = match wb_code {
-            1 => b"Auto\0",
-            2 => b"Sunlight\0",
-            3 => b"Shadow\0",
-            4 => b"Overcast\0",
-            5 => b"Incandescent\0",
-            6 => b"Florescent\0",
-            7 => b"Flash\0",
-            8 => b"Custom\0",
-            11 => b"ColorTemp\0",
-            12 => b"AutoLSP\0",
-            _ => b"Auto\0",
-        };
+        let s = quattro_wb_name(wb_code).to_bytes_with_nul();
         return s.as_ptr() as *mut c_char;
     }
 
@@ -637,5 +644,34 @@ mod tests {
                 assert!(data.is_null());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod quattro_wb_tests {
+    use super::quattro_wb_name;
+
+    #[test]
+    fn names_match_camf_preset_lists() {
+        let names: Vec<&str> = [1u32, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12]
+            .iter()
+            .map(|&c| quattro_wb_name(c).to_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "Auto",
+                "Sunlight",
+                "Shade",
+                "Overcast",
+                "Incandescent",
+                "Fluorescent",
+                "Flash",
+                "Custom",
+                "AutoLSP",
+                "Auto",
+                "Auto"
+            ]
+        );
     }
 }
